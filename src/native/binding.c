@@ -213,7 +213,7 @@ static void connect_execute(napi_env env, void *data) {
   }
 
   // Associate our connection struct with the DBPROCESS for error handlers
-  dbsetuserdata(w->conn->dbproc, w->conn);
+  dbsetuserdata(w->conn->dbproc, (BYTE *)w->conn);
 
   // Switch database
   if (strlen(w->database) > 0) {

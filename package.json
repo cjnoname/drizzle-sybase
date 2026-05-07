@@ -2,6 +2,32 @@
   "name": "drizzle-sybase",
   "version": "0.2.0",
   "description": "Drizzle ORM driver for Sybase ASE with built-in FreeTDS native bindings",
+  "keywords": [
+    "ase",
+    "database",
+    "drizzle",
+    "freetds",
+    "napi",
+    "native",
+    "orm",
+    "sybase",
+    "tds"
+  ],
+  "homepage": "https://github.com/cjnoname/drizzle-sybase#readme",
+  "bugs": {
+    "url": "https://github.com/cjnoname/drizzle-sybase/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cjnoname/drizzle-sybase.git"
+  },
+  "files": [
+    "dist",
+    "src/native/binding.c",
+    "binding.gyp",
+    "scripts"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -11,15 +37,10 @@
       "import": "./dist/index.js"
     }
   },
-  "files": [
-    "dist",
-    "src/native/binding.c",
-    "binding.gyp",
-    "scripts"
-  ],
   "scripts": {
     "build": "tsc",
     "build:native": "node-gyp rebuild",
+    "prepare": "husky",
     "prepublishOnly": "npm run build",
     "test": "vitest",
     "lint": "oxlint",
@@ -28,32 +49,11 @@
     "check": "npm run lint && tsc --noEmit",
     "clean": "rm -rf dist build"
   },
-  "keywords": [
-    "drizzle",
-    "sybase",
-    "ase",
-    "orm",
-    "freetds",
-    "tds",
-    "database",
-    "native",
-    "napi"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/cjnoname/drizzle-sybase.git"
-  },
-  "homepage": "https://github.com/cjnoname/drizzle-sybase#readme",
-  "bugs": {
-    "url": "https://github.com/cjnoname/drizzle-sybase/issues"
-  },
-  "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  },
   "devDependencies": {
     "@types/node": "^25.6.1",
+    "concurrently": "^9.2.1",
     "drizzle-orm": "^1.0.0-rc.2",
+    "husky": "^9.1.7",
     "node-gyp": "^12.3.0",
     "oxfmt": "^0.48.0",
     "oxlint": "^1.63.0",
@@ -64,5 +64,8 @@
   "peerDependencies": {
     "drizzle-orm": "^1.0.0-rc.2",
     "zod": "^3.25.0 || ^4.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

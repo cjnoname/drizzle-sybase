@@ -52,7 +52,9 @@ if [ ! -f "$DEPS_DIR/lib/libsybdb.a" ]; then
   cd "freetds-$FREETDS_VERSION"
 
   echo "==> Configuring FreeTDS (static only)..."
-  ./configure \
+  # CFLAGS=-fPIC is required on Linux — static library objects must be
+  # position-independent to link into a shared object (.node addon).
+  CFLAGS="-fPIC -O2" ./configure \
     --prefix="$DEPS_DIR" \
     --enable-static \
     --disable-shared \
