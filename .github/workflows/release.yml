@@ -34,7 +34,7 @@ jobs:
             platform: linux-arm64
           - os: macos-latest
             platform: darwin-arm64
-          - os: macos-13
+          - os: macos-latest
             platform: darwin-x64
           - os: windows-latest
             platform: win32-x64
@@ -69,6 +69,8 @@ jobs:
 
       - name: Build native (unix)
         if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
+        env:
+          TARGET_ARCH: ${{ matrix.platform == 'darwin-x64' && 'x64' || '' }}
         run: |
           npm install -g node-gyp
           bash scripts/build.sh
@@ -201,7 +203,7 @@ jobs:
             platform: linux-arm64
           - os: macos-latest
             platform: darwin-arm64
-          - os: macos-13
+          - os: macos-latest
             platform: darwin-x64
           - os: windows-latest
             platform: win32-x64
@@ -239,6 +241,8 @@ jobs:
       # --- macOS / Linux x64: native build ---
       - name: Build native (unix)
         if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
+        env:
+          TARGET_ARCH: ${{ matrix.platform == 'darwin-x64' && 'x64' || '' }}
         run: |
           npm install -g node-gyp
           bash scripts/build.sh

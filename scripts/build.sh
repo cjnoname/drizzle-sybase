@@ -29,6 +29,11 @@ case "$ARCH" in
   x86_64|amd64) ARCH="x64" ;;
 esac
 
+# Support cross-compilation via TARGET_ARCH env var (e.g. TARGET_ARCH=x64 on ARM64 Mac)
+if [ -n "${TARGET_ARCH:-}" ]; then
+  ARCH="$TARGET_ARCH"
+fi
+
 PLATFORM="${OS}-${ARCH}"
 echo "Building for platform: $PLATFORM"
 echo "FreeTDS version: $FREETDS_VERSION"
@@ -54,7 +59,15 @@ if [ ! -f "$DEPS_DIR/lib/libsybdb.a" ]; then
   echo "==> Configuring FreeTDS (static only)..."
   # CFLAGS=-fPIC is required on Linux — static library objects must be
   # position-independent to link into a shared object (.node addon).
-  CFLAGS="-fPIC -O2" ./configure \
+  # On macOS cross-compiling x64 from arm64, add -arch x86_64.
+  EXTRA_CFLAGS="-fPIC -O2"
+  CONFIGURE_HOST=""
+  if [ "$OS" = "darwin" ] && [ "$ARCH" = "x64" ] && [ "$(uname -m)" = "arm64" ]; then
+    EXTRA_CFLAGS="$EXTRA_CFLAGS -arch x86_64"
+    CONFIGURE_HOST="--host=x86_64-apple-darwin"
+  fi
+
+  CFLAGS="$EXTRA_CFLAGS" ./configure \
     --prefix="$DEPS_DIR" \
     --enable-static \
     --disable-shared \
@@ -64,6 +77,7 @@ if [ ! -f "$DEPS_DIR/lib/libsybdb.a" ]; then
     --disable-server \
     --disable-pool \
     --without-openssl \
+    $CONFIGURE_HOST \
     --quiet
 
   echo "==> Compiling..."
@@ -84,7 +98,12 @@ fi
 
 echo "==> Building native addon..."
 cd "$ROOT_DIR"
-npx node-gyp rebuild
+if [ "$OS" = "darwin" ] && [ "$ARCH" = "x64" ] && [ "$(uname -m)" = "arm64" ]; then
+  # Cross-compile x64 addon on ARM64 Mac
+  npx node-gyp rebuild --arch=x64
+else
+  npx node-gyp rebuild
+fi
 
 # ---------------------------------------------------------------------------
 # Step 3: Copy to src/native/ for development and dist/native/ for publishing
