@@ -143,5 +143,5 @@ export type {
 export { createSelectSchema, createInsertSchema, createUpdateSchema } from "./schema.js";
 
 // Native binding utilities (lazy-loaded — only triggers native load on actual use)
-export { getNative as native } from "./native/index.js";
+export { native, getNative } from "./native/index.js";
 export type { NativeBinding } from "./native/index.js";
