@@ -1,3 +1,10 @@
+import {
+  SybaseError,
+  SybaseConnectionError,
+  SybaseQueryError,
+  SybaseTimeoutError,
+  SybasePoolError
+} from "./errors.js";
 /**
  * Sybase connection management with production-grade connection pooling.
  *
@@ -14,13 +21,6 @@
  * - Query logging/middleware support
  */
 import { native } from "./native/index.js";
-import {
-  SybaseError,
-  SybaseConnectionError,
-  SybaseQueryError,
-  SybaseTimeoutError,
-  SybasePoolError
-} from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -190,7 +190,7 @@ export class SybaseConnection {
       });
     }
     try {
-      return await native.query(this.handle, sql, options) as unknown as QueryResult<T>;
+      return (await native.query(this.handle, sql, options)) as unknown as QueryResult<T>;
     } catch (err: any) {
       // Check if the error indicates a dead connection
       if (err && err.connectionDead) {
@@ -468,11 +468,13 @@ export class SybasePool {
           this.waitQueue.splice(idx, 1);
         }
         this._totalAcquireTimeouts++;
-        reject(new SybaseTimeoutError(
-          `Connection acquire timeout after ${this.cfg.acquireTimeoutMs}ms`,
-          "acquire",
-          this.cfg.acquireTimeoutMs
-        ));
+        reject(
+          new SybaseTimeoutError(
+            `Connection acquire timeout after ${this.cfg.acquireTimeoutMs}ms`,
+            "acquire",
+            this.cfg.acquireTimeoutMs
+          )
+        );
       }, this.cfg.acquireTimeoutMs);
 
       this.waitQueue.push({ resolve, reject, timer });
@@ -735,9 +737,10 @@ export class SybasePool {
       totalQueriesExecuted: this._totalQueriesExecuted,
       totalQueryErrors: this._totalQueryErrors,
       totalAcquireTimeouts: this._totalAcquireTimeouts,
-      avgQueryDurationMs: this._queryDurationCount > 0
-        ? Math.round(this._queryDurationSum / this._queryDurationCount)
-        : 0,
+      avgQueryDurationMs:
+        this._queryDurationCount > 0
+          ? Math.round(this._queryDurationSum / this._queryDurationCount)
+          : 0,
       currentSize: this.size,
       currentActive: this.active,
       currentIdle: this.idle,
@@ -815,7 +818,7 @@ export class SybasePool {
     while (i < this.pool.length) {
       const pooled = this.pool[i];
       const isIdle = !pooled.inUse;
-      const isExpired = (now - pooled.lastUsed) > this.cfg.idleTimeoutMs;
+      const isExpired = now - pooled.lastUsed > this.cfg.idleTimeoutMs;
       const aboveMin = this.pool.length > this.cfg.min;
 
       if (isIdle && isExpired && aboveMin) {

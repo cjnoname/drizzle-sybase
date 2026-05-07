@@ -4,7 +4,6 @@ build/
 build-freetds/
 deps/freetds/
 *.node
-!src/native/*.node
 npm/
 
 # IDE

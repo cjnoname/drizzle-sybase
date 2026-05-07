@@ -1,5 +1,5 @@
-import { createSybaseDrizzle, sybaseTable, int, varchar } from "drizzle-sybase";
 import { eq, sql } from "drizzle-orm";
+import { createSybaseDrizzle, sybaseTable, int, varchar } from "drizzle-sybase";
 
 // Define a schema
 const sysobjects = sybaseTable("sysobjects", {
@@ -13,7 +13,7 @@ const main = async () => {
 
   const db = createSybaseDrizzle({
     host: process.env.SYBASE_HOST!,
-    port: Number(process.env.SYBASE_PORT ),
+    port: Number(process.env.SYBASE_PORT),
     database: process.env.SYBASE_DATABASE!,
     username: process.env.SYBASE_USERNAME!,
     password: process.env.SYBASE_PASSWORD!,
@@ -28,9 +28,7 @@ const main = async () => {
   console.log("   First 5 tables:", tables.rows);
 
   // 2. Template tag
-  const count = await db.execute(
-    sql`SELECT COUNT(*) AS total FROM sysobjects WHERE type = ${"U"}`
-  );
+  const count = await db.execute(sql`SELECT COUNT(*) AS total FROM sysobjects WHERE type = ${"U"}`);
   console.log("\n2. Total user tables:", count.rows[0].total);
 
   // 3. Transaction

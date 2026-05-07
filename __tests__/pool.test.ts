@@ -4,6 +4,7 @@
  */
 import { describe, it, expect } from "vitest";
 
+import { SybasePool } from "../src/connection.js";
 import {
   SybaseError,
   SybaseConnectionError,
@@ -11,7 +12,6 @@ import {
   SybaseTimeoutError,
   SybasePoolError
 } from "../src/errors.js";
-import { SybasePool } from "../src/connection.js";
 
 // ---------------------------------------------------------------------------
 // Error hierarchy tests
@@ -215,37 +215,46 @@ describe("SybasePool state management", () => {
   it("acquire timeout throws SybaseTimeoutError", async () => {
     // We can't easily test actual acquire timeout without mocking native,
     // but we verify the pool validates configuration
-    expect(() => new SybasePool({
-      host: "localhost",
-      port: 9999,
-      database: "nope",
-      username: "nobody",
-      password: "wrong",
-      max: 0,
-      timeout: 1
-    })).toThrow("Pool max must be at least 1");
+    expect(
+      () =>
+        new SybasePool({
+          host: "localhost",
+          port: 9999,
+          database: "nope",
+          username: "nobody",
+          password: "wrong",
+          max: 0,
+          timeout: 1
+        })
+    ).toThrow("Pool max must be at least 1");
   });
 
   it("rejects min > max configuration", () => {
-    expect(() => new SybasePool({
-      host: "localhost",
-      port: 5000,
-      database: "test",
-      username: "sa",
-      password: "pass",
-      min: 10,
-      max: 5
-    })).toThrow("cannot exceed max");
+    expect(
+      () =>
+        new SybasePool({
+          host: "localhost",
+          port: 5000,
+          database: "test",
+          username: "sa",
+          password: "pass",
+          min: 10,
+          max: 5
+        })
+    ).toThrow("cannot exceed max");
   });
 
   it("rejects negative min", () => {
-    expect(() => new SybasePool({
-      host: "localhost",
-      port: 5000,
-      database: "test",
-      username: "sa",
-      password: "pass",
-      min: -1
-    })).toThrow("non-negative");
+    expect(
+      () =>
+        new SybasePool({
+          host: "localhost",
+          port: 5000,
+          database: "test",
+          username: "sa",
+          password: "pass",
+          min: -1
+        })
+    ).toThrow("non-negative");
   });
 });

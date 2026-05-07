@@ -1,15 +1,15 @@
+import { sql } from "drizzle-orm";
 /**
  * Query builder unit tests.
  * These tests verify SQL generation without requiring a real Sybase connection.
  */
 import { describe, it, expect } from "vitest";
-import { sql } from "drizzle-orm";
 
 import { SybaseDialect, escapeName, escapeString, serializeValue } from "../src/dialect.js";
-import { SybaseSelectBuilder } from "../src/query-builders/select.js";
-import { SybaseInsertBuilder } from "../src/query-builders/insert.js";
-import { SybaseUpdateBuilder } from "../src/query-builders/update.js";
 import { SybaseDeleteBuilder } from "../src/query-builders/delete.js";
+import { SybaseInsertBuilder } from "../src/query-builders/insert.js";
+import { SybaseSelectBuilder } from "../src/query-builders/select.js";
+import { SybaseUpdateBuilder } from "../src/query-builders/update.js";
 
 // ---------------------------------------------------------------------------
 // Mock session that captures executed SQL
@@ -52,12 +52,15 @@ function createMockTable(name: string, columns: Record<string, any>) {
   return table;
 }
 
-function createMockColumn(name: string, options?: {
-  identity?: boolean;
-  defaultFn?: () => unknown;
-  onUpdateFn?: () => unknown;
-  mapToDriverValue?: (v: unknown) => unknown;
-}) {
+function createMockColumn(
+  name: string,
+  options?: {
+    identity?: boolean;
+    defaultFn?: () => unknown;
+    onUpdateFn?: () => unknown;
+    mapToDriverValue?: (v: unknown) => unknown;
+  }
+) {
   return {
     name,
     identity: options?.identity ? {} : undefined,
@@ -152,9 +155,7 @@ describe("SybaseSelectBuilder", () => {
     const mockSession = {
       async execute(_rawSql: string, _options?: { maxRows?: number }) {
         return {
-          rows: [
-            { id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }
-          ],
+          rows: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }],
           rowCount: 5,
           affectedRows: 0
         };
@@ -232,7 +233,10 @@ describe("SybaseSelectBuilder", () => {
   it("generates SELECT with WHERE using sql template", () => {
     const session = createMockSession();
     const builder = new SybaseSelectBuilder(dialect, session);
-    const result = builder.from("users").where(sql`[name] = ${"Alice"}`).toSQL();
+    const result = builder
+      .from("users")
+      .where(sql`[name] = ${"Alice"}`)
+      .toSQL();
     expect(result).toContain("where");
     expect(result).toContain("'Alice'");
   });
@@ -242,7 +246,7 @@ describe("SybaseSelectBuilder", () => {
     const fields = [{ expression: "*" }];
     const builder = new SybaseSelectBuilder(dialect, session, fields);
     // Manually set config for CTE
-    const result = (builder as any);
+    const result = builder as any;
     result.config = {
       fields,
       table: "[users]",
@@ -401,7 +405,10 @@ describe("SybaseUpdateBuilder", () => {
     });
 
     const builder = new SybaseUpdateBuilder(table, dialect, session);
-    const result = builder.set({ name: "Bob" }).where(sql`[id] = ${1}`).toSQL();
+    const result = builder
+      .set({ name: "Bob" })
+      .where(sql`[id] = ${1}`)
+      .toSQL();
     expect(result).toContain("update [users] set [name] = 'Bob'");
     expect(result).toContain("where");
     expect(result).toContain("1");

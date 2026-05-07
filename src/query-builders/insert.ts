@@ -20,12 +20,7 @@
  * ]);
  * ```
  */
-import {
-  escapeName,
-  getTable,
-  getTableColumns,
-  type SybaseDialect
-} from "../dialect.js";
+import { escapeName, getTable, getTableColumns, type SybaseDialect } from "../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
@@ -148,7 +143,7 @@ export class SybaseInsertBuilder {
         // must have a defaultFn defined in the schema.
         throw new Error(
           `Cannot insert into ${tableName}: no columns with values provided. ` +
-          `Sybase ASE requires at least one explicit column value in INSERT.`
+            `Sybase ASE requires at least one explicit column value in INSERT.`
         );
       }
 

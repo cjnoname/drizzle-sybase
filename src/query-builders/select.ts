@@ -197,11 +197,15 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
    */
   async execute(): Promise<T[]> {
     // Safety: offset without limit would fetch entire table into memory then slice.
-    if (this.config.offset !== undefined && this.config.offset > 0 && this.config.limit === undefined) {
+    if (
+      this.config.offset !== undefined &&
+      this.config.offset > 0 &&
+      this.config.limit === undefined
+    ) {
       throw new Error(
         "offset() requires limit() to be set. " +
-        "Without a limit, the entire table would be fetched into memory before slicing. " +
-        "Use cursor-based pagination (WHERE id > ?) for large offsets."
+          "Without a limit, the entire table would be fetched into memory before slicing. " +
+          "Use cursor-based pagination (WHERE id > ?) for large offsets."
       );
     }
 

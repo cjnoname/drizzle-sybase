@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 /**
  * Integration test — requires real Sybase connection.
  *
@@ -7,7 +8,6 @@
  * Or create a .env.test file (not committed to git).
  */
 import { describe, it, expect, afterAll } from "vitest";
-import { sql } from "drizzle-orm";
 
 import { SybasePool } from "../src/connection.js";
 import { createSybaseDrizzle } from "../src/db.js";

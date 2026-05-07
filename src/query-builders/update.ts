@@ -13,12 +13,7 @@
  */
 import type { SQL } from "drizzle-orm";
 
-import {
-  escapeName,
-  getTable,
-  getTableColumns,
-  type SybaseDialect
-} from "../dialect.js";
+import { escapeName, getTable, getTableColumns, type SybaseDialect } from "../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
@@ -96,7 +91,9 @@ export class SybaseUpdateBuilder {
     for (const [fieldName, col] of Object.entries(columns) as [string, any][]) {
       if (col.onUpdateFn && this.setValues[fieldName] === undefined) {
         const onUpdateResult = col.onUpdateFn();
-        setClauses.push(`${escapeName(col.name)} = ${this.dialect.serializeColumnValue(onUpdateResult, col)}`);
+        setClauses.push(
+          `${escapeName(col.name)} = ${this.dialect.serializeColumnValue(onUpdateResult, col)}`
+        );
       }
     }
 

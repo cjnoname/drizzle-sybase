@@ -162,7 +162,7 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
       }
       throw new Error(
         `Cannot resolve field "${alias}": unsupported value type. ` +
-        `Expected a column reference, SQL expression, or string.`
+          `Expected a column reference, SQL expression, or string.`
       );
     });
   };
@@ -240,13 +240,27 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
 
     get pool() {
       return {
-        get size() { return pool.size; },
-        get active() { return pool.active; },
-        get idle() { return pool.idle; },
-        get waiting() { return pool.waiting; },
-        get isDraining() { return pool.isDraining; },
-        get isClosed() { return pool.isClosed; },
-        get metrics() { return pool.metrics; }
+        get size() {
+          return pool.size;
+        },
+        get active() {
+          return pool.active;
+        },
+        get idle() {
+          return pool.idle;
+        },
+        get waiting() {
+          return pool.waiting;
+        },
+        get isDraining() {
+          return pool.isDraining;
+        },
+        get isClosed() {
+          return pool.isClosed;
+        },
+        get metrics() {
+          return pool.metrics;
+        }
       };
     }
   };

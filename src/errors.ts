@@ -128,11 +128,7 @@ export class SybaseTimeoutError extends SybaseError {
   /** The type of operation that timed out. */
   readonly operation: "connect" | "query" | "acquire";
 
-  constructor(
-    message: string,
-    operation: "connect" | "query" | "acquire",
-    timeoutMs: number
-  ) {
+  constructor(message: string, operation: "connect" | "query" | "acquire", timeoutMs: number) {
     // Only connect timeout implies a dead connection;
     // query/acquire timeouts don't mean the connection is dead
     super(message, operation === "connect");

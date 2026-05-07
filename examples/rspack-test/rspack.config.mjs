@@ -1,6 +1,7 @@
-import { defineConfig } from "@rspack/cli";
 import path from "path";
 import { fileURLToPath } from "url";
+
+import { defineConfig } from "@rspack/cli";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const target = process.env.TARGET_PLATFORM ?? `${process.platform}-${process.arch}`;

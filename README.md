@@ -32,8 +32,8 @@ const db = createSybaseDrizzle({
   database: "mydb",
   username: "sa",
   password: "secret",
-  min: 1,   // min pool connections
-  max: 10   // max pool connections
+  min: 1, // min pool connections
+  max: 10 // max pool connections
 });
 
 // SELECT
@@ -63,24 +63,24 @@ await db.close();
 
 ## Why not `child_process` + `tsql`?
 
-| | Old (tsql child_process) | New (native db-lib) |
-|--|--|--|
-| Connection | New process + TCP per query | Persistent pooled connections |
-| Overhead | Fork + exec + parse stdout | Direct C function call |
-| Types | Everything is a string | int → number, bit → boolean |
-| Transactions | Hack (batch in stdin) | Real BEGIN/COMMIT on held conn |
-| Prepared stmts | Impossible | Possible (future) |
-| Lambda | Needs Layer for tsql binary | Self-contained in node_modules |
+|                | Old (tsql child_process)    | New (native db-lib)            |
+| -------------- | --------------------------- | ------------------------------ |
+| Connection     | New process + TCP per query | Persistent pooled connections  |
+| Overhead       | Fork + exec + parse stdout  | Direct C function call         |
+| Types          | Everything is a string      | int → number, bit → boolean    |
+| Transactions   | Hack (batch in stdin)       | Real BEGIN/COMMIT on held conn |
+| Prepared stmts | Impossible                  | Possible (future)              |
+| Lambda         | Needs Layer for tsql binary | Self-contained in node_modules |
 
 ## Supported Platforms
 
-| Platform | Architecture | Binary |
-|----------|-------------|---------|
-| Linux | ARM64 (Graviton) | `sybase_native.linux-arm64.node` |
-| Linux | x64 | `sybase_native.linux-x64.node` |
-| macOS | ARM64 (Apple Silicon) | `sybase_native.darwin-arm64.node` |
-| macOS | x64 (Intel) | `sybase_native.darwin-x64.node` |
-| Windows | x64 | `sybase_native.win32-x64.node` |
+| Platform | Architecture          | Binary                            |
+| -------- | --------------------- | --------------------------------- |
+| Linux    | ARM64 (Graviton)      | `sybase_native.linux-arm64.node`  |
+| Linux    | x64                   | `sybase_native.linux-x64.node`    |
+| macOS    | ARM64 (Apple Silicon) | `sybase_native.darwin-arm64.node` |
+| macOS    | x64 (Intel)           | `sybase_native.darwin-x64.node`   |
+| Windows  | x64                   | `sybase_native.win32-x64.node`    |
 
 All platform binaries are bundled in the package. At runtime, only the binary matching your `process.platform` + `process.arch` is loaded via `dlopen`.
 
@@ -94,6 +94,7 @@ bash scripts/build.sh
 ```
 
 This will:
+
 1. Download FreeTDS source
 2. Compile as static library (`libsybdb.a`)
 3. Build the N-API addon linked against it

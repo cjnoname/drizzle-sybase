@@ -82,7 +82,7 @@ export function getNative(): NativeBinding {
   if (!_binding) {
     throw new Error(
       `drizzle-sybase: no native binding for ${process.platform}-${process.arch}.\n` +
-      `Ensure the package was installed correctly (all platform .node files should be in dist/native/).`
+        `Ensure the package was installed correctly (all platform .node files should be in dist/native/).`
     );
   }
   return _binding;
