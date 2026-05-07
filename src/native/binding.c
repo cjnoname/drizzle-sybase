@@ -617,46 +617,29 @@ static void query_complete(napi_env env, napi_status status, void *data) {
           int coltype = w->columns[c].type;
           char *strval = w->columns[c].values[r];
 
-          switch (coltype) {
-            case SYBINT1:
-            case SYBINT2:
-            case SYBINT4: {
-              int intval = atoi(strval);
-              napi_create_int32(env, intval, &val);
-              break;
+          if (coltype == SYBINT1 || coltype == SYBINT2 || coltype == SYBINT4) {
+            int intval = atoi(strval);
+            napi_create_int32(env, intval, &val);
+          } else if (coltype == SYBINT8) {
+            long long llval = atoll(strval);
+            if (llval >= -2147483648LL && llval <= 2147483647LL) {
+              napi_create_int32(env, (int32_t)llval, &val);
+            } else {
+              napi_create_int64(env, llval, &val);
             }
-            case SYBINT8: {
-              long long llval = atoll(strval);
-              if (llval >= -2147483648LL && llval <= 2147483647LL) {
-                napi_create_int32(env, (int32_t)llval, &val);
-              } else {
-                napi_create_int64(env, llval, &val);
-              }
-              break;
-            }
-            case SYBFLT8:
-            case SYBREAL: {
-              double dval = atof(strval);
-              napi_create_double(env, dval, &val);
-              break;
-            }
-            case SYBMONEY:
-            case SYBMONEY4:
-            case SYBNUMERIC:
-            case SYBDECIMAL: {
-              // Money and decimal: return as string to preserve precision
-              // (JavaScript number loses precision beyond ~15 digits)
-              napi_create_string_utf8(env, strval, NAPI_AUTO_LENGTH, &val);
-              break;
-            }
-            case SYBBIT: {
-              int bval = atoi(strval);
-              napi_get_boolean(env, bval != 0, &val);
-              break;
-            }
-            default:
-              napi_create_string_utf8(env, strval, NAPI_AUTO_LENGTH, &val);
-              break;
+          } else if (coltype == SYBFLT8 || coltype == SYBREAL) {
+            double dval = atof(strval);
+            napi_create_double(env, dval, &val);
+          } else if (coltype == SYBMONEY || coltype == SYBMONEY4 ||
+                     coltype == SYBNUMERIC || coltype == SYBDECIMAL) {
+            // Money and decimal: return as string to preserve precision
+            // (JavaScript number loses precision beyond ~15 digits)
+            napi_create_string_utf8(env, strval, NAPI_AUTO_LENGTH, &val);
+          } else if (coltype == SYBBIT) {
+            int bval = atoi(strval);
+            napi_get_boolean(env, bval != 0, &val);
+          } else {
+            napi_create_string_utf8(env, strval, NAPI_AUTO_LENGTH, &val);
           }
         }
 

@@ -20,12 +20,10 @@ const main = async () => {
     max: 3
   });
 
-  // 1. Raw SQL
+  // 1. Query builder with schema
   console.log("1. Pool stats:", db.pool);
-  const tables = await db.executeRaw(
-    "SET ROWCOUNT 5\nSELECT name, type FROM sysobjects WHERE type = 'U' ORDER BY name\nSET ROWCOUNT 0"
-  );
-  console.log("   First 5 tables:", tables.rows);
+  const tables = await db.select().from(sysobjects).where(eq(sysobjects.type, "U")).limit(5);
+  console.log("   First 5 user tables:", tables.rows);
 
   // 2. Template tag
   const count = await db.execute(sql`SELECT COUNT(*) AS total FROM sysobjects WHERE type = ${"U"}`);
