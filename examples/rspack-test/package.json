@@ -1,0 +1,20 @@
+{
+  "name": "rspack-sybase-example",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "rspack build",
+    "start": "node dist/main.mjs"
+  },
+  "dependencies": {
+    "drizzle-orm": "1.0.0-rc.2",
+    "drizzle-sybase": "link:../../",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@rspack/cli": "^2.0.2",
+    "@rspack/core": "^2.0.2",
+    "node-loader": "^2.1.0"
+  }
+}

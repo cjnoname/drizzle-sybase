@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # Gate: skip CI when release-please merges (already tested in PR)
+  should-run:
+    runs-on: ubuntu-latest
+    if: "${{ github.event_name != 'push' || (!contains(github.event.head_commit.message, 'release-please--branches--main') && !startsWith(github.event.head_commit.message, 'chore(main): release')) }}"
+    steps:
+      - run: echo "CI should run"
+
+  # Build native addon + run tests on all platforms
+  test:
+    needs: should-run
+    timeout-minutes: 20
+    name: Test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build FreeTDS + native addon
+        run: bash scripts/build.sh
+
+      - name: Place .node file
+        run: |
+          PLATFORM="${{ runner.os == 'Linux' && 'linux' || 'darwin' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}"
+          cp build/Release/sybase_native.node "src/native/sybase_native.${PLATFORM}.node"
+          # Create empty placeholders for other platforms
+          for p in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64; do
+            if [ ! -f "src/native/sybase_native.${p}.node" ]; then
+              touch "src/native/sybase_native.${p}.node"
+            fi
+          done
+
+      - name: Build TypeScript
+        run: pnpm run build
+
+      - name: Copy .node files to dist
+        run: cp src/native/sybase_native.*.node dist/native/
+
+      - name: Run tests
+        run: pnpm run test
+
+  lint:
+    needs: should-run
+    timeout-minutes: 10
+    name: Lint and Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build FreeTDS + native addon
+        run: bash scripts/build.sh
+
+      - name: Place .node files
+        run: |
+          PLATFORM="linux-x64"
+          cp build/Release/sybase_native.node "src/native/sybase_native.${PLATFORM}.node"
+          for p in darwin-arm64 darwin-x64 linux-arm64 win32-x64; do
+            touch "src/native/sybase_native.${p}.node"
+          done
+
+      - name: Run linter
+        run: pnpm run lint
+
+      - name: Run type check
+        run: pnpm run build
+
+  codeql:
+    needs: should-run
+    timeout-minutes: 10
+    name: CodeQL Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript, c-cpp
+          queries: +security-and-quality
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:javascript-typescript"

@@ -1,0 +1,347 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Step 1: release-please creates/updates a release PR.
+  # When merged, it creates a GitHub release + tag and sets release_created=true.
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  # Step 2a: Canary — publish on every push except when release-please just created a release.
+  canary:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created != 'true' }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: ubuntu-latest
+            platform: linux-arm64
+          - os: macos-latest
+            platform: darwin-arm64
+          - os: macos-13
+            platform: darwin-x64
+          - os: windows-latest
+            platform: win32-x64
+    runs-on: ${{ matrix.os }}
+    name: Canary Build ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Setup QEMU (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build in Docker (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            node:24-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y build-essential python3 curl &&
+              npm install -g node-gyp &&
+              bash scripts/build.sh
+            "
+
+      - name: Build native (unix)
+        if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
+        run: |
+          npm install -g node-gyp
+          bash scripts/build.sh
+
+      - name: Build FreeTDS (windows)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set ROOT_DIR=%CD%
+          curl -fsSL https://www.freetds.org/files/stable/freetds-1.5.17.tar.gz -o freetds.tar.gz
+          tar xzf freetds.tar.gz
+          cd freetds-1.5.17
+          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+            -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
+            -DWITH_OPENSSL=OFF ^
+            -DENABLE_ODBC=OFF ^
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release
+
+      - name: Build native addon (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          npm install -g node-gyp
+          npx node-gyp rebuild
+
+      - name: Rename artifact
+        shell: bash
+        run: cp build/Release/sybase_native.node sybase_native.${{ matrix.platform }}.node
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-${{ matrix.platform }}
+          path: sybase_native.${{ matrix.platform }}.node
+
+  canary-publish:
+    needs: [release-please, canary]
+    if: ${{ needs.release-please.outputs.release_created != 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Place native binaries
+        run: |
+          mkdir -p src/native
+          for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
+            cp "artifacts/canary-${platform}/sybase_native.${platform}.node" "src/native/"
+          done
+
+      - name: Build TypeScript
+        run: pnpm run build
+
+      - name: Copy .node files to dist
+        run: |
+          mkdir -p dist/native
+          cp src/native/sybase_native.*.node dist/native/
+
+      - name: Generate canary version
+        id: canary_version
+        run: |
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          CANARY_VERSION="${CURRENT_VERSION}-canary.${TIMESTAMP}.${COMMIT_SHORT}"
+          echo "version=${CANARY_VERSION}" >> $GITHUB_OUTPUT
+          node -e "const p=require('./package.json');p.version='${CANARY_VERSION}';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - name: Publish canary to npm
+        run: pnpm publish --tag canary --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify canary publish
+        run: |
+          echo "Waiting for npm registry to propagate..."
+          sleep 30
+          EXPECTED_VERSION="${{ steps.canary_version.outputs.version }}"
+          PUBLISHED_VERSION=$(npm view drizzle-sybase@${EXPECTED_VERSION} version 2>/dev/null || echo "NOT_FOUND")
+          if [ "$PUBLISHED_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "ERROR: Expected version ${EXPECTED_VERSION} but found ${PUBLISHED_VERSION} on npm registry"
+            exit 1
+          fi
+          echo "Verified: drizzle-sybase@${EXPECTED_VERSION} is live on npm"
+
+      - name: Comment on commit
+        uses: actions/github-script@v8
+        with:
+          script: |
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: `🚀 Canary version published: \`${{ steps.canary_version.outputs.version }}\`\n\nInstall with: \`npm install drizzle-sybase@canary\``
+            })
+
+  # Step 2b: Build all platforms for release.
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: ubuntu-latest
+            platform: linux-arm64
+          - os: macos-latest
+            platform: darwin-arm64
+          - os: macos-13
+            platform: darwin-x64
+          - os: windows-latest
+            platform: win32-x64
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # --- Linux ARM64: cross-compile via Docker + QEMU ---
+      - name: Setup QEMU (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build in Docker (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            node:24-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y build-essential python3 curl &&
+              npm install -g node-gyp &&
+              bash scripts/build.sh
+            "
+
+      # --- macOS / Linux x64: native build ---
+      - name: Build native (unix)
+        if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
+        run: |
+          npm install -g node-gyp
+          bash scripts/build.sh
+
+      # --- Windows: CMake + MSVC ---
+      - name: Build FreeTDS (windows)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set ROOT_DIR=%CD%
+          curl -fsSL https://www.freetds.org/files/stable/freetds-1.5.17.tar.gz -o freetds.tar.gz
+          tar xzf freetds.tar.gz
+          cd freetds-1.5.17
+          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+            -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
+            -DWITH_OPENSSL=OFF ^
+            -DENABLE_ODBC=OFF ^
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release
+
+      - name: Build native addon (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          npm install -g node-gyp
+          npx node-gyp rebuild
+
+      # --- Upload ---
+      - name: Rename artifact
+        shell: bash
+        run: cp build/Release/sybase_native.node sybase_native.${{ matrix.platform }}.node
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: sybase_native.${{ matrix.platform }}.node
+
+  # Step 3: Publish to npm with all platform binaries.
+  publish:
+    needs: [release-please, build]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Place native binaries
+        run: |
+          mkdir -p src/native
+          for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
+            cp "artifacts/${platform}/sybase_native.${platform}.node" "src/native/"
+          done
+
+      - name: Build TypeScript
+        run: pnpm run build
+
+      - name: Copy .node files to dist
+        run: |
+          mkdir -p dist/native
+          cp src/native/sybase_native.*.node dist/native/
+
+      - name: Publish to npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if echo "$VERSION" | grep -q "beta\|alpha\|rc"; then
+            echo "Publishing ${VERSION} with --tag beta"
+            pnpm publish --no-git-checks --tag beta
+          else
+            echo "Publishing ${VERSION} as latest"
+            pnpm publish --no-git-checks
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify publish
+        run: |
+          echo "Waiting for npm registry to propagate..."
+          sleep 30
+          EXPECTED_VERSION=$(node -p "require('./package.json').version")
+          PUBLISHED_VERSION=$(npm view drizzle-sybase@${EXPECTED_VERSION} version 2>/dev/null || echo "NOT_FOUND")
+          if [ "$PUBLISHED_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "WARNING: Expected version ${EXPECTED_VERSION} but found ${PUBLISHED_VERSION} on npm registry"
+          else
+            echo "Verified: drizzle-sybase@${EXPECTED_VERSION} is live on npm"
+          fi
