@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1](https://github.com/cjnoname/drizzle-sybase/compare/v0.3.0...v0.3.1) (2026-05-08)
+
+
+### Code Refactoring
+
+* Replace mssqlTable with lightweight sybaseTable implementation and update column type helpers ([3a4e6f1](https://github.com/cjnoname/drizzle-sybase/commit/3a4e6f1284f13df75b91397fab32ba092ccaf6a3))
+
 ## [0.3.0](https://github.com/cjnoname/drizzle-sybase/compare/v0.2.0...v0.3.0) (2026-05-08)
 
 
