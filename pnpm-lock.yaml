@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      drizzle-orm:
+        specifier: ^1.0.0-rc.2
+        version: 1.0.0-rc.2-e38a2ba
     devDependencies:
       '@types/node':
         specifier: ^25.6.2
@@ -14,9 +18,6 @@ importers:
       concurrently:
         specifier: ^9.2.1
         version: 9.2.1
-      drizzle-orm:
-        specifier: ^1.0.0-rc.2
-        version: 1.0.0-rc.2-e38a2ba(zod@4.4.3)
       husky:
         specifier: ^9.1.7
         version: 9.1.7
@@ -30,7 +31,7 @@ importers:
         specifier: ^1.63.0
         version: 1.63.0(oxlint-tsgolint@0.22.1)
       oxlint-tsgolint:
-        specifier: latest
+        specifier: 0.22.1
         version: 0.22.1
       typescript:
         specifier: ^6.0.3
@@ -1060,9 +1061,6 @@ packages:
     resolution: {integrity: sha512-7dSzzRQ++CKnNI/krKnYRV7JKKPUXMEh61soaHKg9mrWEhzFWhFnxPxGl+69cD1Ou63C13NUPCnmIcrvqCuM6w==}
     engines: {node: '>=12'}
 
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
-
 snapshots:
 
   '@emnapi/core@1.10.0':
@@ -1384,9 +1382,7 @@ snapshots:
 
   detect-libc@2.1.2: {}
 
-  drizzle-orm@1.0.0-rc.2-e38a2ba(zod@4.4.3):
-    optionalDependencies:
-      zod: 4.4.3
+  drizzle-orm@1.0.0-rc.2-e38a2ba: {}
 
   emoji-regex@8.0.0: {}
 
@@ -1729,6 +1725,3 @@ snapshots:
       string-width: 4.2.3
       y18n: 5.0.8
       yargs-parser: 21.1.1
-
-  zod@4.4.3:
-    optional: true

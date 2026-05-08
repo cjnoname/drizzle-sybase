@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { native } from "../src/native/index.js";
+import { native } from "../index.js";
 
 describe("native binding", () => {
   it("loads successfully", () => {

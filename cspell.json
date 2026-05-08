@@ -1,0 +1,4 @@
+{
+  "version": "0.2",
+  "words": ["freetds", "napi", "oxfmt", "oxlint", "sybase", "tsgo", "tsgolint", "varchar", "vitest"]
+}

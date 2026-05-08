@@ -48,21 +48,23 @@
     "lint:fix": "oxlint --fix",
     "format": "oxfmt",
     "check": "npm run lint && tsc --noEmit",
-    "clean": "rm -rf dist build"
+    "clean": "pnpm dlx --reporter=silent rimraf \"**/node_modules\" pnpm-lock.yaml \"**/dist\" -g && pnpm i"
   },
   "devDependencies": {
     "@types/node": "^25.6.2",
     "concurrently": "^9.2.1",
-    "drizzle-orm": "^1.0.0-rc.2",
     "husky": "^9.1.7",
     "node-gyp": "^12.3.0",
     "oxfmt": "^0.48.0",
     "oxlint": "^1.63.0",
-    "oxlint-tsgolint": "latest",
+    "oxlint-tsgolint": "0.22.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   },
+  "peerDependencies": {
+    "drizzle-orm": "^1.0.0-rc.2"
+  },
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   }
 }

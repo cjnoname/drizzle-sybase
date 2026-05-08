@@ -4,14 +4,14 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { SybasePool } from "../src/connection.js";
+import { SybasePool } from "../connection.js";
 import {
   SybaseError,
   SybaseConnectionError,
   SybaseQueryError,
   SybaseTimeoutError,
   SybasePoolError
-} from "../src/errors.js";
+} from "../errors.js";
 
 // ---------------------------------------------------------------------------
 // Error hierarchy tests

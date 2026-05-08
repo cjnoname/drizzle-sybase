@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { SybaseDialect, escapeName, escapeString, serializeValue } from "../src/dialect.js";
+import { SybaseDialect, escapeName, escapeString, serializeValue } from "../dialect.js";
 
 describe("escapeName", () => {
   it("wraps names in brackets", () => {

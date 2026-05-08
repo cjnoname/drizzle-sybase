@@ -9,9 +9,9 @@ import { sql } from "drizzle-orm";
  */
 import { describe, it, expect, afterAll } from "vitest";
 
-import { SybasePool } from "../src/connection.js";
-import { createSybaseDrizzle } from "../src/db.js";
-import { native } from "../src/native/index.js";
+import { SybasePool } from "../connection.js";
+import { createSybaseDrizzle } from "../db.js";
+import { native } from "../native/index.js";
 
 const config = {
   host: process.env.SYBASE_HOST ?? "",

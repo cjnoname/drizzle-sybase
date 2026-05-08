@@ -1,6 +1,5 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "declaration": true,
@@ -16,5 +15,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "__tests__", "npm"]
+  "exclude": ["node_modules", "dist", "npm"]
 }

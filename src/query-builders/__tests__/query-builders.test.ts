@@ -5,19 +5,22 @@ import { sql } from "drizzle-orm";
  */
 import { describe, it, expect } from "vitest";
 
-import { SybaseDialect, escapeName, escapeString, serializeValue } from "../src/dialect.js";
-import { SybaseDeleteBuilder } from "../src/query-builders/delete.js";
-import { SybaseInsertBuilder } from "../src/query-builders/insert.js";
-import { SybaseSelectBuilder } from "../src/query-builders/select.js";
-import { SybaseUpdateBuilder } from "../src/query-builders/update.js";
+import { SybaseDialect, escapeName, escapeString, serializeValue } from "../../dialect.js";
+import type { SybaseSession, SybaseTransactionSession } from "../../session.js";
+import { SybaseDeleteBuilder } from "../delete.js";
+import { SybaseInsertBuilder } from "../insert.js";
+import { SybaseSelectBuilder } from "../select.js";
+import { SybaseUpdateBuilder } from "../update.js";
 
 // ---------------------------------------------------------------------------
 // Mock session that captures executed SQL
 // ---------------------------------------------------------------------------
 
+type MockableSession = SybaseSession | SybaseTransactionSession;
+
 function createMockSession() {
   const executed: string[] = [];
-  return {
+  const mock = {
     executed,
     async execute<T extends Record<string, unknown> = Record<string, unknown>>(
       rawSql: string,
@@ -31,6 +34,7 @@ function createMockSession() {
       return { rows: [], columns: [], rowCount: 0, affectedRows: 0 };
     }
   };
+  return mock as unknown as MockableSession & { executed: string[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +167,7 @@ describe("SybaseSelectBuilder", () => {
       async executeRaw(_rawSql: string) {
         return { rows: [], columns: [], rowCount: 0, affectedRows: 0 };
       }
-    };
+    } as unknown as MockableSession;
     const builder = new SybaseSelectBuilder(dialect, mockSession);
     const rows = await builder.from("users").limit(3).offset(2).execute();
     // Should skip first 2 rows and return rows 3-5
