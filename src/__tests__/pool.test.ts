@@ -93,7 +93,6 @@ describe("SybasePool state management", () => {
       database: "test",
       username: "sa",
       password: "pass",
-      min: 0,
       max: 10
     });
 
@@ -113,8 +112,7 @@ describe("SybasePool state management", () => {
       port: 5000,
       database: "test",
       username: "sa",
-      password: "pass",
-      min: 0
+      password: "pass"
     });
 
     await pool.close();
@@ -127,8 +125,7 @@ describe("SybasePool state management", () => {
       port: 5000,
       database: "test",
       username: "sa",
-      password: "pass",
-      min: 0
+      password: "pass"
     });
 
     await pool.close();
@@ -148,8 +145,7 @@ describe("SybasePool state management", () => {
       port: 5000,
       database: "test",
       username: "sa",
-      password: "pass",
-      min: 0
+      password: "pass"
     });
 
     // drain should complete immediately when no active connections
@@ -169,8 +165,7 @@ describe("SybasePool state management", () => {
       port: 5000,
       database: "test",
       username: "sa",
-      password: "pass",
-      min: 0
+      password: "pass"
     });
 
     const metrics = pool.metrics;
@@ -195,7 +190,6 @@ describe("SybasePool state management", () => {
       database: "nope",
       username: "nobody",
       password: "wrong",
-      min: 0,
       max: 1,
       timeout: 2,
       retries: 0
@@ -227,34 +221,5 @@ describe("SybasePool state management", () => {
           timeout: 1
         })
     ).toThrow("Pool max must be at least 1");
-  });
-
-  it("rejects min > max configuration", () => {
-    expect(
-      () =>
-        new SybasePool({
-          host: "localhost",
-          port: 5000,
-          database: "test",
-          username: "sa",
-          password: "pass",
-          min: 10,
-          max: 5
-        })
-    ).toThrow("cannot exceed max");
-  });
-
-  it("rejects negative min", () => {
-    expect(
-      () =>
-        new SybasePool({
-          host: "localhost",
-          port: 5000,
-          database: "test",
-          username: "sa",
-          password: "pass",
-          min: -1
-        })
-    ).toThrow("non-negative");
   });
 });

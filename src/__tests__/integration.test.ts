@@ -94,7 +94,7 @@ describe.skipIf(!hasConfig)("connection pool", () => {
   });
 
   it("creates pool and executes queries", async () => {
-    pool = new SybasePool({ ...config, min: 1, max: 3 });
+    pool = new SybasePool({ ...config, max: 3 });
     const result = await pool.query("SELECT 1 AS val");
     expect(result.rows[0].val).toBe(1);
   });

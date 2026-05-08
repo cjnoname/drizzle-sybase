@@ -10,7 +10,7 @@ import {
  *
  * Features:
  * - Persistent db-lib connections via N-API
- * - Connection pool with min/max sizing
+ * - Connection pool with max sizing
  * - Health checks (dead connection detection + optional ping)
  * - Idle connection cleanup
  * - Automatic reconnection for dead connections
@@ -37,8 +37,6 @@ export interface SybaseConnectionConfig {
 }
 
 export interface SybasePoolConfig extends SybaseConnectionConfig {
-  /** Minimum connections to keep in pool. Default: 1 */
-  min?: number;
   /** Maximum connections in pool. Default: 5 */
   max?: number;
   /** Connection idle timeout in ms. Default: 60000 (60s) */
@@ -258,7 +256,7 @@ interface Waiter {
  * Production-grade connection pool for Sybase ASE.
  *
  * Features:
- * - Min/max pool sizing with automatic scaling
+ * - max pool sizing with automatic scaling
  * - Health checks (dead connection detection + optional ping)
  * - Idle connection cleanup
  * - Acquire timeout with fair queuing
@@ -275,7 +273,6 @@ interface Waiter {
  *   database: "mydb",
  *   username: "sa",
  *   password: "secret",
- *   min: 2,
  *   max: 10,
  *   logger: { query(log) { console.log(`[${log.durationMs}ms] ${log.sql}`); } }
  * });
@@ -306,23 +303,15 @@ export class SybasePool {
   private _pendingCreates = 0;
 
   constructor(config: SybasePoolConfig) {
-    const min = config.min ?? 1;
     const max = config.max ?? 5;
 
     if (max < 1) {
       throw new SybasePoolError("Pool max must be at least 1", "closed");
     }
-    if (min < 0) {
-      throw new SybasePoolError("Pool min must be non-negative", "closed");
-    }
-    if (min > max) {
-      throw new SybasePoolError(`Pool min (${min}) cannot exceed max (${max})`, "closed");
-    }
 
     this.cfg = {
       ...config,
       timeout: config.timeout ?? 30,
-      min,
       max,
       idleTimeoutMs: config.idleTimeoutMs ?? 60000,
       acquireTimeoutMs: config.acquireTimeoutMs ?? 10000,
@@ -342,44 +331,6 @@ export class SybasePool {
     if (this.cleanupTimer && typeof this.cleanupTimer.unref === "function") {
       this.cleanupTimer.unref();
     }
-
-    // Warm up pool to min connections (non-blocking)
-    if (this.cfg.min > 0) {
-      void this.warmUp();
-    }
-  }
-
-  /**
-   * Pre-create connections up to `min` size.
-   * Runs in the background — failures are silently ignored
-   * (connections will be created on demand instead).
-   *
-   * Note: warm-up does NOT use _pendingCreates to avoid blocking
-   * concurrent acquire() calls during pool startup.
-   */
-  private async warmUp(): Promise<void> {
-    const promises: Promise<void>[] = [];
-    for (let i = 0; i < this.cfg.min; i++) {
-      promises.push(
-        this.createConnection()
-          .then(conn => {
-            if (!this.closed && !this.draining && this.pool.length < this.cfg.max) {
-              this.pool.push({
-                conn,
-                lastUsed: Date.now(),
-                createdAt: Date.now(),
-                inUse: false
-              });
-            } else {
-              conn.close();
-            }
-          })
-          .catch(() => {
-            // Ignore warm-up failures — connections will be created on demand
-          })
-      );
-    }
-    await Promise.all(promises);
   }
 
   /**
@@ -440,7 +391,7 @@ export class SybasePool {
       }
       this._pendingCreates--;
 
-      // Re-check after async gap: warm-up or another acquire may have filled pool
+      // Re-check after async gap: another acquire may have filled pool
       if (this.pool.length >= this.cfg.max) {
         // Pool is full now — close the extra connection
         conn.close();
@@ -809,7 +760,7 @@ export class SybasePool {
   }
 
   /**
-   * Remove idle connections exceeding min pool size.
+   * Remove idle connections that have exceeded the idle timeout.
    */
   private cleanupIdle(): void {
     const now = Date.now();
@@ -819,9 +770,8 @@ export class SybasePool {
       const pooled = this.pool[i];
       const isIdle = !pooled.inUse;
       const isExpired = now - pooled.lastUsed > this.cfg.idleTimeoutMs;
-      const aboveMin = this.pool.length > this.cfg.min;
 
-      if (isIdle && isExpired && aboveMin) {
+      if (isIdle && isExpired) {
         this.removeFromPool(i);
         // Don't increment i — the array shifted
       } else {

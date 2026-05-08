@@ -62,7 +62,6 @@ describe("SybaseError from pool (no real connection needed)", () => {
       database: "nope",
       username: "nobody",
       password: "wrong",
-      min: 0,
       max: 1,
       timeout: 3,
       retries: 0

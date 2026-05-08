@@ -32,7 +32,6 @@ const db = createSybaseDrizzle({
   database: "mydb",
   username: "sa",
   password: "secret",
-  min: 1, // min pool connections
   max: 10 // max pool connections
 });
 
