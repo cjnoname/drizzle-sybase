@@ -37,7 +37,7 @@ jobs:
           cache: "pnpm"
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm i
 
       - name: Build FreeTDS + native addon
         run: bash scripts/build.sh
@@ -54,13 +54,13 @@ jobs:
           done
 
       - name: Build TypeScript
-        run: pnpm run build
+        run: pnpm build
 
       - name: Copy .node files to dist
         run: cp src/native/sybase_native.*.node dist/native/
 
       - name: Run tests
-        run: pnpm run test
+        run: pnpm test
 
   lint:
     needs: should-run
@@ -80,7 +80,7 @@ jobs:
           cache: "pnpm"
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm i
 
       - name: Build FreeTDS + native addon
         run: bash scripts/build.sh
@@ -94,10 +94,10 @@ jobs:
           done
 
       - name: Run linter
-        run: pnpm run lint
+        run: pnpm lint
 
       - name: Run type check
-        run: pnpm run build
+        run: pnpm build
 
   codeql:
     needs: should-run

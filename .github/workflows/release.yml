@@ -128,7 +128,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm i
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v8
@@ -143,7 +143,7 @@ jobs:
           done
 
       - name: Build TypeScript
-        run: pnpm run build
+        run: pnpm build
 
       - name: Copy .node files to dist
         run: |
@@ -299,7 +299,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm i
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v8
@@ -314,7 +314,7 @@ jobs:
           done
 
       - name: Build TypeScript
-        run: pnpm run build
+        run: pnpm build
 
       - name: Copy .node files to dist
         run: |
