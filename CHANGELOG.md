@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v0.3.1...v1.0.0) (2026-05-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove min pool size option, simplify pool to max-only sizing
+* minimum Node.js version raised to 24
+
+### Features
+
+* Colocate tests with source, upgrade CI toolchain ([0dadd00](https://github.com/cjnoname/drizzle-sybase/commit/0dadd001683390047ac47c331b41e998878c90e9))
+
+
+### Bug Fixes
+
+* Update npm publish commands and remove unnecessary permissions ([5366c5e](https://github.com/cjnoname/drizzle-sybase/commit/5366c5e32ec47e029103505bab61fe5add1c4b5b))
+
+
+### Code Refactoring
+
+* Remove min pool size option, simplify pool to max-only sizing ([9fd542b](https://github.com/cjnoname/drizzle-sybase/commit/9fd542bc03e69259d507e02ba6cbfa33f2271244))
+
 ## [0.3.1](https://github.com/cjnoname/drizzle-sybase/compare/v0.3.0...v0.3.1) (2026-05-08)
 
 
