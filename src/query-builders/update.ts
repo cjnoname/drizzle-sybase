@@ -12,8 +12,12 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
+import { getTableName } from "drizzle-orm";
 
-import { escapeName, getTable, getTableColumns, type SybaseDialect } from "../dialect.js";
+import { escapeName, type SybaseDialect } from "../dialect.js";
+
+/** @internal */
+const ColumnsSymbol = Symbol.for("drizzle:Columns");
 import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
@@ -71,8 +75,8 @@ export class SybaseUpdateBuilder {
   // ---------------------------------------------------------------------------
 
   private buildSql(): string {
-    const columns = getTableColumns(this.table);
-    const tableName = escapeName(getTable(this.table));
+    const columns = this.table[ColumnsSymbol];
+    const tableName = escapeName(getTableName(this.table));
 
     const setClauses: string[] = [];
 

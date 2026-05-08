@@ -20,7 +20,12 @@
  * ]);
  * ```
  */
-import { escapeName, getTable, getTableColumns, type SybaseDialect } from "../dialect.js";
+import { getTableName } from "drizzle-orm";
+
+import { escapeName, type SybaseDialect } from "../dialect.js";
+
+/** @internal */
+const ColumnsSymbol = Symbol.for("drizzle:Columns");
 import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
@@ -98,8 +103,8 @@ export class SybaseInsertBuilder {
   // ---------------------------------------------------------------------------
 
   private hasIdentityColumn(): boolean {
-    const columns = getTableColumns(this.table);
-    return Object.values(columns).some((col: any) => col.identity !== undefined);
+    const columns = this.table[ColumnsSymbol];
+    return Object.values(columns).some((col: any) => !!col.identity);
   }
 
   private buildSql(): string {
@@ -114,13 +119,13 @@ export class SybaseInsertBuilder {
   }
 
   private buildInsertStatements(): string[] {
-    const columns = getTableColumns(this.table);
+    const columns = this.table[ColumnsSymbol];
 
     const allColEntries = Object.entries(columns).filter(
       ([_, col]: [string, any]) => !col.shouldDisableInsert()
     );
 
-    const tableName = escapeName(getTable(this.table));
+    const tableName = escapeName(getTableName(this.table));
 
     return this.insertValues.map(row => {
       const providedEntries = allColEntries.filter(([fieldName, col]: [string, any]) => {

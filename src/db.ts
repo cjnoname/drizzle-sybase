@@ -27,10 +27,11 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
+import { getTableName } from "drizzle-orm";
 
 import type { SybasePoolConfig, SybasePoolMetrics } from "./connection.js";
 import { SybasePool } from "./connection.js";
-import { SybaseDialect, escapeName, getTable } from "./dialect.js";
+import { SybaseDialect, escapeName } from "./dialect.js";
 import {
   SybaseSelectBuilder,
   SybaseInsertBuilder,
@@ -144,7 +145,7 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
     }
     return Object.entries(fields).map(([alias, field]) => {
       if (field && field.name && field.table) {
-        const tableName = getTable(field.table);
+        const tableName = getTableName(field.table);
         return {
           expression: `${escapeName(tableName)}.${escapeName(field.name)}`,
           alias

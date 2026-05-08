@@ -58,7 +58,7 @@
 
 // Table
 export { sybaseTable } from "./table.js";
-export type { SybaseTable } from "./table.js";
+export { SybaseTable } from "./table.js";
 
 // Column types
 export {
@@ -83,8 +83,7 @@ export {
   bit,
   binary,
   varbinary,
-  image,
-  customType
+  image
 } from "./columns/index.js";
 
 // Database instance
@@ -139,8 +138,8 @@ export type {
   SybaseDeleteResult
 } from "./query-builders/index.js";
 
-// Zod schema generation (requires zod as peer dependency)
-export { createSelectSchema, createInsertSchema, createUpdateSchema } from "./schema.js";
+// Re-export SQL type for convenience (type-only)
+export type { SQL } from "drizzle-orm";
 
 // Native binding utilities (lazy-loaded — only triggers native load on actual use)
 export { native, getNative } from "./native/index.js";

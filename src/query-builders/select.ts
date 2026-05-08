@@ -27,8 +27,9 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
+import { getTableName } from "drizzle-orm";
 
-import { escapeName, getTable, type SybaseDialect } from "../dialect.js";
+import { escapeName, type SybaseDialect } from "../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
     if (typeof table === "string") {
       this.config.table = escapeName(table);
     } else {
-      this.config.table = escapeName(getTable(table));
+      this.config.table = escapeName(getTableName(table));
     }
     return this;
   }
@@ -240,6 +241,11 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
       if (typeof col === "string") {
         return col;
       }
+      // Check for SybaseColumn (has name + table) before getSQL to avoid
+      // calling getSQL() on column objects that don't return a proper SQL instance
+      if (col && col.name && col.table) {
+        return `${escapeName(getTableName(col.table))}.${escapeName(col.name)}`;
+      }
       if (col && typeof col.getSQL === "function") {
         return this.dialect.sqlToQuery(col.getSQL());
       }
@@ -262,7 +268,7 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
     if (typeof table === "string") {
       tableName = escapeName(table);
     } else {
-      tableName = escapeName(getTable(table));
+      tableName = escapeName(getTableName(table));
     }
 
     const onStr = this.dialect.sqlToQuery(on);

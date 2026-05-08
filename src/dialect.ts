@@ -12,18 +12,8 @@
 import { Buffer } from "node:buffer";
 
 import type { SQL } from "drizzle-orm";
-import { getTableName } from "drizzle-orm";
 
 import type { SybaseSelectConfig } from "./query-builders/select.js";
-
-// ---------------------------------------------------------------------------
-// Drizzle internal symbols (not exposed in .d.ts, but exist at runtime)
-// ---------------------------------------------------------------------------
-
-/** @internal Symbol used by Drizzle to store column definitions on a table. */
-const ColumnsSymbol = Symbol.for("drizzle:Columns");
-/** @internal Symbol used by Drizzle to store the table name. */
-const NameSymbol = Symbol.for("drizzle:Name");
 
 // ---------------------------------------------------------------------------
 // SQL escaping helpers
@@ -102,23 +92,6 @@ export const serializeValue = (value: unknown): string => {
   }
   return escapeString(String(value));
 };
-
-// ---------------------------------------------------------------------------
-// Table helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Get columns record from a Drizzle table object.
- * @internal
- */
-export const getTableColumns = (table: any): Record<string, any> => table[ColumnsSymbol] ?? {};
-
-/**
- * Get the table name from a Drizzle table object.
- * @internal
- */
-export const getTable = (table: any): string =>
-  (table[NameSymbol] as string) ?? getTableName(table);
 
 // ---------------------------------------------------------------------------
 // Dialect

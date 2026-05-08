@@ -13,8 +13,9 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
+import { getTableName } from "drizzle-orm";
 
-import { escapeName, getTable, type SybaseDialect } from "../dialect.js";
+import { escapeName, type SybaseDialect } from "../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
@@ -66,7 +67,7 @@ export class SybaseDeleteBuilder {
   // ---------------------------------------------------------------------------
 
   private buildSql(): string {
-    const tableName = escapeName(getTable(this.table));
+    const tableName = escapeName(getTableName(this.table));
     let query = `delete from ${tableName}`;
     if (this.whereCondition) {
       query += ` where ${this.whereCondition}`;
