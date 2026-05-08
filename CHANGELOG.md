@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0](https://github.com/cjnoname/drizzle-sybase/compare/v0.2.0...v0.3.0) (2026-05-08)
+
+
+### Features
+
+* Initial release ([1cc0fe5](https://github.com/cjnoname/drizzle-sybase/commit/1cc0fe51da58aec2c7e225864c3fca765b310f49))
+
 ## [0.2.0] - Unreleased
 
 ### Added
