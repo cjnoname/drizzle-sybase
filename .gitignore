@@ -2,26 +2,8 @@ node_modules/
 dist/
 build/
 build-freetds/
-deps/freetds/
+deps/
 *.node
 npm/
-
-# IDE
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment
-.env
-.env.*
-
-# TypeScript
-*.tsbuildinfo
-
-# Test coverage
-coverage/
-
-# Temp
 tmp/
+.env

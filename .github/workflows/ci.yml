@@ -6,10 +6,6 @@ on:
   pull_request:
     branches: ["**"]
 
-env:
-  NODE_VERSION: "26.1.0"
-  PNPM_VERSION: "11.0.8"
-
 jobs:
   # Gate: skip CI when release-please merges (already tested in PR)
   should-run:
@@ -34,12 +30,10 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
-        with:
-          version: ${{ env.PNPM_VERSION }}
 
       - uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: 26
           cache: "pnpm"
 
       - name: Install dependencies
@@ -79,12 +73,10 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
-        with:
-          version: ${{ env.PNPM_VERSION }}
 
       - uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: 26
           cache: "pnpm"
 
       - name: Install dependencies
