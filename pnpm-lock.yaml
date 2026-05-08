@@ -31,7 +31,7 @@ importers:
         specifier: ^1.63.0
         version: 1.63.0(oxlint-tsgolint@0.22.1)
       oxlint-tsgolint:
-        specifier: 0.22.1
+        specifier: latest
         version: 0.22.1
       typescript:
         specifier: ^6.0.3
