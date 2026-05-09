@@ -38,6 +38,9 @@
             "VCLinkerTool": {
               "AdditionalLibraryDirectories": [
                 "<(module_root_dir)/deps/freetds/lib"
+              ],
+              "AdditionalOptions": [
+                "/NODEFAULTLIB:LIBCMT"
               ]
             }
           }

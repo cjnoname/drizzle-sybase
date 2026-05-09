@@ -50,9 +50,11 @@ if (-not (Test-Path $LibFile)) {
 
   Set-Location "freetds-$FreeTdsVersion"
 
-  Write-Host "==> Configuring FreeTDS (MSVC x64)..."
+  Write-Host "==> Configuring FreeTDS (MSVC x64, /MD runtime)..."
   cmake -B build -G "Visual Studio 17 2022" -A x64 `
     -DCMAKE_INSTALL_PREFIX="$DepsDir" `
+    -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
     -DWITH_OPENSSL=OFF `
     -DENABLE_ODBC=OFF
   if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
