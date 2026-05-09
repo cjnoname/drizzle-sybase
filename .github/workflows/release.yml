@@ -30,7 +30,7 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-x64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             platform: linux-arm64
           - os: macos-latest
             platform: darwin-arm64
@@ -48,27 +48,8 @@ jobs:
         with:
           node-version: 26
 
-      - name: Setup QEMU (linux-arm64)
-        if: matrix.platform == 'linux-arm64'
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      - name: Build in Docker (linux-arm64)
-        if: matrix.platform == 'linux-arm64'
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace \
-            node:24-bookworm \
-            bash -c "
-              apt-get update && apt-get install -y build-essential python3 curl &&
-              npm install -g node-gyp &&
-              bash scripts/build.sh
-            "
-
       - name: Build native (unix)
-        if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest'
         env:
           TARGET_ARCH: ${{ matrix.platform == 'darwin-x64' && 'x64' || '' }}
         run: |
@@ -198,7 +179,7 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-x64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             platform: linux-arm64
           - os: macos-latest
             platform: darwin-arm64
@@ -217,29 +198,8 @@ jobs:
         with:
           node-version: 26
 
-      # --- Linux ARM64: cross-compile via Docker + QEMU ---
-      - name: Setup QEMU (linux-arm64)
-        if: matrix.platform == 'linux-arm64'
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64
-
-      - name: Build in Docker (linux-arm64)
-        if: matrix.platform == 'linux-arm64'
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace \
-            node:24-bookworm \
-            bash -c "
-              apt-get update && apt-get install -y build-essential python3 curl &&
-              npm install -g node-gyp &&
-              bash scripts/build.sh
-            "
-
-      # --- macOS / Linux x64: native build ---
       - name: Build native (unix)
-        if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest'
         env:
           TARGET_ARCH: ${{ matrix.platform == 'darwin-x64' && 'x64' || '' }}
         run: |
