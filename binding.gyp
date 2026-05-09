@@ -27,10 +27,12 @@
         }],
         ["OS=='win'", {
           "libraries": [
-            "<(module_root_dir)/deps/freetds/lib/sybdb.lib",
+            "<(module_root_dir)/deps/freetds/lib/db-lib.lib",
             "<(module_root_dir)/deps/freetds/lib/tds.lib",
             "<(module_root_dir)/deps/freetds/lib/replacements.lib",
-            "ws2_32.lib"
+            "<(module_root_dir)/deps/freetds/lib/tdsutils.lib",
+            "ws2_32.lib",
+            "crypt32.lib"
           ],
           "msvs_settings": {
             "VCLinkerTool": {

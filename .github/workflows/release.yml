@@ -86,8 +86,7 @@ jobs:
           cmake -B build -G "Visual Studio 17 2022" -A x64 ^
             -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
             -DWITH_OPENSSL=OFF ^
-            -DENABLE_ODBC=OFF ^
-            -DBUILD_SHARED_LIBS=OFF
+            -DENABLE_ODBC=OFF
           cmake --build build --config Release --parallel
           cmake --install build --config Release
 
@@ -257,8 +256,7 @@ jobs:
           cmake -B build -G "Visual Studio 17 2022" -A x64 ^
             -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
             -DWITH_OPENSSL=OFF ^
-            -DENABLE_ODBC=OFF ^
-            -DBUILD_SHARED_LIBS=OFF
+            -DENABLE_ODBC=OFF
           cmake --build build --config Release --parallel
           cmake --install build --config Release
 

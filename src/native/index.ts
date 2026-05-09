@@ -62,8 +62,14 @@ function loadBundled(): NativeBinding | null {
     const mod = { exports: {} } as { exports: NativeBinding };
     dlopen(mod, fileURLToPath(addonUrl));
     return mod.exports;
-  } catch {
-    return null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `drizzle-sybase: failed to load native binding for ${platform}-${arch}.\n` +
+        `Path: ${fileURLToPath(addonUrl)}\n` +
+        `Reason: ${message}\n` +
+        `This usually means the .node binary has an unresolved DLL dependency (e.g. sybdb.dll on Windows).`
+    );
   }
 }
 
@@ -76,13 +82,13 @@ let _loaded = false;
  */
 export function getNative(): NativeBinding {
   if (!_loaded) {
-    _binding = loadBundled();
+    _binding = loadBundled(); // throws on dlopen failure; returns null on unsupported platform
     _loaded = true;
   }
   if (!_binding) {
     throw new Error(
-      `drizzle-sybase: no native binding for ${process.platform}-${process.arch}.\n` +
-        `Ensure the package was installed correctly (all platform .node files should be in dist/native/).`
+      `drizzle-sybase: unsupported platform ${process.platform}-${process.arch}.\n` +
+        `Supported: darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64.`
     );
   }
   return _binding;
