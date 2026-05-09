@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2](https://github.com/cjnoname/drizzle-sybase/compare/v1.0.1...v1.0.2) (2026-05-09)
+
+
+### Bug Fixes
+
+* Add Docker build step for linux-arm64 platform in release workflow ([7e352f3](https://github.com/cjnoname/drizzle-sybase/commit/7e352f3c53f3f0db0e32249a41e67dbabf7c270a))
+
 ## [1.0.1](https://github.com/cjnoname/drizzle-sybase/compare/v1.0.0...v1.0.1) (2026-05-09)
 
 
