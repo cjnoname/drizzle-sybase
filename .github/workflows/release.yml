@@ -48,8 +48,21 @@ jobs:
         with:
           node-version: 26
 
+      - name: Build in Docker (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            node:24-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y build-essential python3 curl &&
+              npm install -g node-gyp &&
+              bash scripts/build.sh
+            "
+
       - name: Build native (unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
         env:
           TARGET_ARCH: ${{ matrix.platform == 'darwin-x64' && 'x64' || '' }}
         run: |
@@ -198,8 +211,21 @@ jobs:
         with:
           node-version: 26
 
+      - name: Build in Docker (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            node:24-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y build-essential python3 curl &&
+              npm install -g node-gyp &&
+              bash scripts/build.sh
+            "
+
       - name: Build native (unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.platform != 'linux-arm64' && matrix.os != 'windows-latest'
         env:
           TARGET_ARCH: ${{ matrix.platform == 'darwin-x64' && 'x64' || '' }}
         run: |
