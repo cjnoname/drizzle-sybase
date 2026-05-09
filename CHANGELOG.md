@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1](https://github.com/cjnoname/drizzle-sybase/compare/v1.0.0...v1.0.1) (2026-05-09)
+
+
+### Bug Fixes
+
+* Update canary publish command to skip git checks ([8c53650](https://github.com/cjnoname/drizzle-sybase/commit/8c5365037b64f3b945510956eb97e71543b6b07b))
+* Update FreeTDS build configuration for improved compatibility and runtime settings ([79daa2b](https://github.com/cjnoname/drizzle-sybase/commit/79daa2b834206f3231245861e55ef9d54fe7e1b5))
+* Update FreeTDS build process and improve error handling in native binding loading ([6f8c42d](https://github.com/cjnoname/drizzle-sybase/commit/6f8c42dca72ffbbe9d095c04e544a4981c1b9ceb))
+* Update npm publish commands to use pnpm and adjust package manager version ([a31dd75](https://github.com/cjnoname/drizzle-sybase/commit/a31dd758c6d62ac2fbaf52f26e4a27d18fc1e5ea))
+* Update release workflow to support Ubuntu 24.04 ARM architecture and remove Docker build steps for linux-arm64 ([89d3414](https://github.com/cjnoname/drizzle-sybase/commit/89d341444eee481e4cd567013e63c8c3f08c4a43))
+
 ## [1.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v0.3.1...v1.0.0) (2026-05-08)
 
 
