@@ -1,6 +1,6 @@
 {
   "name": "drizzle-sybase",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Drizzle ORM driver for Sybase ASE with built-in FreeTDS native bindings",
   "keywords": [
     "ase",
