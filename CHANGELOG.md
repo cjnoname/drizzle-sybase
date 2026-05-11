@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.0.2...v1.1.0) (2026-05-11)
+
+
+### Features
+
+* Add hard timeout support for queries and connection configuration options ([02d5ddb](https://github.com/cjnoname/drizzle-sybase/commit/02d5ddb30f096c8d50017ae30413dcb7dc439ae4))
+
 ## [1.0.2](https://github.com/cjnoname/drizzle-sybase/compare/v1.0.1...v1.0.2) (2026-05-09)
 
 
