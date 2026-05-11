@@ -34,6 +34,21 @@ export interface SybaseConnectionConfig {
   password: string;
   /** Connection/query timeout in seconds. Default: 30 */
   timeout?: number;
+  /**
+   * TDS network packet size in bytes. Larger values reduce round-trips
+   * for big result sets. Default: 4096 (FreeTDS default is 512).
+   */
+  packetSize?: number;
+  /**
+   * Hard timeout for individual queries in ms. Acts as a last-resort
+   * watchdog if db-lib's cooperative timeout fails to abort a stuck I/O
+   * (e.g. server unresponsive after CANCEL). When this fires, the query
+   * rejects with a timeout error and the connection is marked dead so the
+   * pool replaces it.
+   *
+   * Defaults to `max(2 * timeout * 1000, 30000)` on the native side.
+   */
+  hardTimeoutMs?: number;
 }
 
 export interface SybasePoolConfig extends SybaseConnectionConfig {
@@ -155,8 +170,13 @@ export class SybaseConnection {
     this.closed = false;
     try {
       this.handle = await native.connect({
-        ...this.config,
-        timeout: this.config.timeout ?? 30
+        host: this.config.host,
+        port: this.config.port,
+        database: this.config.database,
+        username: this.config.username,
+        password: this.config.password,
+        timeout: this.config.timeout ?? 30,
+        packetSize: this.config.packetSize ?? 4096
       });
     } catch (err: any) {
       throw new SybaseConnectionError(err.message ?? String(err), {
@@ -168,7 +188,7 @@ export class SybaseConnection {
 
   async query<T = Record<string, unknown>>(
     sql: string,
-    options?: { maxRows?: number }
+    options?: { maxRows?: number; hardTimeoutMs?: number }
   ): Promise<QueryResult<T>> {
     // Serialize queries on this connection — db-lib DBPROCESS is not reentrant.
     const task = this.queryQueue.then(() => this.executeQuery<T>(sql, options));
@@ -179,7 +199,7 @@ export class SybaseConnection {
 
   private async executeQuery<T = Record<string, unknown>>(
     sql: string,
-    options?: { maxRows?: number }
+    options?: { maxRows?: number; hardTimeoutMs?: number }
   ): Promise<QueryResult<T>> {
     if (!this.handle || this.closed) {
       throw new SybaseConnectionError("Connection is closed", {
@@ -187,10 +207,71 @@ export class SybaseConnection {
         port: this.config.port
       });
     }
+
+    const baseTimeoutS = this.config.timeout ?? 30;
+    const nativeHardMs = options?.hardTimeoutMs ?? this.config.hardTimeoutMs;
+    // JS-side fallback: even longer than the native watchdog. If THIS fires,
+    // the native worker is stuck despite dbcancel — we bail at the JS layer
+    // and mark the connection dead so the pool replaces it. The worker may
+    // continue running until the OS finally gives up the socket; that's
+    // acceptable because libuv's worker pool will reclaim the slot eventually.
+    const jsHardMs = (nativeHardMs ?? Math.max(baseTimeoutS * 2 * 1000, 30000)) + 5000;
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Mark dead so the pool will discard this connection on release.
+        this.closed = true;
+        reject(
+          new SybaseTimeoutError(
+            `Query exceeded JS-side hard timeout of ${jsHardMs}ms; ` +
+              `native worker did not respond to cancel and connection has been abandoned`,
+            "query",
+            jsHardMs
+          )
+        );
+      }, jsHardMs);
+      // Don't keep the event loop alive just for this timer.
+      if (timer && typeof (timer as any).unref === "function") {
+        (timer as any).unref();
+      }
+    });
+
+    const nativeOptions: { maxRows?: number; hardTimeoutMs?: number } = {};
+    if (options?.maxRows !== undefined) {
+      nativeOptions.maxRows = options.maxRows;
+    }
+    if (nativeHardMs !== undefined) {
+      nativeOptions.hardTimeoutMs = nativeHardMs;
+    }
+
     try {
-      return (await native.query(this.handle, sql, options)) as unknown as QueryResult<T>;
+      const result = (await Promise.race([
+        native.query(this.handle, sql, nativeOptions),
+        timeoutPromise
+      ])) as unknown as QueryResult<T>;
+      return result;
     } catch (err: any) {
-      // Check if the error indicates a dead connection
+      // Native-side hard timeout — connection is dead.
+      if (err && err.hardTimeout) {
+        this.closed = true;
+        throw new SybaseTimeoutError(
+          err.message ?? "Query hard timeout",
+          "query",
+          baseTimeoutS * 2 * 1000
+        );
+      }
+      // Cooperative timeout (db-lib's DBSETTIME fired). Connection itself
+      // may still be usable, but to be safe we let the pool decide via
+      // isConnected().
+      if (err && err.timedOut) {
+        throw new SybaseTimeoutError(
+          err.message ?? "Query timed out",
+          "query",
+          baseTimeoutS * 1000
+        );
+      }
+      // Dead connection (e.g. server dropped, network gone)
       if (err && err.connectionDead) {
         this.closed = true;
         throw new SybaseConnectionError(err.message ?? String(err), {
@@ -198,10 +279,17 @@ export class SybaseConnection {
           port: this.config.port
         });
       }
+      if (err instanceof SybaseTimeoutError || err instanceof SybaseConnectionError) {
+        throw err;
+      }
       throw new SybaseQueryError(err.message ?? String(err), {
         sql,
         connectionDead: false
       });
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
   }
 
@@ -288,7 +376,13 @@ export class SybasePool {
   private closed = false;
   private draining = false;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly cfg: Required<Omit<SybasePoolConfig, "logger">> & { logger?: SybaseLogger };
+  private readonly cfg: Required<
+    Omit<SybasePoolConfig, "logger" | "packetSize" | "hardTimeoutMs">
+  > & {
+    logger?: SybaseLogger;
+    packetSize?: number;
+    hardTimeoutMs?: number;
+  };
 
   // Metrics tracking
   private _totalConnectionsCreated = 0;
@@ -491,7 +585,7 @@ export class SybasePool {
    */
   async query<T = Record<string, unknown>>(
     sql: string,
-    options?: { maxRows?: number }
+    options?: { maxRows?: number; hardTimeoutMs?: number }
   ): Promise<QueryResult<T>> {
     let lastError: Error | null = null;
 

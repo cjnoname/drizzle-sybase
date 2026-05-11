@@ -1,51 +1,173 @@
 /**
  * FreeTDS db-lib N-API native addon — production-grade implementation.
  *
- * Improvements over initial version:
- * - #1: Error messages from Sybase server are captured per-connection and
- *       passed back to JS (not just fprintf to stderr)
- * - #4: Memory cleanup on all error paths (no leaks)
- * - #5: maxRows protection to prevent OOM on large result sets
- * - #6: Query timeout support via DBSETTIME
- * - #9: Correct affectedRows for all DML result sets (accumulates across batch)
- * - Dead connection detection via DBDEAD()
+ * Design notes / bug fixes vs. earlier revisions:
+ *   - Per-connection query timeout via `dbsetopt(DBSETTIME)` instead of the
+ *     process-global `dbsettime()`. Same for login timeout: we serialize
+ *     `dbsetlogintime()` with a mutex around `dbopen()` so concurrent
+ *     connects with different timeouts don't race.
+ *   - err_handler returns INT_CANCEL only for fatal errors and INT_TIMEOUT
+ *     for SYBETIME so the user-supplied DBSETTIME drives cancellation cleanly.
+ *   - DBSETLPACKET is set on every login to avoid the 512-byte default,
+ *     which causes excessive round-trips on large result sets.
+ *   - Hard timeout watchdog: every async query spawns a uv_thread_t that, after
+ *     `hardTimeoutMs` (default 2 * timeout_seconds, min 30s) signals the JS
+ *     layer that the query has missed its deadline. The watchdog REJECTS the
+ *     pending promise immediately (via a threadsafe function) and marks the
+ *     connection dead so the pool discards it.
  *
- * All I/O is done on libuv worker threads (napi_create_async_work)
- * so the event loop is never blocked.
+ *     The watchdog deliberately does NOT call dbcancel() from its thread:
+ *     dbcancel() invokes tds_process_cancel() which reads from the same
+ *     socket the worker is reading from, racing with the worker's own
+ *     dbnextrow(). We rely on db-lib's per-connection DBSETTIME to actually
+ *     unblock the worker, which then exits naturally; the worker's late
+ *     return is discarded since the promise was already rejected.
+ *   - Deferred close: fn_close detects in-flight queries (via in_flight
+ *     counter) and instead of freeing immediately, sets pending_close.
+ *     conn_release in the worker performs the actual destruction, eliminating
+ *     the use-after-free that would otherwise happen when the JS layer
+ *     abandons a stuck connection.
+ *   - Concurrency self-protection: conn_acquire rejects re-entry while
+ *     another query is in flight on the same connection — db-lib's DBPROCESS
+ *     is not reentrant, and JS-side serialization can be bypassed.
+ *   - All db-lib calls run on libuv worker threads via napi_create_async_work
+ *     so the JS event loop is never blocked.
+ *   - Per-connection error buffer (handlers locate it via dbgetuserdata).
+ *   - maxRows protection, full memory cleanup on every error path.
+ *
+ * Operational note:
+ *   The libuv worker pool is shared (default size 4). If a worker is stuck
+ *   in db-lib I/O until DBSETTIME fires, that slot is unavailable. For
+ *   high-concurrency workloads, set UV_THREADPOOL_SIZE to a value at least
+ *   equal to your max pool size.
  */
 #include <node_api.h>
 #include <sybfront.h>
 #include <sybdb.h>
+#include <uv.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 // ---------------------------------------------------------------------------
-// Per-connection error buffer
+// Constants
 // ---------------------------------------------------------------------------
 
-// Maximum error message size we'll capture
+// Maximum error message size we'll capture per connection.
 #define ERR_BUF_SIZE 4096
-// Maximum rows to return by default (safety limit)
+// Maximum rows to return by default (safety limit against accidental OOM).
 #define DEFAULT_MAX_ROWS 1000000
+// Default TDS network packet size (bytes). Larger than the FreeTDS default
+// of 512 — fewer round-trips on big result sets. The server may negotiate
+// down if it can't go this high.
+#define DEFAULT_PACKET_SIZE 4096
+
+// ---------------------------------------------------------------------------
+// Global mutex for serializing inherently process-wide db-lib calls.
+//
+// `dbsetlogintime()` is process-global in FreeTDS. We hold this mutex from
+// the moment we set the login timeout until dbopen() returns, so concurrent
+// connects with different timeouts never see each other's value.
+// ---------------------------------------------------------------------------
+
+static uv_once_t global_init_once = UV_ONCE_INIT;
+static uv_mutex_t login_mutex;
+
+static void init_globals(void) {
+  uv_mutex_init(&login_mutex);
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection state
+// ---------------------------------------------------------------------------
 
 /**
  * Connection wrapper — holds the DBPROCESS plus error state.
  *
- * Error/message handlers use dbgetuserdata() to find this struct
- * and write error text into it. The query function checks has_error
- * after each db-lib call.
+ * The error/message handlers locate this struct via dbgetuserdata() and
+ * write error text into it. The query function checks has_error after each
+ * db-lib call.
+ *
+ * `dead` is set:
+ *   - by err_handler when DBDEAD() reports the connection is gone, or
+ *   - by the watchdog thread when it had to force-cancel a runaway query.
+ *
+ * Lifetime / free safety:
+ *   `lock` guards `in_flight` and `pending_close`. fn_close decrements
+ *   nothing, but if in_flight > 0 it sets pending_close and returns without
+ *   freeing — the worker (or watchdog) that decrements in_flight to zero
+ *   is then responsible for the actual dbclose+free. This prevents the JS
+ *   layer from racing a hard-timeout close against a still-running worker
+ *   that is mid-`dbnextrow()` (would otherwise be use-after-free).
  */
 typedef struct {
   DBPROCESS *dbproc;
   LOGINREC *login;
   char last_error[ERR_BUF_SIZE];
   int has_error;
-  int dead;  // set by err_handler if connection is dead
+  int dead;
+  int timed_out;        // set when err_handler sees SYBETIME
+  int timeout_seconds;  // remembered so watchdog can compute its deadline
+  uv_mutex_t lock;
+  int in_flight;        // # of running queries on this connection (0 or 1)
+  int pending_close;    // 1 if fn_close was called while in_flight > 0
 } SybaseConnection;
 
+// Forward declarations.
+static void destroy_connection(SybaseConnection *conn);
+
+/**
+ * Mark a query as starting on the connection. Returns 0 on success, -1 if
+ * the connection is already closed or has a pending close.
+ */
+static int conn_acquire(SybaseConnection *conn) {
+  uv_mutex_lock(&conn->lock);
+  if (conn->pending_close || conn->dbproc == NULL) {
+    uv_mutex_unlock(&conn->lock);
+    return -1;
+  }
+  conn->in_flight++;
+  uv_mutex_unlock(&conn->lock);
+  return 0;
+}
+
+/**
+ * Mark a query as finished. If a close was pending and this was the last
+ * in-flight query, performs the deferred dbclose + free here.
+ */
+static void conn_release(SybaseConnection *conn) {
+  uv_mutex_lock(&conn->lock);
+  conn->in_flight--;
+  int should_destroy = (conn->in_flight == 0 && conn->pending_close);
+  uv_mutex_unlock(&conn->lock);
+
+  if (should_destroy) {
+    destroy_connection(conn);
+  }
+}
+
+/**
+ * Actually free a connection. Must be called outside conn->lock; this
+ * function destroys the lock itself.
+ */
+static void destroy_connection(SybaseConnection *conn) {
+  if (conn->dbproc) {
+    dbclose(conn->dbproc);
+    conn->dbproc = NULL;
+  }
+  if (conn->login) {
+    dbloginfree(conn->login);
+    conn->login = NULL;
+  }
+  uv_mutex_destroy(&conn->lock);
+  free(conn);
+}
+
 // ---------------------------------------------------------------------------
-// Error/message handlers — store errors in connection's buffer
+// Error/message handlers
+//
+// These are installed once globally in module init. They route per-connection
+// state via dbgetuserdata().
 // ---------------------------------------------------------------------------
 
 static int err_handler(DBPROCESS *dbproc, int severity, int dberr,
@@ -59,7 +181,6 @@ static int err_handler(DBPROCESS *dbproc, int severity, int dberr,
   }
 
   if (conn) {
-    // Append to error buffer
     size_t cur_len = strlen(conn->last_error);
     if (cur_len < ERR_BUF_SIZE - 100) {
       snprintf(conn->last_error + cur_len, ERR_BUF_SIZE - cur_len,
@@ -67,16 +188,19 @@ static int err_handler(DBPROCESS *dbproc, int severity, int dberr,
     }
     conn->has_error = 1;
 
-    // Check if connection is dead
+    if (dberr == SYBETIME) {
+      conn->timed_out = 1;
+    }
+
     if (DBDEAD(dbproc)) {
       conn->dead = 1;
     }
   }
 
-  // Return INT_CANCEL for fatal errors, INT_CONTINUE for timeouts
+  // For the per-connection DBSETTIME firing, return INT_TIMEOUT so db-lib
+  // sends a cancel and does not loop. For all other fatal errors, INT_CANCEL.
   if (dberr == SYBETIME) {
-    // Timeout — cancel the query
-    return INT_CANCEL;
+    return INT_TIMEOUT;
   }
   return INT_CANCEL;
 }
@@ -113,17 +237,14 @@ static int msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate,
 }
 
 // ---------------------------------------------------------------------------
-// Helper: clear connection error state before operations
+// Helpers
 // ---------------------------------------------------------------------------
 
 static void clear_error(SybaseConnection *conn) {
   conn->last_error[0] = '\0';
   conn->has_error = 0;
+  conn->timed_out = 0;
 }
-
-// ---------------------------------------------------------------------------
-// Helper: free query result columns (used in both success and error paths)
-// ---------------------------------------------------------------------------
 
 typedef struct {
   char *name;
@@ -160,6 +281,7 @@ typedef struct {
   char username[256];
   char password[256];
   int timeout_seconds;
+  int packet_size;
   SybaseConnection *conn;
   char error[ERR_BUF_SIZE];
   int success;
@@ -175,11 +297,20 @@ static void connect_execute(napi_env env, void *data) {
     w->success = 0;
     return;
   }
+  if (uv_mutex_init(&w->conn->lock) != 0) {
+    snprintf(w->error, sizeof(w->error), "Mutex init failed");
+    free(w->conn);
+    w->conn = NULL;
+    w->success = 0;
+    return;
+  }
+  w->conn->timeout_seconds = w->timeout_seconds;
 
   w->conn->login = dblogin();
   if (!w->conn->login) {
     snprintf(w->error, sizeof(w->error), "dblogin() failed");
     w->success = 0;
+    uv_mutex_destroy(&w->conn->lock);
     free(w->conn);
     w->conn = NULL;
     return;
@@ -192,28 +323,52 @@ static void connect_execute(napi_env env, void *data) {
   // Set TDS version to 5.0 (Sybase ASE native)
   DBSETLVERSION(w->conn->login, DBVERSION_100);
 
-  // Set login timeout
-  if (w->timeout_seconds > 0) {
-    dbsetlogintime(w->timeout_seconds);
+  // Negotiate a larger TDS packet so big result sets aren't shipped
+  // 512 bytes at a time. The server may cap it, that's fine.
+  if (w->packet_size > 0) {
+    DBSETLPACKET(w->conn->login, w->packet_size);
   }
 
-  // Build host:port string
+  // Build host:port string for dbopen.
   char server[300];
   snprintf(server, sizeof(server), "%s:%d", w->host, w->port);
 
+  // dbsetlogintime() is process-global in FreeTDS. Serialize the
+  // login-timeout-set + dbopen pair so concurrent connects with different
+  // timeout values can't observe each other's setting.
+  uv_mutex_lock(&login_mutex);
+  if (w->timeout_seconds > 0) {
+    dbsetlogintime(w->timeout_seconds);
+  }
   w->conn->dbproc = dbopen(w->conn->login, server);
+  uv_mutex_unlock(&login_mutex);
+
   if (!w->conn->dbproc) {
-    snprintf(w->error, sizeof(w->error), "Failed to connect to %s:%d",
-             w->host, w->port);
+    if (w->conn->has_error) {
+      snprintf(w->error, sizeof(w->error), "%s", w->conn->last_error);
+    } else {
+      snprintf(w->error, sizeof(w->error), "Failed to connect to %s:%d",
+               w->host, w->port);
+    }
     dbloginfree(w->conn->login);
+    uv_mutex_destroy(&w->conn->lock);
     free(w->conn);
     w->conn = NULL;
     w->success = 0;
     return;
   }
 
-  // Associate our connection struct with the DBPROCESS for error handlers
+  // Associate our connection struct with the DBPROCESS so the global
+  // err/msg handlers can find it.
   dbsetuserdata(w->conn->dbproc, (BYTE *)w->conn);
+
+  // Per-connection query timeout. Replaces the legacy process-global
+  // dbsettime(). dbsetopt takes the value as a decimal string.
+  if (w->timeout_seconds > 0) {
+    char tval[16];
+    snprintf(tval, sizeof(tval), "%d", w->timeout_seconds);
+    dbsetopt(w->conn->dbproc, DBSETTIME, tval, 0);
+  }
 
   // Switch database
   if (strlen(w->database) > 0) {
@@ -227,16 +382,12 @@ static void connect_execute(napi_env env, void *data) {
       }
       dbclose(w->conn->dbproc);
       dbloginfree(w->conn->login);
+      uv_mutex_destroy(&w->conn->lock);
       free(w->conn);
       w->conn = NULL;
       w->success = 0;
       return;
     }
-  }
-
-  // Set query timeout if specified
-  if (w->timeout_seconds > 0) {
-    dbsettime(w->timeout_seconds);
   }
 
   w->success = 1;
@@ -260,7 +411,7 @@ static void connect_complete(napi_env env, napi_status status, void *data) {
   free(w);
 }
 
-// napi_value connect(config: { host, port, database, username, password, timeout? })
+// napi_value connect(config: { host, port, database, username, password, timeout?, packetSize? })
 static napi_value fn_connect(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -287,12 +438,25 @@ static napi_value fn_connect(napi_env env, napi_callback_info info) {
   napi_get_named_property(env, args[0], "password", &val);
   napi_get_value_string_utf8(env, val, w->password, sizeof(w->password), &len);
 
-  // Optional timeout (seconds)
-  w->timeout_seconds = 30; // default 30s
+  // Optional timeout (seconds), default 30s. Values <= 0 are coerced to 1
+  // because dbsetlogintime() ignores zero/negative input but its prior
+  // process-global value would silently leak through.
+  w->timeout_seconds = 30;
   napi_get_named_property(env, args[0], "timeout", &val);
   napi_typeof(env, val, &vtype);
   if (vtype == napi_number) {
     napi_get_value_int32(env, val, &w->timeout_seconds);
+  }
+  if (w->timeout_seconds <= 0) {
+    w->timeout_seconds = 1;
+  }
+
+  // Optional TDS packet size override.
+  w->packet_size = DEFAULT_PACKET_SIZE;
+  napi_get_named_property(env, args[0], "packetSize", &val);
+  napi_typeof(env, val, &vtype);
+  if (vtype == napi_number) {
+    napi_get_value_int32(env, val, &w->packet_size);
   }
 
   napi_value promise;
@@ -307,8 +471,40 @@ static napi_value fn_connect(napi_env env, napi_callback_info info) {
 }
 
 // ---------------------------------------------------------------------------
-// Async work: query
+// Async work: query (with hard-timeout watchdog)
 // ---------------------------------------------------------------------------
+
+/**
+ * Watchdog state.
+ *
+ * Lifecycle:
+ *   1. fn_query allocates the QueryWork and a Watchdog inside it.
+ *   2. query_execute starts a uv_thread that waits up to deadline_ms.
+ *      The wait is interruptible via uv_cond_signal on `cond`.
+ *   3. When the worker finishes (success or error) it signals the watchdog
+ *      so the thread exits cleanly without firing.
+ *   4. If the watchdog fires (worker still blocked past hardTimeoutMs):
+ *        - marks the connection dead (so the pool replaces it)
+ *        - sets `fired = 1` so query_execute can rewrite the error to a
+ *          clear hard-timeout message before the promise resolves.
+ *
+ *   We deliberately do NOT call dbcancel from this thread — dbcancel calls
+ *   tds_process_cancel which reads from the same socket the worker reads
+ *   from. We rely on db-lib's per-connection DBSETTIME to unblock the
+ *   worker; in the meantime the JS-side Promise.race in
+ *   SybaseConnection.executeQuery() guarantees the user's promise rejects
+ *   on schedule even if the libuv worker is still parked.
+ */
+typedef struct Watchdog {
+  uv_thread_t thread;
+  uv_mutex_t mutex;
+  uv_cond_t cond;
+  int started;     // 1 once the thread has been spawned
+  int finished;    // set by worker before signaling cond
+  int fired;       // set by watchdog when deadline elapsed
+  int deadline_ms;
+  SybaseConnection *conn;
+} Watchdog;
 
 typedef struct {
   napi_async_work work;
@@ -316,6 +512,7 @@ typedef struct {
   SybaseConnection *conn;
   char *sql;
   int max_rows;
+  int hard_timeout_ms;
   // Results
   ResultColumn *columns;
   int num_columns;
@@ -323,28 +520,106 @@ typedef struct {
   int affected_rows;
   char error[ERR_BUF_SIZE];
   int success;
+  // Snapshot of connection state captured before conn_release, so
+  // query_complete (JS thread) can build the error object without ever
+  // dereferencing w->conn — which may have been freed by then.
+  int conn_dead;
+  int conn_timed_out;
+  // Watchdog
+  Watchdog wd;
 } QueryWork;
+
+static void watchdog_thread(void *arg) {
+  Watchdog *wd = (Watchdog *)arg;
+
+  uv_mutex_lock(&wd->mutex);
+  if (!wd->finished) {
+    uint64_t timeout_ns = (uint64_t)wd->deadline_ms * 1000000ULL;
+    int rc = uv_cond_timedwait(&wd->cond, &wd->mutex, timeout_ns);
+    if (rc == UV_ETIMEDOUT && !wd->finished) {
+      wd->fired = 1;
+      if (wd->conn) {
+        wd->conn->dead = 1;
+      }
+    }
+  }
+  uv_mutex_unlock(&wd->mutex);
+}
+
+static int watchdog_start(Watchdog *wd, SybaseConnection *conn, int deadline_ms) {
+  if (deadline_ms <= 0) {
+    return 0; // disabled
+  }
+  if (uv_mutex_init(&wd->mutex) != 0) {
+    return -1;
+  }
+  if (uv_cond_init(&wd->cond) != 0) {
+    uv_mutex_destroy(&wd->mutex);
+    return -1;
+  }
+  wd->finished = 0;
+  wd->fired = 0;
+  wd->started = 0;
+  wd->conn = conn;
+  wd->deadline_ms = deadline_ms;
+  if (uv_thread_create(&wd->thread, watchdog_thread, wd) != 0) {
+    uv_cond_destroy(&wd->cond);
+    uv_mutex_destroy(&wd->mutex);
+    return -1;
+  }
+  wd->started = 1;
+  return 0;
+}
+
+static void watchdog_stop(Watchdog *wd) {
+  if (!wd->started) {
+    return;
+  }
+  uv_mutex_lock(&wd->mutex);
+  wd->finished = 1;
+  uv_cond_signal(&wd->cond);
+  uv_mutex_unlock(&wd->mutex);
+  uv_thread_join(&wd->thread);
+  uv_cond_destroy(&wd->cond);
+  uv_mutex_destroy(&wd->mutex);
+  wd->started = 0;
+}
 
 static void query_execute(napi_env env, void *data) {
   (void)env;
   QueryWork *w = (QueryWork *)data;
 
-  if (!w->conn || !w->conn->dbproc) {
+  if (!w->conn) {
     snprintf(w->error, sizeof(w->error), "Connection is closed");
     w->success = 0;
     return;
   }
 
-  // Check if connection is dead
+  // Acquire an in-flight slot. If the connection is closed (or close is
+  // pending from a JS-side hard-timeout abort) we reject without touching
+  // dbproc — the close path in conn_release will free the struct.
+  if (conn_acquire(w->conn) != 0) {
+    snprintf(w->error, sizeof(w->error), "Connection is closed");
+    w->success = 0;
+    // Important: do NOT touch w->conn after this point, except via
+    // query_complete which checks pending_close before re-acquiring.
+    return;
+  }
+
+  // Check if connection is dead.
   if (w->conn->dead || DBDEAD(w->conn->dbproc)) {
     snprintf(w->error, sizeof(w->error), "Connection is dead");
     w->conn->dead = 1;
     w->success = 0;
+    conn_release(w->conn);
     return;
   }
 
-  // Clear error state before executing
   clear_error(w->conn);
+
+  // Spawn the hard-timeout watchdog. Failure is non-fatal — db-lib's own
+  // DBSETTIME still provides a cooperative timeout.
+  watchdog_start(&w->wd, w->conn, w->hard_timeout_ms);
 
   // Send SQL command
   if (dbcmd(w->conn->dbproc, w->sql) == FAIL) {
@@ -354,7 +629,7 @@ static void query_execute(napi_env env, void *data) {
       snprintf(w->error, sizeof(w->error), "dbcmd() failed");
     }
     w->success = 0;
-    return;
+    goto done;
   }
 
   // Execute
@@ -364,10 +639,9 @@ static void query_execute(napi_env env, void *data) {
     } else {
       snprintf(w->error, sizeof(w->error), "dbsqlexec() failed");
     }
-    // Try to cancel any pending state
     dbcancel(w->conn->dbproc);
     w->success = 0;
-    return;
+    goto done;
   }
 
   // Process results — skip empty result sets (e.g. from SET ROWCOUNT)
@@ -390,7 +664,7 @@ static void query_execute(napi_env env, void *data) {
       w->num_columns = 0;
       w->num_rows = 0;
       w->success = 0;
-      return;
+      goto done;
     }
 
     int ncols = dbnumcols(w->conn->dbproc);
@@ -420,7 +694,7 @@ static void query_execute(napi_env env, void *data) {
       snprintf(w->error, sizeof(w->error), "Memory allocation failed for columns");
       dbcancel(w->conn->dbproc);
       w->success = 0;
-      return;
+      goto done;
     }
 
     for (int i = 0; i < w->num_columns; i++) {
@@ -445,7 +719,7 @@ static void query_execute(napi_env env, void *data) {
         w->num_rows = 0;
         dbcancel(w->conn->dbproc);
         w->success = 0;
-        return;
+        goto done;
       }
     }
 
@@ -463,7 +737,7 @@ static void query_execute(napi_env env, void *data) {
         w->num_rows = 0;
         dbcancel(w->conn->dbproc);
         w->success = 0;
-        return;
+        goto done;
       }
 
       // BUF_FULL (row_code > 0 for computed rows) — skip
@@ -494,7 +768,7 @@ static void query_execute(napi_env env, void *data) {
             w->num_rows = 0;
             dbcancel(w->conn->dbproc);
             w->success = 0;
-            return;
+            goto done;
           }
           w->columns[i].values = new_vals;
         }
@@ -524,7 +798,7 @@ static void query_execute(napi_env env, void *data) {
             w->num_rows = 0;
             dbcancel(w->conn->dbproc);
             w->success = 0;
-            return;
+            goto done;
           }
 
           int convlen = dbconvert(w->conn->dbproc, coltype, src, datalen,
@@ -565,10 +839,37 @@ static void query_execute(napi_env env, void *data) {
     w->num_columns = 0;
     w->num_rows = 0;
     w->success = 0;
-    return;
+    goto done;
   }
 
   w->success = 1;
+
+done:
+  // Stop the watchdog before returning. If it already fired (forced cancel),
+  // overwrite the error so the JS layer knows it was a hard timeout.
+  watchdog_stop(&w->wd);
+  if (w->wd.fired) {
+    snprintf(w->error, sizeof(w->error),
+             "Query exceeded hard timeout of %d ms — connection forcefully cancelled",
+             w->hard_timeout_ms);
+    free_columns(w->columns, w->num_columns, w->num_rows);
+    w->columns = NULL;
+    w->num_columns = 0;
+    w->num_rows = 0;
+    w->success = 0;
+  }
+
+  // Snapshot connection flags before releasing — w->conn may be freed
+  // inside conn_release if a close was pending.
+  w->conn_dead = w->conn->dead;
+  w->conn_timed_out = w->conn->timed_out;
+
+  // Release the in-flight slot. If a close was queued while we were running
+  // (JS-side hard timeout, pool drain, etc.), this is where the dbproc and
+  // the SybaseConnection struct are actually freed. After this call we MUST
+  // NOT touch w->conn — query_complete will run on the JS thread but only
+  // reads w->error / w->wd.fired / w->success, never w->conn->dbproc.
+  conn_release(w->conn);
 }
 
 static void query_complete(napi_env env, napi_status status, void *data) {
@@ -579,11 +880,22 @@ static void query_complete(napi_env env, napi_status status, void *data) {
     napi_create_string_utf8(env, w->error, NAPI_AUTO_LENGTH, &error_msg);
     napi_create_error(env, NULL, error_msg, &error_obj);
 
-    // Add 'dead' property if connection is dead
-    if (w->conn && w->conn->dead) {
+    if (w->conn_dead) {
       napi_value dead_val;
       napi_get_boolean(env, true, &dead_val);
       napi_set_named_property(env, error_obj, "connectionDead", dead_val);
+    }
+
+    if (w->conn_timed_out) {
+      napi_value to_val;
+      napi_get_boolean(env, true, &to_val);
+      napi_set_named_property(env, error_obj, "timedOut", to_val);
+    }
+
+    if (w->wd.fired) {
+      napi_value forced_val;
+      napi_get_boolean(env, true, &forced_val);
+      napi_set_named_property(env, error_obj, "hardTimeout", forced_val);
     }
 
     napi_reject_deferred(env, w->deferred, error_obj);
@@ -673,6 +985,10 @@ static void query_complete(napi_env env, napi_status status, void *data) {
 }
 
 // napi_value query(conn, sql, options?)
+//
+// options.maxRows: cap rows materialized into JS (defaults to 1,000,000).
+// options.hardTimeoutMs: hard kill threshold for stuck queries. If unset
+//   we derive it from the connection's timeout (2x timeout, min 30s).
 static napi_value fn_query(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value args[3];
@@ -689,17 +1005,34 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
   w->sql = (char *)malloc(sql_len + 1);
   napi_get_value_string_utf8(env, args[1], w->sql, sql_len + 1, &sql_len);
 
-  // Optional: maxRows from 3rd argument (options object)
+  // Defaults
   w->max_rows = DEFAULT_MAX_ROWS;
+  // Hard timeout: 2x the cooperative timeout, with a 30s floor so very small
+  // configured timeouts don't translate to absurdly tight watchdog deadlines.
+  int base_timeout_s = (w->conn && w->conn->timeout_seconds > 0)
+                           ? w->conn->timeout_seconds
+                           : 30;
+  w->hard_timeout_ms = base_timeout_s * 2 * 1000;
+  if (w->hard_timeout_ms < 30000) {
+    w->hard_timeout_ms = 30000;
+  }
+
   if (argc >= 3) {
     napi_valuetype vtype;
     napi_typeof(env, args[2], &vtype);
     if (vtype == napi_object) {
-      napi_value max_rows_val;
-      napi_get_named_property(env, args[2], "maxRows", &max_rows_val);
-      napi_typeof(env, max_rows_val, &vtype);
+      napi_value v;
+
+      napi_get_named_property(env, args[2], "maxRows", &v);
+      napi_typeof(env, v, &vtype);
       if (vtype == napi_number) {
-        napi_get_value_int32(env, max_rows_val, &w->max_rows);
+        napi_get_value_int32(env, v, &w->max_rows);
+      }
+
+      napi_get_named_property(env, args[2], "hardTimeoutMs", &v);
+      napi_typeof(env, v, &vtype);
+      if (vtype == napi_number) {
+        napi_get_value_int32(env, v, &w->hard_timeout_ms);
       }
     }
   }
@@ -719,6 +1052,19 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
 // Close connection
 // ---------------------------------------------------------------------------
 
+// fn_close: deferred-safe close.
+//
+// If a query worker is currently running on this connection (e.g. JS layer
+// gave up on a hard timeout but the C-level dbnextrow is still blocked), we
+// do NOT free dbproc here — that would be a use-after-free in the worker.
+// Instead we set pending_close; conn_release in the worker will perform the
+// actual destruction once it returns.
+//
+// We deliberately do NOT call dbcancel from this thread either: dbcancel
+// invokes tds_process_cancel which reads from the same socket the worker
+// is reading from. We rely on db-lib's per-connection DBSETTIME to abort
+// the worker; if the user wants tighter behavior they must configure a
+// smaller `timeout` rather than a smaller hardTimeoutMs.
 static napi_value fn_close(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -728,15 +1074,17 @@ static napi_value fn_close(napi_env env, napi_callback_info info) {
   napi_get_value_external(env, args[0], (void **)&conn);
 
   if (conn) {
-    if (conn->dbproc) {
-      dbclose(conn->dbproc);
-      conn->dbproc = NULL;
+    uv_mutex_lock(&conn->lock);
+    int can_destroy_now = (conn->in_flight == 0);
+    int already_pending = conn->pending_close;
+    conn->pending_close = 1;
+    conn->dead = 1;  // reject any subsequent acquire
+    uv_mutex_unlock(&conn->lock);
+
+    if (can_destroy_now && !already_pending) {
+      destroy_connection(conn);
     }
-    if (conn->login) {
-      dbloginfree(conn->login);
-      conn->login = NULL;
-    }
-    free(conn);
+    // else: worker (or someone holding in_flight) will free in conn_release.
   }
 
   napi_value undefined;
@@ -757,8 +1105,12 @@ static napi_value fn_is_alive(napi_env env, napi_callback_info info) {
   napi_get_value_external(env, args[0], (void **)&conn);
 
   int alive = 0;
-  if (conn && conn->dbproc && !conn->dead && !DBDEAD(conn->dbproc)) {
-    alive = 1;
+  if (conn) {
+    uv_mutex_lock(&conn->lock);
+    if (conn->dbproc && !conn->dead && !conn->pending_close && !DBDEAD(conn->dbproc)) {
+      alive = 1;
+    }
+    uv_mutex_unlock(&conn->lock);
   }
 
   napi_value result;
@@ -784,6 +1136,8 @@ static napi_value fn_get_version(napi_env env, napi_callback_info info) {
 // ---------------------------------------------------------------------------
 
 static napi_value init(napi_env env, napi_value exports) {
+  uv_once(&global_init_once, init_globals);
+
   if (dbinit() == FAIL) {
     napi_throw_error(env, NULL, "FreeTDS dbinit() failed");
     return exports;

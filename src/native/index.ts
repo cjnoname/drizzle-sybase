@@ -13,6 +13,18 @@ import { fileURLToPath } from "node:url";
 
 export interface NativeQueryOptions {
   maxRows?: number;
+  /**
+   * Hard timeout in ms. If the query has not produced a result by this
+   * deadline, the returned promise rejects with `error.hardTimeout = true`
+   * and the connection is marked dead so the pool replaces it.
+   *
+   * Note: the underlying libuv worker may continue running until db-lib's
+   * cooperative DBSETTIME fires (set from the connection's `timeout`).
+   * Its result is discarded.
+   *
+   * Defaults to `max(2 * connection.timeout * 1000, 30000)` on the native side.
+   */
+  hardTimeoutMs?: number;
 }
 
 export interface NativeBinding {
@@ -23,6 +35,8 @@ export interface NativeBinding {
     username: string;
     password: string;
     timeout?: number;
+    /** TDS network packet size in bytes. Defaults to 4096 (FreeTDS default is 512). */
+    packetSize?: number;
   }): Promise<unknown>;
   query(
     conn: unknown,
