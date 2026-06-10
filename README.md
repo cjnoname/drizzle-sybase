@@ -136,6 +136,63 @@ This will:
 - **Identifiers**: Quoted with `[brackets]`
 - **Date format**: `'YYYY-MM-DD HH:MM:SS.mmm'` (no T separator)
 
+## Schema Introspection (generate schema from an existing database)
+
+Reverse-engineer Sybase ASE tables into drizzle-sybase definitions, Zod
+schemas, and TypeScript types — the Sybase equivalent of `drizzle-kit pull`.
+
+### CLI
+
+```bash
+npx drizzle-sybase-introspect \
+  --host=sybase-host --port=5000 --database=mydb \
+  --username=sa --password=secret \
+  --tables=USERS,ORDERS --owner=dbo \
+  --out=src/drizzle/generated/sybase.ts
+```
+
+Credentials can also be supplied via env vars: `SYBASE_HOST`, `SYBASE_PORT`,
+`SYBASE_DATABASE`, `SYBASE_USERNAME`, `SYBASE_PASSWORD`, `SYBASE_TABLES`.
+Omit `--out` to print to stdout, and omit `--tables` to introspect all user tables.
+
+### Programmatic
+
+```ts
+import { introspectSybase, introspectWith } from "drizzle-sybase/introspect";
+import { writeFileSync } from "node:fs";
+
+// Self-contained: opens a short-lived pool and closes it.
+const { code, warnings } = await introspectSybase({
+  host: "sybase-host",
+  port: 5000,
+  database: "mydb",
+  username: "sa",
+  password: "secret",
+  tables: ["USERS", "ORDERS"]
+});
+warnings.forEach(w => console.warn(w));
+writeFileSync("src/drizzle/generated/sybase.ts", code);
+
+// Or reuse an existing db/pool (e.g. credentials from a secrets manager):
+const db = createSybaseDrizzle({
+  /* ... */
+});
+const result = await introspectWith(db, { database: "mydb", tables: ["USERS"] });
+```
+
+The generator reads the Sybase system catalogs (`sysobjects`, `syscolumns`,
+`systypes`, `syscomments`, `sysindexes`), resolves user-defined types back to
+their base system type, halves byte lengths for national (Unicode) char types,
+and emits:
+
+- `sybaseTable(...)` definitions (single-column primary keys inline; composite
+  keys preserved as a comment and in the exported `<table>Indexes` constant)
+- `<table>Indexes` metadata (primary/unique flags + key columns)
+- Zod select schemas (`<table>Schema` + `<Table>Row` type)
+- Zod insert schemas (`<table>InsertSchema` + `New<Table>` type, identity columns excluded)
+
+Unmapped Sybase types fall back to `varchar` and are reported via `warnings`.
+
 ## License
 
 MIT

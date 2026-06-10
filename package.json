@@ -22,6 +22,9 @@
     "type": "git",
     "url": "git+https://github.com/cjnoname/drizzle-sybase.git"
   },
+  "bin": {
+    "drizzle-sybase-introspect": "./dist/introspect/cli.js"
+  },
   "files": [
     "dist",
     "src/native/binding.c",
@@ -35,6 +38,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./introspect": {
+      "types": "./dist/introspect/index.d.ts",
+      "import": "./dist/introspect/index.js"
     }
   },
   "scripts": {
@@ -51,18 +58,18 @@
     "clean": "pnpm dlx --reporter=silent rimraf \"**/node_modules\" pnpm-lock.yaml \"**/dist\" -g && pnpm i"
   },
   "devDependencies": {
-    "@types/node": "^25.6.2",
-    "concurrently": "^9.2.1",
+    "@types/node": "^25.9.2",
+    "concurrently": "^10.0.3",
     "husky": "^9.1.7",
-    "node-gyp": "^12.3.0",
-    "oxfmt": "^0.48.0",
-    "oxlint": "^1.63.0",
+    "node-gyp": "^12.4.0",
+    "oxfmt": "^0.54.0",
+    "oxlint": "^1.69.0",
     "oxlint-tsgolint": "latest",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.5"
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
-    "drizzle-orm": "^1.0.0-rc.2"
+    "drizzle-orm": "^1.0.0-rc.3"
   },
   "engines": {
     "node": ">=24"
