@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.1.0...v1.2.0) (2026-06-10)
+
+
+### Features
+
+* Add Sybase schema introspection (drizzle-sybase/introspect) ([f8e6bbc](https://github.com/cjnoname/drizzle-sybase/commit/f8e6bbcd3539781f83550d0aa839e5966bec95b6))
+
+
+### Bug Fixes
+
+* **ci:** Pass a module object with exports to process.dlopen in smoke test ([ee45c06](https://github.com/cjnoname/drizzle-sybase/commit/ee45c0650a9cbb71398e74ce7ccbbb301f90bfd9))
+* **ci:** Strip Node 26 thin-LTO flags from Windows native build ([ee0aeb3](https://github.com/cjnoname/drizzle-sybase/commit/ee0aeb3d785abaab1744e0876d4b685450c730ea))
+
 ## [1.1.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.0.2...v1.1.0) (2026-05-11)
 
 
