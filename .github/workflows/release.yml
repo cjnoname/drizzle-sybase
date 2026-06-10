@@ -91,7 +91,27 @@ jobs:
         shell: bash
         run: |
           npm install -g node-gyp
-          npx node-gyp rebuild
+          # Some Node 26 Windows builds enable thin-LTO, so node-gyp inherits
+          # Clang LTO flags (-flto=thin and /opt:lldltojobs=N) that MSVC's
+          # link.exe rejects (LNK1117). binding.gyp strips those flags on
+          # Windows; -D here is a secondary lever for config.gypi files that use
+          # the %-default form. We print the resolved config.gypi first so the
+          # real enable_thin_lto / lto_jobs values are visible in the logs.
+          npx node-gyp configure -Denable_lto=false -Denable_thin_lto=false
+          echo "----- build/config.gypi (LTO-related) -----"
+          grep -Ei "lto" build/config.gypi || echo "(no lto keys found)"
+          echo "--------------------------------------------"
+          npx node-gyp build
+
+      - name: Smoke-test native addon (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          # Guard against a "green but broken" build: actually dlopen the
+          # freshly built addon and call a function that reaches into the
+          # statically linked FreeTDS, so a bad link fails CI here instead of
+          # shipping a broken binary.
+          node -e "const m={};process.dlopen(m,require('path').resolve('build/Release/sybase_native.node'));const v=m.exports.getVersion();if(!String(v).includes('FreeTDS'))throw new Error('unexpected getVersion(): '+v);for(const f of ['connect','query','close','isAlive']){if(typeof m.exports[f]!=='function')throw new Error('missing export: '+f);}console.log('native smoke test OK:',v);"
 
       - name: Rename artifact
         shell: bash
@@ -255,9 +275,29 @@ jobs:
         shell: bash
         run: |
           npm install -g node-gyp
-          npx node-gyp rebuild
+          # Some Node 26 Windows builds enable thin-LTO, so node-gyp inherits
+          # Clang LTO flags (-flto=thin and /opt:lldltojobs=N) that MSVC's
+          # link.exe rejects (LNK1117). binding.gyp strips those flags on
+          # Windows; -D here is a secondary lever for config.gypi files that use
+          # the %-default form. We print the resolved config.gypi first so the
+          # real enable_thin_lto / lto_jobs values are visible in the logs.
+          npx node-gyp configure -Denable_lto=false -Denable_thin_lto=false
+          echo "----- build/config.gypi (LTO-related) -----"
+          grep -Ei "lto" build/config.gypi || echo "(no lto keys found)"
+          echo "--------------------------------------------"
+          npx node-gyp build
 
       # --- Upload ---
+      - name: Smoke-test native addon (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          # Guard against a "green but broken" build: actually dlopen the
+          # freshly built addon and call a function that reaches into the
+          # statically linked FreeTDS, so a bad link fails CI here instead of
+          # shipping a broken binary.
+          node -e "const m={};process.dlopen(m,require('path').resolve('build/Release/sybase_native.node'));const v=m.exports.getVersion();if(!String(v).includes('FreeTDS'))throw new Error('unexpected getVersion(): '+v);for(const f of ['connect','query','close','isAlive']){if(typeof m.exports[f]!=='function')throw new Error('missing export: '+f);}console.log('native smoke test OK:',v);"
+
       - name: Rename artifact
         shell: bash
         run: cp build/Release/sybase_native.node sybase_native.${{ matrix.platform }}.node

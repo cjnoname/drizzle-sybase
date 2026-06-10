@@ -35,12 +35,34 @@
             "crypt32.lib"
           ],
           "msvs_settings": {
+            "VCCLCompilerTool": {
+              "WholeProgramOptimization": "false",
+              "AdditionalOptions!": [
+                "-flto=thin",
+                "-flto=full"
+              ]
+            },
+            "VCLibrarianTool": {
+              "AdditionalOptions!": [
+                "-flto=thin",
+                "-flto=full"
+              ]
+            },
             "VCLinkerTool": {
+              "LinkTimeCodeGeneration": "0",
               "AdditionalLibraryDirectories": [
                 "<(module_root_dir)/deps/freetds/lib"
               ],
               "AdditionalOptions": [
                 "/NODEFAULTLIB:LIBCMT"
+              ],
+              "AdditionalOptions!": [
+                "-flto=thin",
+                "-flto=full",
+                "/opt:lldltojobs=2",
+                "/opt:lldltojobs=1",
+                "/opt:lldltojobs=4",
+                "/opt:lldltojobs=8"
               ]
             }
           }

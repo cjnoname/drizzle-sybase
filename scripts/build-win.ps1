@@ -88,7 +88,11 @@ if (Test-Path $ImportLib) {
 
 Write-Host "==> Building native addon..."
 Set-Location $RootDir
-npx node-gyp rebuild
+# Some Node 26 Windows builds enable thin-LTO, so node-gyp inherits Clang LTO
+# flags (-flto=thin and /opt:lldltojobs=N) that MSVC's link.exe rejects
+# (LNK1117). binding.gyp strips those flags on Windows; the -D flags are a
+# secondary lever for config.gypi files that use the %-default form.
+npx node-gyp rebuild -Denable_lto=false -Denable_thin_lto=false
 if ($LASTEXITCODE -ne 0) { throw "node-gyp rebuild failed" }
 
 # ---------------------------------------------------------------------------
