@@ -1,5 +1,9 @@
 # drizzle-sybase
 
+[![npm version](https://img.shields.io/npm/v/drizzle-sybase.svg)](https://www.npmjs.com/package/drizzle-sybase)
+[![npm downloads](https://img.shields.io/npm/dm/drizzle-sybase.svg)](https://www.npmjs.com/package/drizzle-sybase)
+[![license](https://img.shields.io/npm/l/drizzle-sybase.svg)](https://github.com/cjnoname/drizzle-sybase/blob/main/LICENSE)
+
 Drizzle ORM driver for **Sybase ASE** with built-in FreeTDS native bindings.
 
 Zero system dependencies — FreeTDS is statically compiled into the native addon. Works on Lambda (ARM64/x64), containers, and local dev without installing anything.
@@ -97,7 +101,7 @@ This will:
 1. Download FreeTDS source
 2. Compile as static library (`libsybdb.a`)
 3. Build the N-API addon linked against it
-4. Place the `.node` file in the correct `npm/` directory
+4. Place the `.node` file in `src/native/` (e.g. `sybase_native.darwin-arm64.node`)
 
 ## Architecture
 
