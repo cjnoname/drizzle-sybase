@@ -111,7 +111,7 @@ jobs:
           # freshly built addon and call a function that reaches into the
           # statically linked FreeTDS, so a bad link fails CI here instead of
           # shipping a broken binary.
-          node -e "const m={};process.dlopen(m,require('path').resolve('build/Release/sybase_native.node'));const v=m.exports.getVersion();if(!String(v).includes('FreeTDS'))throw new Error('unexpected getVersion(): '+v);for(const f of ['connect','query','close','isAlive']){if(typeof m.exports[f]!=='function')throw new Error('missing export: '+f);}console.log('native smoke test OK:',v);"
+          node -e "const m={exports:{}};process.dlopen(m,require('path').resolve('build/Release/sybase_native.node'));const v=m.exports.getVersion();if(!String(v).includes('FreeTDS'))throw new Error('unexpected getVersion(): '+v);for(const f of ['connect','query','close','isAlive']){if(typeof m.exports[f]!=='function')throw new Error('missing export: '+f);}console.log('native smoke test OK:',v);"
 
       - name: Rename artifact
         shell: bash
@@ -296,7 +296,7 @@ jobs:
           # freshly built addon and call a function that reaches into the
           # statically linked FreeTDS, so a bad link fails CI here instead of
           # shipping a broken binary.
-          node -e "const m={};process.dlopen(m,require('path').resolve('build/Release/sybase_native.node'));const v=m.exports.getVersion();if(!String(v).includes('FreeTDS'))throw new Error('unexpected getVersion(): '+v);for(const f of ['connect','query','close','isAlive']){if(typeof m.exports[f]!=='function')throw new Error('missing export: '+f);}console.log('native smoke test OK:',v);"
+          node -e "const m={exports:{}};process.dlopen(m,require('path').resolve('build/Release/sybase_native.node'));const v=m.exports.getVersion();if(!String(v).includes('FreeTDS'))throw new Error('unexpected getVersion(): '+v);for(const f of ['connect','query','close','isAlive']){if(typeof m.exports[f]!=='function')throw new Error('missing export: '+f);}console.log('native smoke test OK:',v);"
 
       - name: Rename artifact
         shell: bash
