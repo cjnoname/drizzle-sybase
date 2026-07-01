@@ -69,6 +69,12 @@ jobs:
           npm install -g node-gyp
           bash scripts/build.sh
 
+      - name: Set up MSVC (windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build FreeTDS (windows)
         if: matrix.os == 'windows-latest'
         shell: cmd
@@ -77,14 +83,15 @@ jobs:
           curl -fsSL https://www.freetds.org/files/stable/freetds-1.5.17.tar.gz -o freetds.tar.gz
           tar xzf freetds.tar.gz
           cd freetds-1.5.17
-          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+          cmake -B build -G "Ninja" ^
+            -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
             -DCMAKE_POLICY_DEFAULT_CMP0091=NEW ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
             -DWITH_OPENSSL=OFF ^
             -DENABLE_ODBC=OFF
-          cmake --build build --config Release --parallel
-          cmake --install build --config Release
+          cmake --build build --parallel
+          cmake --install build
 
       - name: Build native addon (windows)
         if: matrix.os == 'windows-latest'
@@ -253,6 +260,12 @@ jobs:
           bash scripts/build.sh
 
       # --- Windows: CMake + MSVC ---
+      - name: Set up MSVC (windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build FreeTDS (windows)
         if: matrix.os == 'windows-latest'
         shell: cmd
@@ -261,14 +274,15 @@ jobs:
           curl -fsSL https://www.freetds.org/files/stable/freetds-1.5.17.tar.gz -o freetds.tar.gz
           tar xzf freetds.tar.gz
           cd freetds-1.5.17
-          cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+          cmake -B build -G "Ninja" ^
+            -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
             -DCMAKE_POLICY_DEFAULT_CMP0091=NEW ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
             -DWITH_OPENSSL=OFF ^
             -DENABLE_ODBC=OFF
-          cmake --build build --config Release --parallel
-          cmake --install build --config Release
+          cmake --build build --parallel
+          cmake --install build
 
       - name: Build native addon (windows)
         if: matrix.os == 'windows-latest'
