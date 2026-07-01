@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.2.0...v1.3.0) (2026-07-01)
+
+
+### Features
+
+* Add AGENTS.md and LICENSE file; update README.md with license badge ([1fcccda](https://github.com/cjnoname/drizzle-sybase/commit/1fcccdaf7b3e9891f2f9301166690f0f70e3e896))
+* Add FUNDING.yml to enable sponsorship options ([c5ccc23](https://github.com/cjnoname/drizzle-sybase/commit/c5ccc23c54b0dfe36bfb8d098392cb9df461ce8e))
+* Add MSVC setup step for Windows builds and update CMake generator to Ninja ([b8980ce](https://github.com/cjnoname/drizzle-sybase/commit/b8980ce362ba56e79a5c4b06d9c31cf8bae85868))
+
+
+### Bug Fixes
+
+* Update typescript version to 7.0.1-rc in package.json and pnpm-lock.yaml ([b5c7ac5](https://github.com/cjnoname/drizzle-sybase/commit/b5c7ac5707d1c086f8958a103993b0ee1b8e9e55))
+
 ## [1.2.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.1.0...v1.2.0) (2026-06-10)
 
 
