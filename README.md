@@ -178,9 +178,7 @@ warnings.forEach(w => console.warn(w));
 writeFileSync("src/drizzle/generated/sybase.ts", code);
 
 // Or reuse an existing db/pool (e.g. credentials from a secrets manager):
-const db = createSybaseDrizzle({
-  /* ... */
-});
+const db = createSybaseDrizzle({/* ... */});
 const result = await introspectWith(db, { database: "mydb", tables: ["USERS"] });
 ```
 
