@@ -58,15 +58,15 @@
     "clean": "pnpm dlx --reporter=silent rimraf \"**/node_modules\" pnpm-lock.yaml \"**/dist\" -g && pnpm i"
   },
   "devDependencies": {
-    "@types/node": "^26.0.1",
-    "concurrently": "^10.0.3",
+    "@types/node": "^26.1.2",
+    "concurrently": "^10.0.4",
     "husky": "^9.1.7",
-    "node-gyp": "^13.0.0",
-    "oxfmt": "^0.57.0",
-    "oxlint": "^1.72.0",
+    "node-gyp": "^13.0.1",
+    "oxfmt": "^0.61.0",
+    "oxlint": "^1.76.0",
     "oxlint-tsgolint": "latest",
-    "typescript": "7.0.1-rc",
-    "vitest": "^4.1.9"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   },
   "peerDependencies": {
     "drizzle-orm": "^1.0.0-rc.4"
@@ -74,5 +74,5 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@11.9.0"
+  "packageManager": "pnpm@11.18.0"
 }
