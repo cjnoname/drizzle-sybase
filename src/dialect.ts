@@ -12,7 +12,10 @@
 import { Buffer } from "node:buffer";
 
 import type { SQL } from "drizzle-orm";
+import { CodecsCollection, refineCodecs, type Codecs } from "drizzle-orm/codecs";
 
+import { castExactNumericLiteral, SYBASE_CODECS } from "./codecs.js";
+import { formatSybaseDateTime, resolveTimeZone } from "./datetime.js";
 import type { SybaseSelectConfig } from "./query-builders/select.js";
 
 // ---------------------------------------------------------------------------
@@ -47,19 +50,25 @@ export const escapeString = (str: string): string => {
  * - null/undefined → NULL
  * - numbers (including NaN/Infinity checks)
  * - booleans → 1/0
- * - Date → Sybase-compatible datetime string
+ * - Date → Sybase-compatible datetime string, in `timeZone` (default UTC)
  * - Buffer → hex literal (0x...)
  * - bigint → numeric string
  * - Arrays → throws (use individual values)
  * - Strings → escaped string literal
  */
-export const serializeValue = (value: unknown): string => {
+export const serializeValue = (value: unknown, timeZone?: string): string => {
   if (value === null || value === undefined) {
     return "NULL";
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
       throw new Error(`Cannot serialize non-finite number to SQL: ${value}`);
+    }
+    // `String()` switches to exponential notation at 1e21, and ASE reads that as
+    // a float — so an integer that a wide `numeric` could hold exactly would be
+    // rounded to a double's precision on the way in. BigInt renders every digit.
+    if (Number.isInteger(value) && Math.abs(value) >= 1e21) {
+      return BigInt(value).toString();
     }
     return String(value);
   }
@@ -70,8 +79,11 @@ export const serializeValue = (value: unknown): string => {
     if (Number.isNaN(value.getTime())) {
       throw new Error("Cannot serialize invalid Date to SQL");
     }
-    // Sybase ASE does NOT accept ISO 8601 'T' separator — use space
-    return `'${value.toISOString().slice(0, 23).replace("T", " ")}'`;
+    // ASE stores a naive wall clock, so the instant has to be rendered in the
+    // server's zone. Without one configured this is UTC, which is byte for byte
+    // what `toISOString()` produced before `timeZone` existed. ASE does NOT
+    // accept the ISO 8601 'T' separator — hence the space.
+    return `'${formatSybaseDateTime(value, timeZone)}'`;
   }
   if (Buffer.isBuffer(value)) {
     return `0x${value.toString("hex")}`;
@@ -97,7 +109,34 @@ export const serializeValue = (value: unknown): string => {
 // Dialect
 // ---------------------------------------------------------------------------
 
+export interface SybaseDialectConfig {
+  /** Extra or overriding codecs, merged over the built-in Sybase set. */
+  codecs?: Codecs;
+  /** IANA zone the server keeps its clocks in. Default: UTC. */
+  timeZone?: string;
+}
+
 export class SybaseDialect {
+  /**
+   * Applied to inlined parameters by drizzle-orm. This is what covers WHERE,
+   * JOIN ... ON and HAVING, which build their SQL from drizzle's own chunks
+   * rather than through {@link SybaseDialect.serializeColumnValue}.
+   */
+  readonly codecs: CodecsCollection;
+
+  /** Zone used to render `Date` values as ASE wall clocks. */
+  readonly timeZone: string;
+
+  constructor(config?: SybaseDialectConfig) {
+    this.codecs = new CodecsCollection(
+      type => type,
+      config?.codecs ? refineCodecs(SYBASE_CODECS, config.codecs) : SYBASE_CODECS
+    );
+    // Validated here so a typo fails at setup rather than from inside the first
+    // statement that happens to carry a Date.
+    this.timeZone = resolveTimeZone(config?.timeZone);
+  }
+
   /**
    * Convert a Drizzle SQL object to a raw SQL string for Sybase.
    * All parameters are inlined.
@@ -105,8 +144,9 @@ export class SybaseDialect {
   sqlToQuery(sqlObj: SQL): string {
     const { sql: sqlString } = sqlObj.toQuery({
       escapeName,
-      escapeParam: (_index: number, value: unknown) => serializeValue(value),
-      escapeString
+      escapeParam: (_index: number, value: unknown) => serializeValue(value, this.timeZone),
+      escapeString,
+      codecs: this.codecs
     });
     return sqlString;
   }
@@ -114,6 +154,12 @@ export class SybaseDialect {
   /**
    * Serialize a column value to inline SQL.
    * Handles SQL expressions (getSQL/toQuery), mapToDriverValue, and raw values.
+   *
+   * A decimal string bound to `money`, `smallmoney` or a sized
+   * `numeric`/`decimal` is wrapped in CONVERT rather than emitted as a plain
+   * quoted literal, because ASE refuses the implicit conversion — see
+   * `./codecs.ts` for the full reasoning. The same wrapping reaches WHERE and
+   * friends through {@link SybaseDialect.codecs}.
    */
   serializeColumnValue(value: unknown, col: any): string {
     if (value && typeof value === "object" && "getSQL" in value) {
@@ -128,7 +174,14 @@ export class SybaseDialect {
       driverValue = col.mapToDriverValue(value);
     }
 
-    return serializeValue(driverValue);
+    // `serializeValue` renders a string as `escapeString(value)`, so routing
+    // strings through the cast keeps that path identical for every type that
+    // needs no CONVERT — the cast returns the literal untouched.
+    if (typeof driverValue === "string") {
+      return castExactNumericLiteral(escapeString(driverValue), col);
+    }
+
+    return serializeValue(driverValue, this.timeZone);
   }
 
   /**

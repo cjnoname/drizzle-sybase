@@ -8,9 +8,24 @@
  * Does NOT depend on drizzle-orm/mssql-core.
  */
 
+import { EXACT_NUMERIC_TYPES } from "../codecs.js";
+
 // We use the entityKind symbol to make our classes recognized by drizzle-orm's
 // `is()` function without needing to extend the heavily-generic base classes.
 const entityKind = Symbol.for("drizzle:entityKind");
+
+/** Codec keys, by the base type name a declared SQL type starts with. */
+const CODEC_KEYS: ReadonlySet<string> = new Set<string>(EXACT_NUMERIC_TYPES);
+
+/**
+ * Codec key for a declared SQL type, or `undefined` when the type needs none.
+ * The width is stripped, so `numeric(19,4)` and `numeric` share one codec — the
+ * codec re-reads the full type from the column when it matters.
+ */
+function codecKey(dataType: string): string | undefined {
+  const base = dataType.replace(/\s*\(.*$/, "").toLowerCase();
+  return CODEC_KEYS.has(base) ? base : undefined;
+}
 
 // ---------------------------------------------------------------------------
 // SybaseColumn — the built column instance attached to tables
@@ -39,7 +54,22 @@ export class SybaseColumn {
   dataType: string;
   columnType: string;
   identity: boolean;
-  mapFromDriverValue: (value: any) => any;
+  /**
+   * Codec key read by drizzle-orm when it inlines a parameter, so types that
+   * need a CONVERT around the literal get one in WHERE / JOIN ... ON / HAVING
+   * too — those build their SQL from drizzle's chunks, not through
+   * `SybaseDialect#serializeColumnValue`. Left undefined for types that need no
+   * codec, which makes the lookup a no-op.
+   */
+  codec: string | undefined;
+  /**
+   * Applied by the dialect when a value is written. There is deliberately no
+   * read-side counterpart: results are decoded from the type metadata the addon
+   * reports (see `columnTypes`), and by then the schema that produced the query
+   * is no longer in hand — `db.select()` may return `*`, joined columns can share
+   * a name, and an aggregate belongs to no column at all. A hook that silently
+   * applied to some of those and not others would be worse than none.
+   */
   mapToDriverValue: (value: any) => any;
 
   constructor(table: any, config: SybaseColumnConfig) {
@@ -54,7 +84,7 @@ export class SybaseColumn {
     this.dataType = config.dataType ?? "string";
     this.columnType = config.columnType ?? "SybaseColumn";
     this.identity = config.identity ?? false;
-    this.mapFromDriverValue = config.mapFromDriverValue ?? ((v: any) => v);
+    this.codec = codecKey(this.dataType);
     this.mapToDriverValue = config.mapToDriverValue ?? ((v: any) => v);
   }
 
@@ -101,7 +131,6 @@ export interface SybaseColumnConfig {
   dataType?: string;
   columnType?: string;
   identity?: boolean;
-  mapFromDriverValue?: (value: any) => any;
   mapToDriverValue?: (value: any) => any;
 }
 
@@ -163,14 +192,6 @@ export class SybaseColumnBuilder {
    */
   $mapToDriver(fn: (value: any) => any): this {
     this._config.mapToDriverValue = fn;
-    return this;
-  }
-
-  /**
-   * Set a custom mapFromDriverValue function for this column.
-   */
-  $mapFromDriver(fn: (value: any) => any): this {
-    this._config.mapFromDriverValue = fn;
     return this;
   }
 

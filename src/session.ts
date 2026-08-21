@@ -6,6 +6,7 @@
  * Supports transaction isolation levels.
  */
 import type { SybaseConnection, SybasePool, QueryResult, SybaseLogger } from "./connection.js";
+import { decodeDateTimeColumns, resolveTimeZone } from "./datetime.js";
 import { SybaseConnectionError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
@@ -56,8 +57,31 @@ export interface SybaseSessionQueryResult<T = Record<string, unknown>> {
   affectedRows: number;
 }
 
+/**
+ * Decode a result's datetime columns to `Date`.
+ *
+ * Unconditional: `timeZone` selects which wall clock the stored values are read
+ * in, it does not decide whether they are decoded at all. A driver that returned
+ * `Date` or `string` depending on configuration would make every consumer handle
+ * a union that the schema does not describe.
+ */
+const decodeResult = <T extends Record<string, unknown>>(
+  result: QueryResult<T>,
+  timeZone: string
+): QueryResult<T> => ({
+  ...result,
+  rows: decodeDateTimeColumns(result.rows, result.columns, result.columnTypes, timeZone)
+});
+
 export class SybaseSession {
-  constructor(private readonly pool: SybasePool) {}
+  private readonly timeZone: string;
+
+  constructor(
+    private readonly pool: SybasePool,
+    timeZone?: string
+  ) {
+    this.timeZone = resolveTimeZone(timeZone);
+  }
 
   /**
    * Execute raw SQL and return results.
@@ -66,7 +90,7 @@ export class SybaseSession {
     rawSql: string,
     options?: { maxRows?: number }
   ): Promise<SybaseSessionQueryResult<T>> {
-    const result = await this.pool.query<T>(rawSql, options);
+    const result = decodeResult(await this.pool.query<T>(rawSql, options), this.timeZone);
     return {
       rows: result.rows,
       rowCount: result.rowCount,
@@ -78,7 +102,7 @@ export class SybaseSession {
    * Execute raw SQL and return the full result (including columns).
    */
   async executeRaw(rawSql: string, options?: { maxRows?: number }): Promise<QueryResult> {
-    return this.pool.query(rawSql, options);
+    return decodeResult(await this.pool.query(rawSql, options), this.timeZone);
   }
 
   /**
@@ -108,7 +132,7 @@ export class SybaseSession {
       }
 
       await conn.query("BEGIN TRAN");
-      const tx = new SybaseTransactionSession(conn, this.pool.logger);
+      const tx = new SybaseTransactionSession(conn, this.pool.logger, this.timeZone);
       try {
         const result = await fn(tx);
         await conn.query("COMMIT TRAN");
@@ -143,10 +167,15 @@ export class SybaseSession {
 // ---------------------------------------------------------------------------
 
 export class SybaseTransactionSession {
+  private readonly timeZone: string;
+
   constructor(
     private readonly conn: SybaseConnection,
-    private readonly logger?: SybaseLogger
-  ) {}
+    private readonly logger?: SybaseLogger,
+    timeZone?: string
+  ) {
+    this.timeZone = resolveTimeZone(timeZone);
+  }
 
   /**
    * Execute raw SQL within the transaction.
@@ -155,7 +184,7 @@ export class SybaseTransactionSession {
     rawSql: string,
     options?: { maxRows?: number }
   ): Promise<SybaseSessionQueryResult<T>> {
-    const result = await this.runWithLogging<T>(rawSql, options);
+    const result = decodeResult(await this.runWithLogging<T>(rawSql, options), this.timeZone);
     return {
       rows: result.rows,
       rowCount: result.rowCount,
@@ -164,7 +193,7 @@ export class SybaseTransactionSession {
   }
 
   async executeRaw(rawSql: string, options?: { maxRows?: number }): Promise<QueryResult> {
-    return this.runWithLogging(rawSql, options);
+    return decodeResult(await this.runWithLogging(rawSql, options), this.timeZone);
   }
 
   // ---------------------------------------------------------------------------

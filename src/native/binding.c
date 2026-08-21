@@ -252,6 +252,161 @@ typedef struct {
   int type;
 } ResultColumn;
 
+/**
+ * Sybase system type name for a db-lib column type, using the same spelling as
+ * the schema/introspection layer. Exposed to JS as `columnTypes` so callers can
+ * decode by type — for a raw query with no schema attached, the column type is
+ * the only thing that says a value is a timestamp rather than text that happens
+ * to look like one.
+ *
+ * `dbcoltype` reports the concrete type, never the nullable `*N` variants
+ * (db-lib resolves SYBDATETIMN to SYBDATETIME/SYBDATETIME4 by size), so those
+ * need no cases here.
+ */
+static const char *syb_type_name(int coltype) {
+  switch (coltype) {
+    case SYBINT1:
+      return "tinyint";
+    case SYBINT2:
+      return "smallint";
+    case SYBINT4:
+      return "int";
+    case SYBINT8:
+      return "bigint";
+    case SYBFLT8:
+      return "float";
+    case SYBREAL:
+      return "real";
+    case SYBMONEY:
+      return "money";
+    case SYBMONEY4:
+      return "smallmoney";
+    case SYBNUMERIC:
+      return "numeric";
+    case SYBDECIMAL:
+      return "decimal";
+    case SYBBIT:
+      return "bit";
+    case SYBDATETIME:
+      return "datetime";
+    case SYBDATETIME4:
+      return "smalldatetime";
+    case SYBDATE:
+      return "date";
+    case SYBTIME:
+      return "time";
+    case SYBBIGDATETIME:
+      return "bigdatetime";
+    case SYBBIGTIME:
+      return "bigtime";
+    case SYBCHAR:
+      return "char";
+    case SYBVARCHAR:
+      return "varchar";
+    case SYBTEXT:
+      return "text";
+    case SYBBINARY:
+      return "binary";
+    case SYBVARBINARY:
+      return "varbinary";
+    case SYBIMAGE:
+      return "image";
+    default:
+      return "unknown";
+  }
+}
+
+/** Whether a column type carries a date and/or time that we render ourselves. */
+static int is_temporal_type(int coltype) {
+  switch (coltype) {
+    case SYBDATETIME:
+    case SYBDATETIME4:
+    case SYBDATE:
+    case SYBTIME:
+    case SYBBIGDATETIME:
+    case SYBBIGTIME:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Render a date/time value as canonical, locale-independent text.
+ *
+ * `dbconvert(..., SYBCHAR, ...)` must NOT be used for these types. It formats
+ * through `tds_ctx->locale->datetime_fmt`, which is
+ *   1. read from `locales.conf` at the sysconfdir baked in at build time, using
+ *      the section matching the process locale (the shipped file maps it_IT and
+ *      pt_BR to "%d/%m/%Y %H:%M", es_ES to a format with no seconds), and
+ *   2. finally handed to `strftime`, whose %b and %p are LC_TIME dependent.
+ *
+ * So the text a caller gets would depend on the machine's locale and on whether
+ * a locales.conf happens to be reachable — the JS layer cannot reliably parse
+ * that, and a mismatch would silently hand back raw text where a Date was
+ * promised. Cracking the value into its parts and formatting it here removes
+ * both variables: the output is byte-identical everywhere.
+ *
+ * Formats (matching the literals the driver writes, so reads and writes are
+ * exact inverses):
+ *   datetime, smalldatetime   YYYY-MM-DD HH:MM:SS.mmm
+ *   bigdatetime               YYYY-MM-DD HH:MM:SS.mmmuuu
+ *   date                      YYYY-MM-DD
+ *   time                      HH:MM:SS.mmm
+ *   bigtime                   HH:MM:SS.mmmuuu
+ *
+ * Returns the string length, or -1 if the value could not be cracked (the
+ * caller then falls back to dbconvert rather than dropping the value).
+ */
+static int format_temporal_value(DBPROCESS *dbproc, int coltype, const void *src, char *buf,
+                                 size_t buf_size) {
+  // DBDATEREC2 carries nanoseconds, which is enough for bigdatetime's
+  // microseconds. Sybase field naming (no MSDBLIB): month is 0-based.
+  DBDATEREC2 di;
+  memset(&di, 0, sizeof(di));
+
+  if (dbanydatecrack(dbproc, &di, coltype, src) != SUCCEED) {
+    return -1;
+  }
+
+  int year = (int)di.dateyear;
+  int month = (int)di.datemonth + 1;
+  int day = (int)di.datedmonth;
+  int hour = (int)di.datehour;
+  int minute = (int)di.dateminute;
+  int second = (int)di.datesecond;
+  long nanosecond = (long)di.datensecond;
+
+  int written;
+  switch (coltype) {
+    case SYBDATE:
+      written = snprintf(buf, buf_size, "%04d-%02d-%02d", year, month, day);
+      break;
+    case SYBTIME:
+      written =
+          snprintf(buf, buf_size, "%02d:%02d:%02d.%03ld", hour, minute, second, nanosecond / 1000000L);
+      break;
+    case SYBBIGTIME:
+      written =
+          snprintf(buf, buf_size, "%02d:%02d:%02d.%06ld", hour, minute, second, nanosecond / 1000L);
+      break;
+    case SYBBIGDATETIME:
+      written = snprintf(buf, buf_size, "%04d-%02d-%02d %02d:%02d:%02d.%06ld", year, month, day, hour,
+                         minute, second, nanosecond / 1000L);
+      break;
+    default:  // SYBDATETIME, SYBDATETIME4
+      written = snprintf(buf, buf_size, "%04d-%02d-%02d %02d:%02d:%02d.%03ld", year, month, day, hour,
+                         minute, second, nanosecond / 1000000L);
+      break;
+  }
+
+  // snprintf returns the length it wanted; treat truncation as failure.
+  if (written < 0 || (size_t)written >= buf_size) {
+    return -1;
+  }
+  return written;
+}
+
 static void free_columns(ResultColumn *columns, int num_columns, int num_rows) {
   if (!columns) {
     return;
@@ -801,8 +956,39 @@ static void query_execute(napi_env env, void *data) {
             goto done;
           }
 
-          int convlen = dbconvert(w->conn->dbproc, coltype, src, datalen,
-                                  SYBCHAR, (BYTE *)buf, buf_size - 1);
+          int convlen;
+          if (is_temporal_type(coltype)) {
+            // Date/time values are formatted here, never by dbconvert, which
+            // renders them through a locale-dependent format string that in
+            // several locales drops the seconds and milliseconds outright — see
+            // format_temporal_value. There is deliberately no fallback: falling
+            // back would reintroduce exactly the lossy, machine-dependent text
+            // this exists to remove, and the JS layer would then be handed a
+            // string it cannot parse. Failing the query says so directly.
+            convlen = datalen > 0
+                          ? format_temporal_value(w->conn->dbproc, coltype, src, buf,
+                                                  (size_t)buf_size)
+                          : -1;
+            if (convlen < 0) {
+              snprintf(w->error, sizeof(w->error),
+                       "Could not decode %s column '%s' (%d bytes) into canonical text",
+                       syb_type_name(coltype), w->columns[i].name ? w->columns[i].name : "?",
+                       datalen);
+              if (buf != stack_buf) {
+                free(buf);
+              }
+              free_columns(w->columns, w->num_columns, w->num_rows);
+              w->columns = NULL;
+              w->num_columns = 0;
+              w->num_rows = 0;
+              dbcancel(w->conn->dbproc);
+              w->success = 0;
+              goto done;
+            }
+          } else {
+            convlen = dbconvert(w->conn->dbproc, coltype, src, datalen,
+                                SYBCHAR, (BYTE *)buf, buf_size - 1);
+          }
           if (convlen >= 0) {
             buf[convlen] = '\0';
             // Trim trailing spaces for CHAR/NCHAR fixed-width types
@@ -901,17 +1087,20 @@ static void query_complete(napi_env env, napi_status status, void *data) {
     napi_reject_deferred(env, w->deferred, error_obj);
   } else {
     // Build result object
-    napi_value result, rows_arr, cols_arr, row_count, affected;
+    napi_value result, rows_arr, cols_arr, col_types_arr, row_count, affected;
 
     napi_create_object(env, &result);
     napi_create_array_with_length(env, w->num_rows, &rows_arr);
     napi_create_array_with_length(env, w->num_columns, &cols_arr);
+    napi_create_array_with_length(env, w->num_columns, &col_types_arr);
 
-    // Column names array
+    // Column names and Sybase type names, in column order
     for (int i = 0; i < w->num_columns; i++) {
-      napi_value col_name;
+      napi_value col_name, col_type;
       napi_create_string_utf8(env, w->columns[i].name, NAPI_AUTO_LENGTH, &col_name);
       napi_set_element(env, cols_arr, i, col_name);
+      napi_create_string_utf8(env, syb_type_name(w->columns[i].type), NAPI_AUTO_LENGTH, &col_type);
+      napi_set_element(env, col_types_arr, i, col_type);
     }
 
     // Row objects with type-aware conversion
@@ -933,12 +1122,14 @@ static void query_complete(napi_env env, napi_status status, void *data) {
             int intval = atoi(strval);
             napi_create_int32(env, intval, &val);
           } else if (coltype == SYBINT8) {
+            // bigint is 64-bit: up to 9223372036854775807, which a double
+            // cannot hold. A double silently rounds anything past 2^53
+            // (9007199254740993 reads back as 9007199254740992), so the value
+            // is handed over as a BigInt — the only exact JS integer type.
+            // Mixing a BigInt into number arithmetic throws rather than
+            // corrupting the result, which is the behaviour we want here.
             long long llval = atoll(strval);
-            if (llval >= -2147483648LL && llval <= 2147483647LL) {
-              napi_create_int32(env, (int32_t)llval, &val);
-            } else {
-              napi_create_int64(env, llval, &val);
-            }
+            napi_create_bigint_int64(env, llval, &val);
           } else if (coltype == SYBFLT8 || coltype == SYBREAL) {
             double dval = atof(strval);
             napi_create_double(env, dval, &val);
@@ -963,14 +1154,16 @@ static void query_complete(napi_env env, napi_status status, void *data) {
     napi_create_int32(env, w->num_rows, &row_count);
     napi_create_int32(env, w->affected_rows, &affected);
 
-    napi_value key_rows, key_cols, key_rc, key_aff;
+    napi_value key_rows, key_cols, key_col_types, key_rc, key_aff;
     napi_create_string_utf8(env, "rows", NAPI_AUTO_LENGTH, &key_rows);
     napi_create_string_utf8(env, "columns", NAPI_AUTO_LENGTH, &key_cols);
+    napi_create_string_utf8(env, "columnTypes", NAPI_AUTO_LENGTH, &key_col_types);
     napi_create_string_utf8(env, "rowCount", NAPI_AUTO_LENGTH, &key_rc);
     napi_create_string_utf8(env, "affectedRows", NAPI_AUTO_LENGTH, &key_aff);
 
     napi_set_property(env, result, key_rows, rows_arr);
     napi_set_property(env, result, key_cols, cols_arr);
+    napi_set_property(env, result, key_col_types, col_types_arr);
     napi_set_property(env, result, key_rc, row_count);
     napi_set_property(env, result, key_aff, affected);
 

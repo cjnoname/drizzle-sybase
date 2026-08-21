@@ -32,6 +32,7 @@ import { getTableName } from "drizzle-orm";
 import type { SybasePoolConfig, SybasePoolMetrics } from "./connection.js";
 import { SybasePool } from "./connection.js";
 import { SybaseDialect, escapeName } from "./dialect.js";
+import type { SybaseDialectConfig } from "./dialect.js";
 import {
   SybaseSelectBuilder,
   SybaseInsertBuilder,
@@ -46,7 +47,13 @@ import type { SybaseTransactionOptions } from "./session.js";
 // Types
 // ---------------------------------------------------------------------------
 
-export type SybaseDrizzleConfig = SybasePoolConfig;
+export type SybaseDrizzleConfig = SybasePoolConfig & {
+  /**
+   * Extra or overriding codecs for inlined parameters, merged over the built-in
+   * Sybase set (which wraps money/numeric literals in CONVERT).
+   */
+  codecs?: SybaseDialectConfig["codecs"];
+};
 
 export interface SybaseDrizzle {
   /** Start a SELECT query. */
@@ -135,9 +142,9 @@ export interface SybaseDrizzleTx {
 // ---------------------------------------------------------------------------
 
 export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle => {
-  const dialect = new SybaseDialect();
+  const dialect = new SybaseDialect({ codecs: config.codecs, timeZone: config.timeZone });
   const pool = new SybasePool(config);
-  const session = new SybaseSession(pool);
+  const session = new SybaseSession(pool, config.timeZone);
 
   const resolveFields = (fields?: Record<string, any>): SybaseSelectField[] => {
     if (!fields) {

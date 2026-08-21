@@ -1,12 +1,15 @@
-import { sql } from "drizzle-orm";
+import { eq, isNull, sql } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
 /**
  * Query builder unit tests.
  * These tests verify SQL generation without requiring a real Sybase connection.
  */
 import { describe, it, expect } from "vitest";
 
+import { money, numeric, smallmoney, varchar } from "../../columns/index.js";
 import { SybaseDialect, escapeName, escapeString, serializeValue } from "../../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../../session.js";
+import { sybaseTable } from "../../table.js";
 import { SybaseDeleteBuilder } from "../delete.js";
 import { SybaseInsertBuilder } from "../insert.js";
 import { SybaseSelectBuilder } from "../select.js";
@@ -572,5 +575,123 @@ describe("escapeName edge cases", () => {
 
   it("handles name with spaces", () => {
     expect(escapeName("my table")).toBe("[my table]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: exact numeric parameters (CONVERT)
+// ---------------------------------------------------------------------------
+
+/**
+ * ASE refuses a quoted literal against money/numeric ("Msg 257: Implicit
+ * conversion from datatype 'VARCHAR' to 'MONEY' is not allowed"), and these are
+ * exactly the types the driver returns as strings — so every place a value can
+ * reach the statement has to wrap them, not just INSERT/UPDATE values.
+ */
+describe("exact numeric parameters", () => {
+  const dialect = new SybaseDialect();
+  const winf = sybaseTable("WINF", {
+    key: varchar("WINFkey", { length: 10 }).primaryKey(),
+    totPrRoyalty: money("tot_pr_royalty"),
+    pocket: smallmoney("pocket"),
+    pct: numeric("percentage", { precision: 7, scale: 4 }),
+    wide: numeric("wide", { precision: 20, scale: 0 }),
+    unsized: numeric("unsized")
+  });
+
+  const selectWhere = (condition: SQL): string =>
+    new SybaseSelectBuilder(dialect, createMockSession()).from(winf).where(condition).toSQL();
+
+  it("wraps a money literal in WHERE", () => {
+    expect(selectWhere(eq(winf.totPrRoyalty, "922337203685477.5807"))).toContain(
+      "= convert(money, '922337203685477.5807')"
+    );
+  });
+
+  it("wraps smallmoney and sized numeric in WHERE", () => {
+    expect(selectWhere(eq(winf.pocket, "-214748.3647"))).toContain(
+      "convert(smallmoney, '-214748.3647')"
+    );
+    expect(selectWhere(eq(winf.pct, "12.3456"))).toContain("convert(numeric(7,4), '12.3456')");
+    expect(selectWhere(eq(winf.wide, "99999999999999999999"))).toContain(
+      "convert(numeric(20,0), '99999999999999999999')"
+    );
+  });
+
+  it("wraps money literals in JOIN ... ON and HAVING", () => {
+    const joined = new SybaseSelectBuilder(dialect, createMockSession())
+      .from(winf)
+      .innerJoin(winf, eq(winf.totPrRoyalty, "1.5000"))
+      .toSQL();
+    expect(joined).toContain("convert(money, '1.5000')");
+
+    const having = new SybaseSelectBuilder(dialect, createMockSession())
+      .from(winf)
+      .groupBy(winf.key)
+      .having(eq(winf.totPrRoyalty, "1.5000"))
+      .toSQL();
+    expect(having).toContain("convert(money, '1.5000')");
+  });
+
+  it("wraps money literals in DELETE and UPDATE predicates", () => {
+    const deleted = new SybaseDeleteBuilder(winf, dialect, createMockSession())
+      .where(eq(winf.totPrRoyalty, "1.5000"))
+      .toSQL();
+    expect(deleted).toContain("convert(money, '1.5000')");
+
+    const updated = new SybaseUpdateBuilder(winf, dialect, createMockSession())
+      .set({ key: "W1" })
+      .where(eq(winf.totPrRoyalty, "1.5000"))
+      .toSQL();
+    expect(updated).toContain("convert(money, '1.5000')");
+  });
+
+  it("wraps money values in INSERT and UPDATE assignments", () => {
+    const inserted = new SybaseInsertBuilder(winf, dialect, createMockSession())
+      .values({ key: "W1", totPrRoyalty: "1.5000" })
+      .toSQL();
+    expect(inserted).toContain("convert(money, '1.5000')");
+
+    const updated = new SybaseUpdateBuilder(winf, dialect, createMockSession())
+      .set({ totPrRoyalty: "1.5000" })
+      .toSQL();
+    expect(updated).toContain("[tot_pr_royalty] = convert(money, '1.5000')");
+  });
+
+  // A bare numeric/decimal would default to (18,0) in ASE, silently rounding the
+  // fraction away, so it is left to fail loudly instead.
+  it("leaves an unsized numeric alone", () => {
+    expect(selectWhere(eq(winf.unsized, "1.5"))).toContain("= '1.5'");
+  });
+
+  it("leaves strings bound to other types alone", () => {
+    expect(selectWhere(eq(winf.key, "W1"))).toContain("= 'W1'");
+  });
+
+  // Numbers already serialize as bare literals, which ASE converts implicitly.
+  it("does not wrap numbers or NULL", () => {
+    expect(selectWhere(eq(winf.totPrRoyalty, 1.5))).toContain("= 1.5");
+    expect(selectWhere(isNull(winf.totPrRoyalty))).toContain("is null");
+  });
+
+  it("does not wrap non-literal strings", () => {
+    for (const value of ["1e5", "abc", "1' or '1"]) {
+      expect(selectWhere(eq(winf.totPrRoyalty, value))).toContain(serializeValue(value));
+      expect(selectWhere(eq(winf.totPrRoyalty, value))).not.toContain("convert(");
+    }
+  });
+
+  it("leaves raw sql templates untouched", () => {
+    expect(selectWhere(sql`${winf.totPrRoyalty} > 0`)).toContain("[tot_pr_royalty] > 0");
+  });
+
+  // A bare value interpolated into a raw template carries no column, so there is
+  // nothing to key a codec off and it stays a plain literal — which ASE rejects.
+  // `sql.param(value, column)` is the way to opt in.
+  it("wraps a raw template parameter when it is bound to the column", () => {
+    expect(selectWhere(sql`${winf.totPrRoyalty} = ${"1.5000"}`)).toContain("= '1.5000'");
+    expect(
+      selectWhere(sql`${winf.totPrRoyalty} = ${sql.param("1.5000", winf.totPrRoyalty)}`)
+    ).toContain("= convert(money, '1.5000')");
   });
 });

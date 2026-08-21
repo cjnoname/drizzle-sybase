@@ -45,6 +45,8 @@ export interface NativeBinding {
   ): Promise<{
     rows: Record<string, unknown>[];
     columns: string[];
+    /** Sybase system type name per column, in column order. */
+    columnTypes: string[];
     rowCount: number;
     affectedRows: number;
   }>;

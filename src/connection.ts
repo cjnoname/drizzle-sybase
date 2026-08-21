@@ -1,10 +1,3 @@
-import {
-  SybaseError,
-  SybaseConnectionError,
-  SybaseQueryError,
-  SybaseTimeoutError,
-  SybasePoolError
-} from "./errors.js";
 /**
  * Sybase connection management with production-grade connection pooling.
  *
@@ -20,6 +13,14 @@ import {
  * - Observable pool metrics
  * - Query logging/middleware support
  */
+import { resolveTimeZone } from "./datetime.js";
+import {
+  SybaseError,
+  SybaseConnectionError,
+  SybaseQueryError,
+  SybaseTimeoutError,
+  SybasePoolError
+} from "./errors.js";
 import { native } from "./native/index.js";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,20 @@ export interface SybaseConnectionConfig {
    * Defaults to `max(2 * timeout * 1000, 30000)` on the native side.
    */
   hardTimeoutMs?: number;
+  /**
+   * IANA zone the ASE server keeps its clocks in, e.g. `Australia/Sydney`.
+   * Default: `UTC`.
+   *
+   * `datetime` / `smalldatetime` columns store a naive wall clock with no
+   * offset, so this is the only way the driver can map them to instants. It is
+   * used in both directions: `Date` values are written as this zone's wall clock
+   * and datetime columns are read back as the `Date` that wall clock denotes
+   * here. Leaving it unset makes reads and writes exact inverses in UTC, which
+   * is correct as long as nothing else interprets the stored values.
+   *
+   * Validated when the connection is created, not on first use.
+   */
+  timeZone?: string;
 }
 
 export interface SybasePoolConfig extends SybaseConnectionConfig {
@@ -73,6 +88,12 @@ export interface SybasePoolConfig extends SybaseConnectionConfig {
 export interface QueryResult<T = Record<string, unknown>> {
   rows: T[];
   columns: string[];
+  /**
+   * Sybase system type name per column, in column order (`datetime`, `money`,
+   * `varchar`, ...). Reported by the native addon so results can be decoded by
+   * type even for raw SQL with no schema attached.
+   */
+  columnTypes: string[];
   rowCount: number;
   affectedRows: number;
 }
@@ -161,7 +182,12 @@ export class SybaseConnection {
   /** Promise queue to serialize queries on a single DBPROCESS (not thread-safe). */
   private queryQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly config: SybaseConnectionConfig) {}
+  constructor(private readonly config: SybaseConnectionConfig) {
+    // `timeZone` is consumed by the session and dialect, not here, but this is a
+    // public entry point that accepts it — validating it here keeps the promise
+    // on `SybaseConnectionConfig.timeZone` true wherever a config is accepted.
+    resolveTimeZone(config.timeZone);
+  }
 
   async connect(): Promise<void> {
     if (this.handle && !this.closed) {
@@ -377,11 +403,12 @@ export class SybasePool {
   private draining = false;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private readonly cfg: Required<
-    Omit<SybasePoolConfig, "logger" | "packetSize" | "hardTimeoutMs">
+    Omit<SybasePoolConfig, "logger" | "packetSize" | "hardTimeoutMs" | "timeZone">
   > & {
     logger?: SybaseLogger;
     packetSize?: number;
     hardTimeoutMs?: number;
+    timeZone?: string;
   };
 
   // Metrics tracking
@@ -402,6 +429,10 @@ export class SybasePool {
     if (max < 1) {
       throw new SybasePoolError("Pool max must be at least 1", "closed");
     }
+
+    // Before the cleanup timer is started, so an invalid zone cannot leave a
+    // half-built pool behind.
+    resolveTimeZone(config.timeZone);
 
     this.cfg = {
       ...config,

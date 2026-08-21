@@ -112,6 +112,18 @@ export type {
 
 // Dialect
 export { SybaseDialect, escapeName, escapeString, serializeValue } from "./dialect.js";
+export type { SybaseDialectConfig } from "./dialect.js";
+
+// Codecs (CONVERT wrapping for exact numeric types)
+export { SYBASE_CODECS, EXACT_NUMERIC_TYPES } from "./codecs.js";
+
+// Datetime conversion (ASE stores a naive wall clock)
+export {
+  formatSybaseDateTime,
+  parseSybaseDateTime,
+  decodeDateTimeColumns,
+  resolveTimeZone
+} from "./datetime.js";
 
 // Session
 export { SybaseSession, SybaseTransactionSession } from "./session.js";
