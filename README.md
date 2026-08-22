@@ -172,6 +172,11 @@ lose digits:
   has — `numeric("col", { precision: 19, scale: 4 })` — and it works. Introspected
   schemas always carry the width, so this only affects hand-written ones.
 
+`insertId` after an `INSERT` follows the same rule. `@@identity` is
+`numeric(38,0)`, so an identity past 2^53 has no exact `number`; `insertId` is
+`undefined` in that case and `insertIdText` carries the digits, which is always
+populated when the table has an identity column.
+
 ### Serializing rows that contain a `bigint`
 
 `bigint` columns come back as `BigInt`, which `JSON.stringify` refuses to

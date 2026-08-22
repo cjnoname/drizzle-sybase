@@ -40,6 +40,15 @@ export interface SybaseInsertResult {
    * (Sybase ASE limitation — no OUTPUT/RETURNING clause support).
    */
   insertId?: number;
+  /**
+   * The same value as digits, exact at any width.
+   *
+   * `@@identity` is `numeric(38,0)`, so it can hold more than a double: an
+   * identity past 2^53 has no exact `number`, and {@link insertId} is `undefined`
+   * rather than a rounded one. This is always populated when the table has an
+   * identity column and the insert returned a value.
+   */
+  insertIdText?: string;
   affectedRows: number;
 }
 
@@ -78,15 +87,24 @@ export class SybaseInsertBuilder {
 
     const hasIdentity = this.hasIdentityColumn();
     let insertId: number | undefined;
+    let insertIdText: string | undefined;
     if (hasIdentity && result.rows.length > 0) {
       const raw = Object.values(result.rows[0]!)[0];
-      const parsed = Number(raw);
-      insertId = Number.isFinite(parsed) ? parsed : undefined;
+      // @@identity is numeric(38,0), which the driver hands over as digits.
+      const digits = raw === null || raw === undefined ? "" : String(raw).trim();
+      if (digits !== "") {
+        insertIdText = digits;
+        const parsed = Number(digits);
+        // Only report a number when a double holds it exactly. Rounding a wide
+        // identity would be the one thing this driver does not do to a value.
+        insertId = Number.isSafeInteger(parsed) ? parsed : undefined;
+      }
     }
 
     return {
       rowCount: this.insertValues.length,
       insertId,
+      insertIdText,
       affectedRows: result.affectedRows
     };
   }

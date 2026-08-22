@@ -46,7 +46,7 @@
   },
   "scripts": {
     "install": "echo 'native addon is prebuilt — skip node-gyp'",
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "build:native": "node-gyp rebuild",
     "prepare": "husky",
     "prepublishOnly": "npm run build",

@@ -1,0 +1,7 @@
+{
+  // Build config: same settings, minus the tests.
+  // `npm run check` uses tsconfig.json so tests are still type-checked; this one
+  // keeps them out of dist/, which `package.json#files` publishes wholesale.
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist", "npm", "src/**/__tests__/**"]
+}

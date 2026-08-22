@@ -6,7 +6,7 @@ import type { SQL } from "drizzle-orm";
  */
 import { describe, it, expect } from "vitest";
 
-import { money, numeric, smallmoney, varchar } from "../../columns/index.js";
+import { int, money, numeric, smallmoney, varchar } from "../../columns/index.js";
 import { SybaseDialect, escapeName, escapeString, serializeValue } from "../../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../../session.js";
 import { sybaseTable } from "../../table.js";
@@ -21,7 +21,7 @@ import { SybaseUpdateBuilder } from "../update.js";
 
 type MockableSession = SybaseSession | SybaseTransactionSession;
 
-function createMockSession() {
+function createMockSession(rows: Record<string, unknown>[] = []) {
   const executed: string[] = [];
   const mock = {
     executed,
@@ -30,7 +30,7 @@ function createMockSession() {
       _options?: { maxRows?: number }
     ) {
       executed.push(rawSql);
-      return { rows: [] as T[], rowCount: 0, affectedRows: 0 };
+      return { rows: rows as T[], rowCount: rows.length, affectedRows: 0 };
     },
     async executeRaw(rawSql: string, _options?: { maxRows?: number }) {
       executed.push(rawSql);
@@ -694,4 +694,44 @@ describe("exact numeric parameters", () => {
       selectWhere(sql`${winf.totPrRoyalty} = ${sql.param("1.5000", winf.totPrRoyalty)}`)
     ).toContain("= convert(money, '1.5000')");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: identity values wider than a double
+// ---------------------------------------------------------------------------
+
+/**
+ * `@@identity` is `numeric(38,0)`, so the driver returns it as digits and it can
+ * exceed what a `number` holds exactly. Reporting a rounded id would be a silent
+ * corruption of a primary key.
+ */
+describe("insertId precision", () => {
+  const dialect = new SybaseDialect();
+  const t = sybaseTable("T", {
+    id: int("id").identity(),
+    name: varchar("name", { length: 10 })
+  });
+
+  const insert = (identity: string) =>
+    new SybaseInsertBuilder(t, dialect, createMockSession([{ "": identity }]) as any)
+      .values({ name: "a" })
+      .execute();
+
+  it.each([
+    ["1", 1],
+    ["9007199254740991", 9007199254740991]
+  ])("reports %s as a number when a double holds it exactly", async (digits, expected) => {
+    const r = await insert(digits);
+    expect(r.insertId).toBe(expected);
+    expect(r.insertIdText).toBe(digits);
+  });
+
+  it.each(["9007199254740993", "123456789012345678901234567890"])(
+    "refuses to round %s, keeping the digits instead",
+    async digits => {
+      const r = await insert(digits);
+      expect(r.insertId).toBeUndefined();
+      expect(r.insertIdText).toBe(digits);
+    }
+  );
 });
