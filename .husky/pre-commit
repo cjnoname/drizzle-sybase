@@ -38,8 +38,11 @@ echo "[pre-commit] 2/3 running lint + type in parallel…"
 # Reuse the concurrently binary (already a devDependency). Using
 # `pnpm exec` avoids hard-coding the path; both commands run in parallel
 # and the first failure fails the whole step.
+# `pnpm type` (tsc --noEmit) rather than `pnpm build`: the build config excludes
+# src/**/__tests__ so they stay out of the published dist, but they still have to
+# be type-checked before a commit lands.
 pnpm exec concurrently --raw --kill-others-on-fail \
   "pnpm -s lint" \
-  "pnpm -s build"
+  "pnpm -s type"
 
 echo "[pre-commit] 3/3 done — proceeding with commit."

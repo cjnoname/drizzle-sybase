@@ -51,10 +51,11 @@
     "prepare": "husky",
     "prepublishOnly": "npm run build",
     "test": "vitest",
+    "type": "tsc --noEmit",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "format": "oxfmt",
-    "check": "npm run lint && tsc --noEmit",
+    "check": "npm run lint && npm run type",
     "clean": "pnpm dlx --reporter=silent rimraf \"**/node_modules\" pnpm-lock.yaml \"**/dist\" -g && pnpm i"
   },
   "devDependencies": {
