@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.3.0...v2.0.0) (2026-08-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* `SybaseInsertResult.insertId` is `undefined` when the identity value is too wide for a `number` to hold exactly, where it previously returned a rounded one. Read `insertIdText` for the exact digits.
+* `bigint` columns are returned as `BigInt` instead of `number`. JSON.stringify throws on BigInt and mixing one into number arithmetic throws, and nothing in the type system catches it, so call sites that read bigint columns need updating. README gives the JSON replacer to use.
+
+### Features
+
+* Preserve exact numerics and decode temporal columns losslessly ([b478d1b](https://github.com/cjnoname/drizzle-sybase/commit/b478d1b5e7543f244de3cdc8e0527e025e3cde39))
+
+
+### Bug Fixes
+
+* **build:** Type-check tests in the pre-commit hook again ([0eaea40](https://github.com/cjnoname/drizzle-sybase/commit/0eaea40f3428ebe4fe73f0a93bd232000da9a3ff))
+* Stop rounding wide identity values and keep tests out of the package ([91988f5](https://github.com/cjnoname/drizzle-sybase/commit/91988f5e165c1b06ea40a5d102eed49e01b6835d))
+
+
+### Code Refactoring
+
+* Remove duplicated definitions that had to be kept in sync by hand ([10656d9](https://github.com/cjnoname/drizzle-sybase/commit/10656d9514fd0a633903bdf4f0d26c2b197f04d6))
+
+
+### Performance Improvements
+
+* **datetime:** Streamline timezone component extraction ([4460664](https://github.com/cjnoname/drizzle-sybase/commit/4460664cd088af96fdde3951c676407bdeed11de))
+
 ## [1.3.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.2.0...v1.3.0) (2026-07-01)
 
 
