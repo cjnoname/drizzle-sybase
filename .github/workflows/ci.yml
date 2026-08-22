@@ -99,26 +99,75 @@ jobs:
       - name: Run type check
         run: pnpm build
 
+  # One job per language: `build-mode` is only valid when a single language is
+  # analyzed per job, and the two languages need different treatment anyway.
   codeql:
     needs: should-run
-    timeout-minutes: 10
-    name: CodeQL Security Scan
+    timeout-minutes: 15
+    name: CodeQL Security Scan (${{ matrix.language }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          # binding.c must be compiled against the real FreeTDS headers, and
+          # deps/ is gitignored — so this language needs a manual build. Under
+          # build-mode: none the extractor cannot resolve sybdb.h, so every SYB*
+          # constant becomes an unknown identifier: switch cases get dropped
+          # (bogus trivial-switch / dead-code alerts) and the queries that
+          # matter — memory leaks, use-after-free, buffer overflows across the
+          # malloc/free and snprintf paths — silently find nothing.
+          - language: c-cpp
+            build-mode: manual
+
     steps:
       - uses: actions/checkout@v6
+
+      # Toolchain is only needed to build the native addon (node-gyp is a
+      # devDependency, and scripts/build.sh invokes it via npx).
+      - name: Install pnpm
+        if: matrix.build-mode == 'manual'
+        uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        if: matrix.build-mode == 'manual'
+        with:
+          node-version: 26
+          cache: "pnpm"
+
+      - name: Install dependencies
+        if: matrix.build-mode == 'manual'
+        run: pnpm i
+
+      # Deliberately BEFORE init: the CodeQL tracer extracts every compilation
+      # unit it observes, and FreeTDS is a few hundred thousand lines of
+      # third-party C. Building it here keeps it out of the database — only
+      # binding.c is compiled under the tracer below.
+      - name: Build FreeTDS
+        if: matrix.build-mode == 'manual'
+        run: bash scripts/build.sh
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: javascript-typescript, c-cpp
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
           queries: +security-and-quality
-          build-mode: none
+
+      # Must sit between init and analyze so the tracer observes the compiler
+      # invocation. `rebuild` is clean + configure + build, so binding.c is
+      # always recompiled here even though build.sh already built it.
+      - name: Compile binding.c under the CodeQL tracer
+        if: matrix.build-mode == 'manual'
+        run: npx node-gyp rebuild
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:javascript-typescript"
+          category: "/language:${{ matrix.language }}"
