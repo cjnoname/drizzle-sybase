@@ -79,7 +79,7 @@ const wallClockFormatter = (timeZone: string): Intl.DateTimeFormat => {
  * of a transaction, since `Intl` only rejects the zone when it is first used.
  */
 export const resolveTimeZone = (timeZone?: string): string => {
-  if (timeZone === undefined) {
+  if (timeZone === undefined || timeZone === UTC) {
     return UTC;
   }
   try {
@@ -117,18 +117,44 @@ const wallClockAt = (instant: Date, timeZone: string): WallClock => {
     };
   }
   const parts = wallClockFormatter(timeZone).formatToParts(instant);
-  const read = (type: Intl.DateTimeFormatPartTypes): number => {
-    const part = parts.find(p => p.type === type);
-    return part ? Number(part.value) : 0;
-  };
+  let year = 0;
+  let month = 0;
+  let day = 0;
+  let hour = 0;
+  let minute = 0;
+  let second = 0;
+  // One pass instead of six Array#find scans. `formatToParts` still dominates,
+  // but this is called for every offset sample and every formatted Date.
+  for (const part of parts) {
+    switch (part.type) {
+      case "year":
+        year = Number(part.value);
+        break;
+      case "month":
+        month = Number(part.value);
+        break;
+      case "day":
+        day = Number(part.value);
+        break;
+      case "hour":
+        hour = Number(part.value) % 24;
+        break;
+      case "minute":
+        minute = Number(part.value);
+        break;
+      case "second":
+        second = Number(part.value);
+        break;
+    }
+  }
   return {
-    year: read("year"),
-    month: read("month"),
-    day: read("day"),
-    // h23 renders midnight as 00, but be defensive: a 24 would push the date.
-    hour: read("hour") % 24,
-    minute: read("minute"),
-    second: read("second"),
+    year,
+    month,
+    day,
+    // h23 renders midnight as 00; `% 24` above is defensive against 24.
+    hour,
+    minute,
+    second,
     // Milliseconds are the same in every zone; no offset is a fraction of a second.
     millisecond: instant.getUTCMilliseconds()
   };
@@ -198,18 +224,6 @@ export const formatSybaseDateTime = (value: Date, timeZone = UTC): string => {
   );
 };
 
-/**
- * Parse the canonical `YYYY-MM-DD HH:MM:SS.mmm` form back to an instant,
- * reading the wall clock in `timeZone` (UTC by default). Returns `undefined`
- * for text that is not in that form, so callers can decide whether that is an
- * error — {@link decodeDateTimeColumns} treats it as one.
- *
- * A wall clock that a DST transition repeats cannot be resolved to a single
- * instant: two instants an hour apart share it and the column stores no offset,
- * so this returns the standard-time (later) occurrence. A wall clock the
- * transition skips does not exist at all and is moved forward by the size of
- * the jump. Nothing can do better — the ambiguity is in the stored value.
- */
 /** Minutes the zone is ahead of UTC at an instant. */
 const offsetMinutesAt = (instant: Date, timeZone: string): number =>
   (asUtcMs(wallClockAt(instant, timeZone)) - instant.getTime()) / MS_PER_MINUTE;
