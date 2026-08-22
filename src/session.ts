@@ -73,6 +73,24 @@ const decodeResult = <T extends Record<string, unknown>>(
   rows: decodeDateTimeColumns(result.rows, result.columns, result.columnTypes, timeZone)
 });
 
+/**
+ * Decode a result and project it onto the narrower shape `execute` returns.
+ *
+ * Shared by both session classes, which differ only in how they get hold of the
+ * result — through the pool, or on the single connection a transaction holds.
+ */
+const executeAndDecode = async <T extends Record<string, unknown>>(
+  run: () => Promise<QueryResult<T>>,
+  timeZone: string
+): Promise<SybaseSessionQueryResult<T>> => {
+  const result = decodeResult(await run(), timeZone);
+  return {
+    rows: result.rows,
+    rowCount: result.rowCount,
+    affectedRows: result.affectedRows
+  };
+};
+
 export class SybaseSession {
   private readonly timeZone: string;
 
@@ -90,12 +108,7 @@ export class SybaseSession {
     rawSql: string,
     options?: { maxRows?: number }
   ): Promise<SybaseSessionQueryResult<T>> {
-    const result = decodeResult(await this.pool.query<T>(rawSql, options), this.timeZone);
-    return {
-      rows: result.rows,
-      rowCount: result.rowCount,
-      affectedRows: result.affectedRows
-    };
+    return executeAndDecode<T>(() => this.pool.query<T>(rawSql, options), this.timeZone);
   }
 
   /**
@@ -184,12 +197,7 @@ export class SybaseTransactionSession {
     rawSql: string,
     options?: { maxRows?: number }
   ): Promise<SybaseSessionQueryResult<T>> {
-    const result = decodeResult(await this.runWithLogging<T>(rawSql, options), this.timeZone);
-    return {
-      rows: result.rows,
-      rowCount: result.rowCount,
-      affectedRows: result.affectedRows
-    };
+    return executeAndDecode<T>(() => this.runWithLogging<T>(rawSql, options), this.timeZone);
   }
 
   async executeRaw(rawSql: string, options?: { maxRows?: number }): Promise<QueryResult> {

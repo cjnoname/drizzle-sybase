@@ -41,7 +41,7 @@ import {
 } from "./query-builders/index.js";
 import type { SybaseSelectField } from "./query-builders/index.js";
 import { SybaseSession } from "./session.js";
-import type { SybaseTransactionOptions } from "./session.js";
+import type { SybaseTransactionOptions, SybaseTransactionSession } from "./session.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -175,67 +175,51 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
     });
   };
 
-  return {
+  /**
+   * The query surface shared by the top-level handle and a transaction handle.
+   *
+   * Both expose exactly these members and differ only in which session they run
+   * on, so they are built from one definition — keeping them as two literals made
+   * it possible to change one and forget the other.
+   */
+  const queryApi = (on: SybaseSession | SybaseTransactionSession): SybaseDrizzleTx => ({
     select(fields?: Record<string, any>) {
-      return new SybaseSelectBuilder(dialect, session, resolveFields(fields));
+      return new SybaseSelectBuilder(dialect, on, resolveFields(fields));
     },
 
     insert(table: any) {
-      return new SybaseInsertBuilder(table, dialect, session);
+      return new SybaseInsertBuilder(table, dialect, on);
     },
 
     update(table: any) {
-      return new SybaseUpdateBuilder(table, dialect, session);
+      return new SybaseUpdateBuilder(table, dialect, on);
     },
 
     delete(table: any) {
-      return new SybaseDeleteBuilder(table, dialect, session);
+      return new SybaseDeleteBuilder(table, dialect, on);
     },
 
     async execute<T extends Record<string, unknown>>(query: SQL) {
-      const rawSql = dialect.sqlToQuery(query);
-      return session.execute<T>(rawSql);
+      return on.execute<T>(dialect.sqlToQuery(query));
     },
 
     async exec<T extends Record<string, unknown>>(query: SQL) {
-      return this.execute<T>(query);
+      return on.execute<T>(dialect.sqlToQuery(query));
     },
 
     async executeRaw<T extends Record<string, unknown>>(rawSql: string) {
-      return session.execute<T>(rawSql);
-    },
+      return on.execute<T>(rawSql);
+    }
+  });
+
+  return {
+    ...queryApi(session),
 
     async transaction<T>(
       fn: (tx: SybaseDrizzleTx) => Promise<T>,
       options?: SybaseTransactionOptions
     ): Promise<T> {
-      return session.transaction(async txSession => {
-        const tx: SybaseDrizzleTx = {
-          select(fields?: Record<string, any>) {
-            return new SybaseSelectBuilder(dialect, txSession, resolveFields(fields));
-          },
-          insert(table: any) {
-            return new SybaseInsertBuilder(table, dialect, txSession);
-          },
-          update(table: any) {
-            return new SybaseUpdateBuilder(table, dialect, txSession);
-          },
-          delete(table: any) {
-            return new SybaseDeleteBuilder(table, dialect, txSession);
-          },
-          async execute<T2 extends Record<string, unknown>>(query: SQL) {
-            const rawSql = dialect.sqlToQuery(query);
-            return txSession.execute<T2>(rawSql);
-          },
-          async exec<T2 extends Record<string, unknown>>(query: SQL) {
-            return this.execute<T2>(query);
-          },
-          async executeRaw<T2 extends Record<string, unknown>>(rawSql: string) {
-            return txSession.execute<T2>(rawSql);
-          }
-        };
-        return fn(tx);
-      }, options);
+      return session.transaction(txSession => fn(queryApi(txSession)), options);
     },
 
     async close() {

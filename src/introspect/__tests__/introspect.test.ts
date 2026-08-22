@@ -632,3 +632,24 @@ describe("runCli", () => {
     process.exitCode = prevExit;
   });
 });
+
+describe("import collection", () => {
+  // FACTORY_ORDER is derived from SYBASE_TYPE_MAP rather than restated, so a new
+  // Sybase type can never be mapped to a factory the import list forgets.
+  it("can emit an import for every factory in the registry", () => {
+    const factories = new Set(Object.values(SYBASE_TYPE_MAP).map(m => m.factory));
+    const tables = [...Object.keys(SYBASE_TYPE_MAP)].map((typeName, i) =>
+      table(`T${i}`, [col({ name: "C", typeName, length: 10, precision: 9, scale: 2 })])
+    );
+    const { code } = generateSchemaCode(tables, "mydb");
+    const imported = /^import \{ sybaseTable, (.+) \} from "drizzle-sybase";$/m
+      .exec(code)![1]!
+      .split(", ");
+
+    expect(new Set(imported)).toEqual(factories);
+    // `decimal` maps to the `numeric` factory, so it is never imported itself.
+    expect(imported).not.toContain("decimal");
+    // Deterministic order, so regenerating an unchanged schema is a no-op diff.
+    expect(imported).toEqual([...factories]);
+  });
+});

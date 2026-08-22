@@ -210,41 +210,41 @@ export const bigint = (name: string) => new SybaseColumnBuilder(name, "bigint");
 export const smallint = (name: string) => new SybaseColumnBuilder(name, "smallint");
 export const tinyint = (name: string) => new SybaseColumnBuilder(name, "tinyint");
 
-export const varchar = (name: string, opts?: { length?: number }) =>
-  new SybaseColumnBuilder(name, opts?.length ? `varchar(${opts.length})` : "varchar");
-export const nvarchar = (name: string, opts?: { length?: number }) =>
-  new SybaseColumnBuilder(name, opts?.length ? `nvarchar(${opts.length})` : "nvarchar");
-export const char = (name: string, opts?: { length?: number }) =>
-  new SybaseColumnBuilder(name, opts?.length ? `char(${opts.length})` : "char");
-export const nchar = (name: string, opts?: { length?: number }) =>
-  new SybaseColumnBuilder(name, opts?.length ? `nchar(${opts.length})` : "nchar");
+/**
+ * A type whose width is a single length, e.g. `varchar(30)`.
+ *
+ * A length of 0 is treated as absent, so the type is emitted bare — ASE supplies
+ * its own default and a `varchar(0)` would be rejected.
+ */
+const sizedByLength =
+  (type: string) =>
+  (name: string, opts?: { length?: number }): SybaseColumnBuilder =>
+    new SybaseColumnBuilder(name, opts?.length ? `${type}(${opts.length})` : type);
+
+/** A type whose width is a precision and an optional scale, e.g. `numeric(19,4)`. */
+const sizedByPrecision =
+  (type: string) =>
+  (name: string, opts?: { precision?: number; scale?: number }): SybaseColumnBuilder => {
+    if (opts?.precision === undefined) {
+      return new SybaseColumnBuilder(name, type);
+    }
+    const width =
+      opts.scale === undefined ? `${opts.precision}` : `${opts.precision},${opts.scale}`;
+    return new SybaseColumnBuilder(name, `${type}(${width})`);
+  };
+
+export const varchar = sizedByLength("varchar");
+export const nvarchar = sizedByLength("nvarchar");
+export const char = sizedByLength("char");
+export const nchar = sizedByLength("nchar");
 export const text = (name: string) => new SybaseColumnBuilder(name, "text");
 export const ntext = (name: string) => new SybaseColumnBuilder(name, "ntext");
 
 export const datetime = (name: string) => new SybaseColumnBuilder(name, "datetime");
 export const smalldatetime = (name: string) => new SybaseColumnBuilder(name, "smalldatetime");
 
-export const numeric = (name: string, opts?: { precision?: number; scale?: number }) => {
-  let type = "numeric";
-  if (opts?.precision !== undefined) {
-    type =
-      opts.scale !== undefined
-        ? `numeric(${opts.precision},${opts.scale})`
-        : `numeric(${opts.precision})`;
-  }
-  return new SybaseColumnBuilder(name, type);
-};
-
-export const decimal = (name: string, opts?: { precision?: number; scale?: number }) => {
-  let type = "decimal";
-  if (opts?.precision !== undefined) {
-    type =
-      opts.scale !== undefined
-        ? `decimal(${opts.precision},${opts.scale})`
-        : `decimal(${opts.precision})`;
-  }
-  return new SybaseColumnBuilder(name, type);
-};
+export const numeric = sizedByPrecision("numeric");
+export const decimal = sizedByPrecision("decimal");
 
 export const float = (name: string) => new SybaseColumnBuilder(name, "float");
 export const real = (name: string) => new SybaseColumnBuilder(name, "real");
@@ -253,8 +253,6 @@ export const smallmoney = (name: string) => new SybaseColumnBuilder(name, "small
 
 export const bit = (name: string) => new SybaseColumnBuilder(name, "bit");
 
-export const binary = (name: string, opts?: { length?: number }) =>
-  new SybaseColumnBuilder(name, opts?.length ? `binary(${opts.length})` : "binary");
-export const varbinary = (name: string, opts?: { length?: number }) =>
-  new SybaseColumnBuilder(name, opts?.length ? `varbinary(${opts.length})` : "varbinary");
+export const binary = sizedByLength("binary");
+export const varbinary = sizedByLength("varbinary");
 export const image = (name: string) => new SybaseColumnBuilder(name, "image");

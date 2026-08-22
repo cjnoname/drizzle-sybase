@@ -18,6 +18,15 @@ import { sybaseTable } from "../table.js";
 
 const SYDNEY = "Australia/Sydney";
 
+/** Enough of a config to construct a pool; nothing here connects. */
+const config = {
+  host: "localhost",
+  port: 5000,
+  database: "db",
+  username: "u",
+  password: "p"
+};
+
 /** The canonical text `binding.c` produces for a datetime column. */
 const STORED = "2016-06-09 09:48:46.753";
 const AS_SYDNEY = "2016-06-08T23:48:46.753Z";
@@ -119,14 +128,6 @@ describe("SybaseSession datetime decoding", () => {
 });
 
 describe("createSybaseDrizzle timeZone wiring", () => {
-  const config = {
-    host: "localhost",
-    port: 5000,
-    database: "db",
-    username: "u",
-    password: "p"
-  };
-
   const winf = sybaseTable("WINF", {
     key: varchar("WINFkey", { length: 10 }).primaryKey(),
     dtRecAdded: datetime("dt_rec_added"),
@@ -188,8 +189,6 @@ describe("createSybaseDrizzle timeZone wiring", () => {
 });
 
 describe("column mapping hooks", () => {
-  const config = { host: "localhost", port: 5000, database: "db", username: "u", password: "p" };
-
   // The write hook runs through the dialect, which has the column in hand.
   it("applies $mapToDriver on write", () => {
     const t = sybaseTable("T", {
@@ -212,5 +211,28 @@ describe("column mapping hooks", () => {
     const builder = money("amt") as unknown as Record<string, unknown>;
     expect(builder.$mapFromDriver).toBeUndefined();
     expect(Object.keys(money("amt").build({}))).not.toContain("mapFromDriverValue");
+  });
+});
+
+describe("query surface", () => {
+  /**
+   * The top-level handle and the transaction handle are built from one
+   * definition, typed as `SybaseDrizzleTx`, so `tsc` is what guarantees they
+   * cannot drift apart. This checks the runtime half: that spreading that
+   * definition really does put every member on the handle.
+   */
+  it("puts the whole shared query surface on the top-level handle", () => {
+    const db = createSybaseDrizzle(config) as unknown as Record<string, unknown>;
+    for (const m of ["select", "insert", "update", "delete", "execute", "exec", "executeRaw"]) {
+      expect(typeof db[m], m).toBe("function");
+    }
+  });
+
+  // `exec` used to delegate through `this`, which broke when destructured.
+  it("keeps exec working when detached from the handle", () => {
+    const db = createSybaseDrizzle(config);
+    const t = sybaseTable("T", { k: varchar("k", { length: 5 }).primaryKey() });
+    const { insert } = db;
+    expect(() => insert(t).values({ k: "a" }).toSQL()).not.toThrow();
   });
 });

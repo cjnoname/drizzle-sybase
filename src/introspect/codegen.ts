@@ -10,6 +10,7 @@ import {
   decimalRepresentation,
   effectiveLength,
   resolveMapping,
+  SYBASE_TYPE_MAP,
   type TypeMapping
 } from "./type-map.js";
 import type { ColumnMeta, TableMeta } from "./types.js";
@@ -385,30 +386,17 @@ function generateInsertSchema(table: TableMeta): string {
 // Import collection (driven by the same registry as everything else)
 // ---------------------------------------------------------------------------
 
-/** drizzle-sybase column factories, in a stable declaration order for imports. */
-const FACTORY_ORDER = [
-  "int",
-  "bigint",
-  "smallint",
-  "tinyint",
-  "varchar",
-  "nvarchar",
-  "char",
-  "nchar",
-  "text",
-  "ntext",
-  "datetime",
-  "smalldatetime",
-  "numeric",
-  "decimal",
-  "float",
-  "real",
-  "money",
-  "smallmoney",
-  "bit",
-  "binary",
-  "varbinary",
-  "image"
+/**
+ * drizzle-sybase column factories, in a stable declaration order for imports.
+ *
+ * Derived from the type registry rather than restated, so a new Sybase type can
+ * never be mapped to a factory the import list forgets. The registry's insertion
+ * order is the declaration order, and `Set` preserves it while collapsing the
+ * types that share a factory — `decimal` maps to `numeric`, so it correctly does
+ * not appear as a factory of its own.
+ */
+const FACTORY_ORDER: readonly string[] = [
+  ...new Set(Object.values(SYBASE_TYPE_MAP).map(mapping => mapping.factory))
 ];
 
 function collectImports(tables: TableMeta[]): string[] {
