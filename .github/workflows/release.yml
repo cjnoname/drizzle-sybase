@@ -134,6 +134,11 @@ jobs:
     needs: [release-please, canary]
     if: ${{ needs.release-please.outputs.release_created != 'true' }}
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow defaults, so contents: write
+    # must be repeated here for the "Comment on commit" step.
+    permissions:
+      contents: write
+      id-token: write # required for npm trusted publishing (OIDC)
 
     steps:
       - uses: actions/checkout@v6
@@ -183,9 +188,10 @@ jobs:
           node -e "const p=require('./package.json');p.version='${CANARY_VERSION}';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Publish canary to npm
+        # Auth comes from GitHub OIDC via npm trusted publishing — no NPM_TOKEN.
+        # Requires the trusted publisher (this repo + release.yml) to be
+        # registered on npmjs.com for the drizzle-sybase package.
         run: pnpm publish --tag canary --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify canary publish
         run: |
@@ -327,6 +333,9 @@ jobs:
     needs: [release-please, build]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for npm trusted publishing (OIDC)
 
     steps:
       - uses: actions/checkout@v6
@@ -364,6 +373,7 @@ jobs:
           cp src/native/sybase_native.*.node dist/native/
 
       - name: Publish to npm
+        # Auth comes from GitHub OIDC via npm trusted publishing — no NPM_TOKEN.
         run: |
           VERSION=$(node -p "require('./package.json').version")
           if echo "$VERSION" | grep -q "beta\|alpha\|rc"; then
@@ -373,8 +383,6 @@ jobs:
             echo "Publishing ${VERSION} as latest"
             pnpm publish --no-git-checks
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify publish
         run: |
