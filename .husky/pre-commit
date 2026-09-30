@@ -12,7 +12,7 @@
 set -e
 
 echo "[pre-commit] 1/3 formatting project (pnpm format)…"
-pnpm -s format
+pnpm --silent format
 
 # Collect the list of files that were staged when the commit started.
 # `--cached --name-only --diff-filter=ACMR` = Added / Copied / Modified /
@@ -42,7 +42,7 @@ echo "[pre-commit] 2/3 running lint + type in parallel…"
 # src/**/__tests__ so they stay out of the published dist, but they still have to
 # be type-checked before a commit lands.
 pnpm exec concurrently --raw --kill-others-on-fail \
-  "pnpm -s lint" \
-  "pnpm -s type"
+  "pnpm --silent lint" \
+  "pnpm --silent type"
 
 echo "[pre-commit] 3/3 done — proceeding with commit."

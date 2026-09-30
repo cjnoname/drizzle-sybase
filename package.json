@@ -50,24 +50,24 @@
     "build:native": "node-gyp rebuild",
     "prepare": "husky",
     "prepublishOnly": "npm run build",
-    "test": "vitest",
+    "test": "vitest run",
     "type": "tsc --noEmit",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "format": "oxfmt",
     "check": "npm run lint && npm run type",
-    "clean": "pnpm dlx --reporter=silent rimraf \"**/node_modules\" pnpm-lock.yaml \"**/dist\" -g && pnpm i"
+    "clean": "node scripts/clean.ts \"**/node_modules\" \"**/dist\" pnpm-lock.yaml && pnpm i"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.6.3",
     "concurrently": "^10.0.5",
     "husky": "^9.1.7",
-    "node-gyp": "^13.0.1",
-    "oxfmt": "^0.64.0",
-    "oxlint": "^1.79.0",
+    "node-gyp": "^13.0.2",
+    "oxfmt": "^0.71.0",
+    "oxlint": "^1.86.0",
     "oxlint-tsgolint": "latest",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.2"
   },
   "peerDependencies": {
     "drizzle-orm": "^1.0.0-rc.4"
@@ -75,5 +75,5 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@11.22.0"
+  "packageManager": "pnpm@12.8.2"
 }
