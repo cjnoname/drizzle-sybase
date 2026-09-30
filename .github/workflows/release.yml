@@ -193,28 +193,27 @@ jobs:
         # registered on npmjs.com for the drizzle-sybase package.
         run: pnpm publish --tag canary --no-git-checks
 
+      # Unauthenticated and polled — `sleep 30` + `npm view` reads the packument,
+      # which is CDN-cached for 300s. See scripts/verify-published.ts.
       - name: Verify canary publish
-        run: |
-          echo "Waiting for npm registry to propagate..."
-          sleep 30
-          EXPECTED_VERSION="${{ steps.canary_version.outputs.version }}"
-          PUBLISHED_VERSION=$(npm view drizzle-sybase@${EXPECTED_VERSION} version 2>/dev/null || echo "NOT_FOUND")
-          if [ "$PUBLISHED_VERSION" != "$EXPECTED_VERSION" ]; then
-            echo "ERROR: Expected version ${EXPECTED_VERSION} but found ${PUBLISHED_VERSION} on npm registry"
-            exit 1
-          fi
-          echo "Verified: drizzle-sybase@${EXPECTED_VERSION} is live on npm"
+        run: node scripts/verify-published.ts "drizzle-sybase@${{ steps.canary_version.outputs.version }}"
 
       - name: Comment on commit
         uses: actions/github-script@v9
         with:
           script: |
-            github.rest.repos.createCommitComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              commit_sha: context.sha,
-              body: `🚀 Canary version published: \`${{ steps.canary_version.outputs.version }}\`\n\nInstall with: \`npm install drizzle-sybase@canary\``
-            })
+            // The publish already succeeded and was verified, so a transient
+            // GitHub API failure here must not fail the job.
+            try {
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                body: `🚀 Canary version published: \`${{ steps.canary_version.outputs.version }}\`\n\nInstall with: \`npm install drizzle-sybase@canary\``
+              });
+            } catch (error) {
+              core.warning(`Canary published, but commenting on the commit failed: ${error.message}`);
+            }
 
   # Step 2b: Build all platforms for release.
   build:
@@ -384,14 +383,6 @@ jobs:
             pnpm publish --no-git-checks
           fi
 
+      # Unauthenticated and polled — see scripts/verify-published.ts.
       - name: Verify publish
-        run: |
-          echo "Waiting for npm registry to propagate..."
-          sleep 30
-          EXPECTED_VERSION=$(node -p "require('./package.json').version")
-          PUBLISHED_VERSION=$(npm view drizzle-sybase@${EXPECTED_VERSION} version 2>/dev/null || echo "NOT_FOUND")
-          if [ "$PUBLISHED_VERSION" != "$EXPECTED_VERSION" ]; then
-            echo "WARNING: Expected version ${EXPECTED_VERSION} but found ${PUBLISHED_VERSION} on npm registry"
-          else
-            echo "Verified: drizzle-sybase@${EXPECTED_VERSION} is live on npm"
-          fi
+        run: node scripts/verify-published.ts "drizzle-sybase@$(node -p "require('./package.json').version")"
