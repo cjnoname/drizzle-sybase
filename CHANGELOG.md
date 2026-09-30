@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1](https://github.com/cjnoname/drizzle-sybase/compare/v2.0.0...v2.0.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* **ci:** Poll per-version npm endpoint to verify publish instead of cached npm view ([0f7547d](https://github.com/cjnoname/drizzle-sybase/commit/0f7547dd1571ef5428700708a423baf8cc5b58c0))
+
 ## [2.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v1.3.0...v2.0.0) (2026-08-22)
 
 
