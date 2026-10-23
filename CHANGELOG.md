@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v2.0.1...v3.0.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* with() (CTEs) and fullJoin() removed; invalid limit/offset throw RangeError; unsigned ints are number/bigint; unitext is a Buffer and ntext() is deprecated; sybaseTable() is typed instead of any; COMMIT/ROLLBACK are refused inside db.transaction(); a raw batch leaving a transaction open is rolled back and rejected; connections that ran setuser are discarded; results over 1,000,000 rows throw unless maxRows is given; default packetSize is 2048; pagination uses TOP; #temp tables do not outlive their pool query or transaction (use db.withConnection()); invalid config throws.
+
+### Features
+
+* Harden pool, transactions and types; drop temp tables; add withConnection ([c866b8f](https://github.com/cjnoname/drizzle-sybase/commit/c866b8f046340f3bb733a0f4c7334684c899a383))
+
+
+### Bug Fixes
+
+* **clean:** Enhance path filtering to prevent deletion of absolute paths on Windows ([99707a9](https://github.com/cjnoname/drizzle-sybase/commit/99707a93333f846ab817ee7f7a472ec5b5d59630))
+* **codec:** Optimize data type parsing to improve performance ([539eab3](https://github.com/cjnoname/drizzle-sybase/commit/539eab3bce659c30b6bc66ed7a18ff986ec35558))
+* **docs:** Reorder import statements in README for clarity ([a4ed852](https://github.com/cjnoname/drizzle-sybase/commit/a4ed8526ad7e722cdb02cfee30bf57c1f8dd814b))
+
 ## [2.0.1](https://github.com/cjnoname/drizzle-sybase/compare/v2.0.0...v2.0.1) (2026-09-30)
 
 
