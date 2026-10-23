@@ -18,8 +18,8 @@ npm install drizzle-sybase
 ## Usage
 
 ```ts
-import { createSybaseDrizzle, sybaseTable, int, varchar, datetime } from "drizzle-sybase";
 import { eq, sql } from "drizzle-orm";
+import { createSybaseDrizzle, sybaseTable, int, varchar, datetime } from "drizzle-sybase";
 
 // Define schema
 const users = sybaseTable("users", {
@@ -290,8 +290,9 @@ Omit `--out` to print to stdout, and omit `--tables` to introspect all user tabl
 ### Programmatic
 
 ```ts
-import { introspectSybase, introspectWith } from "drizzle-sybase/introspect";
 import { writeFileSync } from "node:fs";
+
+import { introspectSybase, introspectWith } from "drizzle-sybase/introspect";
 
 // Self-contained: opens a short-lived pool and closes it.
 const { code, warnings } = await introspectSybase({
