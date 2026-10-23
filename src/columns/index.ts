@@ -107,7 +107,10 @@ const CODEC_KEYS: ReadonlySet<string> = new Set<string>(EXACT_NUMERIC_TYPES);
  * codec re-reads the full type from the column when it matters.
  */
 function codecKey(dataType: string): string | undefined {
-  const base = dataType.replace(/\s*\(.*$/, "").toLowerCase();
+  // Cut at the parenthesis rather than with /\s*\(.*$/, which backtracks
+  // quadratically on a long run of spaces.
+  const paren = dataType.indexOf("(");
+  const base = (paren === -1 ? dataType : dataType.slice(0, paren)).trimEnd().toLowerCase();
   return CODEC_KEYS.has(base) ? base : undefined;
 }
 
