@@ -13,10 +13,14 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
-import { getTableName } from "drizzle-orm";
 
-import { escapeName, type SybaseDialect } from "../dialect.js";
-import type { SybaseSession, SybaseTransactionSession } from "../session.js";
+import { escapeTableName, type SybaseDialect } from "../dialect.js";
+import type {
+  SybaseConnectionSession,
+  SybaseSession,
+  SybaseTransactionSession
+} from "../session.js";
+import type { AnySybaseTable } from "../table.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,17 +35,18 @@ export interface SybaseDeleteResult {
 // Builder
 // ---------------------------------------------------------------------------
 
-export class SybaseDeleteBuilder {
+export class SybaseDeleteBuilder<TTable extends AnySybaseTable = AnySybaseTable> {
   private whereCondition?: string;
 
   constructor(
-    private readonly table: any,
+    private readonly table: TTable,
     private readonly dialect: SybaseDialect,
-    private readonly session: SybaseSession | SybaseTransactionSession
+    private readonly session: SybaseSession | SybaseTransactionSession | SybaseConnectionSession
   ) {}
 
-  where(condition: SQL): this {
-    this.whereCondition = this.dialect.sqlToQuery(condition);
+  /** `undefined` (as `and()` of no conditions returns) means no condition, as in drizzle. */
+  where(condition: SQL | undefined): this {
+    this.whereCondition = condition ? this.dialect.sqlToQuery(condition) : undefined;
     return this;
   }
 
@@ -67,7 +72,7 @@ export class SybaseDeleteBuilder {
   // ---------------------------------------------------------------------------
 
   private buildSql(): string {
-    const tableName = escapeName(getTableName(this.table));
+    const tableName = escapeTableName(this.table);
     let query = `delete from ${tableName}`;
     if (this.whereCondition) {
       query += ` where ${this.whereCondition}`;

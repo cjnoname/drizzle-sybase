@@ -6,10 +6,11 @@
  * - WHERE conditions (via Drizzle SQL expressions)
  * - ORDER BY
  * - GROUP BY / HAVING
- * - JOINs (inner, left, right, full)
+ * - JOINs (inner, left, right — ASE has no FULL OUTER JOIN)
  * - DISTINCT
- * - Pagination via SET ROWCOUNT (Sybase has no LIMIT/OFFSET)
- * - CTE (WITH)
+ * - Pagination via SELECT TOP (Sybase has no LIMIT/OFFSET)
+ *
+ * ASE has no common table expressions (`WITH`); use a derived table instead.
  *
  * @example
  * ```ts
@@ -27,10 +28,26 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
-import { getTableName } from "drizzle-orm";
 
-import { escapeName, type SybaseDialect } from "../dialect.js";
-import type { SybaseSession, SybaseTransactionSession } from "../session.js";
+import { escapeName, escapeTableName, type SybaseDialect } from "../dialect.js";
+import type {
+  SybaseConnectionSession,
+  SybaseSession,
+  SybaseTransactionSession
+} from "../session.js";
+import type { AnySybaseTable } from "../table.js";
+import type {
+  InitialSelectState,
+  JoinGuard,
+  SybaseSelectFields,
+  SybaseSelectResult,
+  SybaseSelectState,
+  WithFrom,
+  WithJoin,
+  WithNamedSource
+} from "./select-types.js";
+
+const ColumnsSymbol = Symbol.for("drizzle:Columns");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,15 +58,11 @@ export interface SybaseSelectField {
   alias?: string;
 }
 
+/** ASE has no FULL OUTER JOIN. */
 export interface SybaseSelectJoin {
-  type: "inner" | "left" | "right" | "full";
+  type: "inner" | "left" | "right";
   table: string;
   on: string;
-}
-
-export interface SybaseSelectWithCTE {
-  alias: string;
-  sql: string;
 }
 
 export interface SybaseSelectConfig {
@@ -63,56 +76,67 @@ export interface SybaseSelectConfig {
   distinct?: boolean;
   limit?: number;
   offset?: number;
-  withList?: SybaseSelectWithCTE[];
+  /** Rows to fetch, rendered as `SELECT TOP n`: `offset + limit` when a limit is set. */
+  top?: number;
 }
 
 // ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
 
-export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<string, unknown>> {
+/** Largest value `TOP` takes (a 32-bit int). */
+const MAX_ROWCOUNT = 2_147_483_647;
+
+/**
+ * Validate a limit/offset. They are inlined into `TOP`, so anything
+ * that is not a plain integer would be a syntax error at best and injected SQL
+ * at worst (for callers outside TypeScript).
+ */
+const assertRowCount = (name: "limit" | "offset", count: number): number => {
+  if (!Number.isInteger(count) || count < 0 || count > MAX_ROWCOUNT) {
+    throw new RangeError(
+      `${name}() expects an integer between 0 and ${MAX_ROWCOUNT}, got ${String(count)}`
+    );
+  }
+  return count;
+};
+
+export class SybaseSelectBuilder<
+  S extends SybaseSelectState = InitialSelectState<SybaseSelectFields | undefined>
+> {
   private config: SybaseSelectConfig;
+  /** No fields were given: select every column of the source tables. */
+  private readonly implicitFields: boolean;
+  /** Table objects in FROM / JOIN order, used to expand implicit fields. */
+  private readonly sources: any[] = [];
+  /** A source was given by name, so its columns are unknown. */
+  private hasNamedSource = false;
 
   constructor(
     private readonly dialect: SybaseDialect,
-    private readonly session: SybaseSession | SybaseTransactionSession,
+    private readonly session: SybaseSession | SybaseTransactionSession | SybaseConnectionSession,
     fields?: SybaseSelectField[]
   ) {
+    this.implicitFields = fields === undefined;
     this.config = {
       fields: fields ?? [{ expression: "*" }]
     };
   }
 
   /**
-   * Add a Common Table Expression (CTE) to the query.
-   *
-   * @example
-   * ```ts
-   * const result = await db.select()
-   *   .with("active_users", sql`select * from [users] where active = 1`)
-   *   .from("active_users");
-   * ```
+   * Select from a table. A table given by name (e.g. a temporary table) is
+   * selected as-is: its columns are unknown, so rows are untyped.
    */
-  with(alias: string, query: SQL | string): this {
-    if (!this.config.withList) {
-      this.config.withList = [];
-    }
-    const sqlStr = typeof query === "string" ? query : this.dialect.sqlToQuery(query);
-    this.config.withList.push({ alias, sql: sqlStr });
+  from<T extends AnySybaseTable>(table: T): SybaseSelectBuilder<WithFrom<S, T>>;
+  from(table: string): SybaseSelectBuilder<WithNamedSource<S>>;
+  from(table: AnySybaseTable | string): unknown {
+    this.config.table = this.addSource(table);
     return this;
   }
 
-  from(table: any): this {
-    if (typeof table === "string") {
-      this.config.table = escapeName(table);
-    } else {
-      this.config.table = escapeName(getTableName(table));
-    }
-    return this;
-  }
-
-  where(condition: SQL): this {
-    this.config.where = this.dialect.sqlToQuery(condition);
+  /** `undefined` (as `and()` of no conditions returns) means no condition, as in drizzle. */
+  where(condition: SQL | undefined): this {
+    this.config.where = condition ? this.dialect.sqlToQuery(condition) : undefined;
     return this;
   }
 
@@ -126,25 +150,44 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
     return this;
   }
 
-  having(condition: SQL): this {
-    this.config.having = this.dialect.sqlToQuery(condition);
+  having(condition: SQL | undefined): this {
+    this.config.having = condition ? this.dialect.sqlToQuery(condition) : undefined;
     return this;
   }
 
-  innerJoin(table: any, on: SQL): this {
+  // The typed overload is last: TypeScript reports the last overload's error,
+  // which for a clashing join is the one that names the clash.
+  innerJoin(table: string, on: SQL): SybaseSelectBuilder<WithNamedSource<S, "inner">>;
+  innerJoin<T extends AnySybaseTable>(
+    table: T & JoinGuard<S, T>,
+    on: SQL
+  ): SybaseSelectBuilder<WithJoin<S, T, "inner">>;
+  innerJoin(table: AnySybaseTable | string, on: SQL): unknown {
     return this.addJoin("inner", table, on);
   }
 
-  leftJoin(table: any, on: SQL): this {
+  /** The joined table's columns come back `null` where nothing matched. */
+  // The typed overload is last: TypeScript reports the last overload's error,
+  // which for a clashing join is the one that names the clash.
+  leftJoin(table: string, on: SQL): SybaseSelectBuilder<WithNamedSource<S, "left">>;
+  leftJoin<T extends AnySybaseTable>(
+    table: T & JoinGuard<S, T>,
+    on: SQL
+  ): SybaseSelectBuilder<WithJoin<S, T, "left">>;
+  leftJoin(table: AnySybaseTable | string, on: SQL): unknown {
     return this.addJoin("left", table, on);
   }
 
-  rightJoin(table: any, on: SQL): this {
+  /** Every earlier table's columns come back `null` where nothing matched. */
+  // The typed overload is last: TypeScript reports the last overload's error,
+  // which for a clashing join is the one that names the clash.
+  rightJoin(table: string, on: SQL): SybaseSelectBuilder<WithNamedSource<S, "right">>;
+  rightJoin<T extends AnySybaseTable>(
+    table: T & JoinGuard<S, T>,
+    on: SQL
+  ): SybaseSelectBuilder<WithJoin<S, T, "right">>;
+  rightJoin(table: AnySybaseTable | string, on: SQL): unknown {
     return this.addJoin("right", table, on);
-  }
-
-  fullJoin(table: any, on: SQL): this {
-    return this.addJoin("full", table, on);
   }
 
   distinct(): this {
@@ -153,16 +196,14 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
   }
 
   /**
-   * Set max rows to return. Sybase uses SET ROWCOUNT instead of LIMIT.
+   * Set max rows to return, as `SELECT TOP n` (ASE has no LIMIT).
    *
-   * - `limit(0)` returns zero rows (SET ROWCOUNT 0 before query, then reset)
-   * - Negative values are ignored
+   * - `limit(0)` returns zero rows
+   * - Anything but a non-negative integer throws: the value is inlined into
+   *   the batch
    */
   limit(count: number): this {
-    if (count < 0) {
-      return this;
-    }
-    this.config.limit = count;
+    this.config.limit = assertRowCount("limit", count);
     return this;
   }
 
@@ -170,7 +211,7 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
    * Set offset for pagination.
    *
    * **Implementation:** Sybase ASE does not support OFFSET natively.
-   * This is implemented by fetching `offset + limit` rows via SET ROWCOUNT,
+   * This is implemented by fetching `offset + limit` rows with `TOP`,
    * then slicing off the first `offset` rows in application code.
    *
    * For best performance with large offsets, consider cursor-based pagination
@@ -179,10 +220,7 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
    * ORDER BY is required for deterministic results with offset.
    */
   offset(count: number): this {
-    if (count < 0) {
-      return this;
-    }
-    this.config.offset = count;
+    this.config.offset = assertRowCount("offset", count);
     return this;
   }
 
@@ -196,7 +234,7 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
   /**
    * Execute the query and return typed results.
    */
-  async execute(): Promise<T[]> {
+  async execute(): Promise<SybaseSelectResult<S>[]> {
     // Safety: offset without limit would fetch entire table into memory then slice.
     if (
       this.config.offset !== undefined &&
@@ -210,23 +248,33 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
       );
     }
 
+    // limit(0) means no rows. Not left to the generated `where 1=0`: an
+    // aggregate without GROUP BY still returns one row over an empty input
+    // (`count(*)` gives `[{ n: 0 }]`).
+    if (this.config.limit === 0) {
+      return [];
+    }
+
     const rawSql = this.buildSql();
     const maxRows = this.getMaxRowsHint();
-    const result = await this.session.execute<T>(rawSql, maxRows ? { maxRows } : undefined);
+    const result = await this.session.execute(rawSql, maxRows ? { maxRows } : undefined);
+    // The rows are shaped by the field list this builder generated, which is
+    // what the result type describes.
+    const rows = result.rows as SybaseSelectResult<S>[];
 
     // If offset is set, skip the first N rows in application code
     // (Sybase ASE has no native OFFSET support)
     if (this.config.offset !== undefined && this.config.offset > 0) {
-      return result.rows.slice(this.config.offset);
+      return rows.slice(this.config.offset);
     }
-    return result.rows;
+    return rows;
   }
 
   /**
    * Alias for execute() — enables `await db.select()...` pattern.
    */
-  then<TResult1 = T[], TResult2 = never>(
-    onfulfilled?: ((value: T[]) => TResult1 | PromiseLike<TResult1>) | null,
+  then<TResult1 = SybaseSelectResult<S>[], TResult2 = never>(
+    onfulfilled?: ((value: SybaseSelectResult<S>[]) => TResult1 | PromiseLike<TResult1>) | null,
     onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
   ): Promise<TResult1 | TResult2> {
     return this.execute().then(onfulfilled, onrejected);
@@ -237,70 +285,79 @@ export class SybaseSelectBuilder<T extends Record<string, unknown> = Record<stri
   // ---------------------------------------------------------------------------
 
   private resolveColumns(columns: any[]): string[] {
-    return columns.map(col => {
-      if (typeof col === "string") {
-        return col;
-      }
-      // Check for SybaseColumn (has name + table) before getSQL to avoid
-      // calling getSQL() on column objects that don't return a proper SQL instance
-      if (col && col.name && col.table) {
-        return `${escapeName(getTableName(col.table))}.${escapeName(col.name)}`;
-      }
-      if (col && typeof col.getSQL === "function") {
-        return this.dialect.sqlToQuery(col.getSQL());
-      }
-      if (col && typeof col.toQuery === "function") {
-        return this.dialect.sqlToQuery(col);
-      }
-      if (col && col.name) {
-        return escapeName(col.name);
-      }
-      return String(col);
-    });
+    return columns.map(col => this.dialect.renderExpression(col, "reference"));
   }
 
-  private addJoin(type: "inner" | "left" | "right" | "full", table: any, on: SQL): this {
+  private addJoin(type: SybaseSelectJoin["type"], table: any, on: SQL): this {
     if (!this.config.joins) {
       this.config.joins = [];
     }
 
-    let tableName: string;
-    if (typeof table === "string") {
-      tableName = escapeName(table);
-    } else {
-      tableName = escapeName(getTableName(table));
-    }
-
+    const tableName = this.addSource(table);
     const onStr = this.dialect.sqlToQuery(on);
     this.config.joins.push({ type, table: tableName, on: onStr });
     return this;
   }
 
+  /** Record a FROM / JOIN source and return its escaped reference. */
+  private addSource(table: any): string {
+    if (typeof table === "string") {
+      this.hasNamedSource = true;
+      return escapeName(table);
+    }
+    this.sources.push(table);
+    return escapeTableName(table);
+  }
+
+  /**
+   * Fields for a select with none given: every column of every source table,
+   * aliased to its property name — the keys the table definition and the
+   * generated schemas use, rather than the database column names `select *`
+   * would return.
+   *
+   * Falls back to `*` when a source was given by name, since its columns are
+   * unknown. Throws when two sources share a property name: a flat row cannot
+   * hold both, and keeping one silently would lose data.
+   */
+  private implicitFieldList(): SybaseSelectField[] {
+    if (this.hasNamedSource || this.sources.length === 0) {
+      return [{ expression: "*" }];
+    }
+    const fields: SybaseSelectField[] = [];
+    const owners = new Map<string, string>();
+    for (const table of this.sources) {
+      const tableRef = escapeTableName(table);
+      for (const [property, col] of Object.entries<any>(table[ColumnsSymbol] ?? {})) {
+        const previous = owners.get(property);
+        if (previous !== undefined) {
+          throw new Error(
+            `Cannot select every column: property "${property}" exists in both ${previous} and ` +
+              `${tableRef}. Pass the fields explicitly, e.g. db.select({ ... }).`
+          );
+        }
+        owners.set(property, tableRef);
+        fields.push({ expression: `${tableRef}.${escapeName(col.name)}`, alias: property });
+      }
+    }
+    return fields;
+  }
+
   private buildSql(): string {
-    // Special case: limit(0) means return no rows
-    // In Sybase, SET ROWCOUNT 0 means "no limit", so we add WHERE 1=0
-    if (this.config.limit === 0) {
-      const configWithFalseWhere: SybaseSelectConfig = {
-        ...this.config,
-        where: this.config.where ? `1=0 and (${this.config.where})` : "1=0"
-      };
-      return this.dialect.buildSelectQuery(configWithFalseWhere);
+    const config: SybaseSelectConfig = this.implicitFields
+      ? { ...this.config, fields: this.implicitFieldList() }
+      : this.config;
+    // `SELECT TOP n` rather than `SET ROWCOUNT n`: TOP is part of the
+    // statement, so it changes no session state that could outlive it (a
+    // ROWCOUNT left set by a batch that stopped early would truncate the next
+    // pool user's queries). `TOP 0` returns no rows, as limit(0) means.
+    if (config.limit === undefined) {
+      return this.dialect.buildSelectQuery(config);
     }
-
-    const paginationParts: string[] = [];
-    if (this.config.limit !== undefined && this.config.offset !== undefined) {
-      paginationParts.push(`SET ROWCOUNT ${this.config.offset + this.config.limit}`);
-    } else if (this.config.limit !== undefined) {
-      paginationParts.push(`SET ROWCOUNT ${this.config.limit}`);
+    const top = (config.offset ?? 0) + config.limit;
+    if (top > MAX_ROWCOUNT) {
+      throw new RangeError(`offset() + limit() must not exceed ${MAX_ROWCOUNT}, got ${top}`);
     }
-
-    const selectSql = this.dialect.buildSelectQuery(this.config);
-
-    if (paginationParts.length > 0) {
-      return `${paginationParts.join("\n")}\n${selectSql}\nSET ROWCOUNT 0`;
-    }
-
-    return selectSql;
+    return this.dialect.buildSelectQuery({ ...config, top });
   }
 
   /**

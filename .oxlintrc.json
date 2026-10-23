@@ -4,7 +4,14 @@
   "options": {
     "typeAware": true
   },
-  "ignorePatterns": ["scripts/**/*", "dist/**/*", "build/**/*", "npm/**/*", "examples/**/*"],
+  "ignorePatterns": [
+    "scripts/**/*",
+    "dist/**/*",
+    "build/**/*",
+    "npm/**/*",
+    "examples/**/*",
+    "src/introspect/__tests__/fixtures/**/*"
+  ],
   "overrides": [
     {
       "files": ["src/**/*.{ts,tsx}"],

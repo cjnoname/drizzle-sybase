@@ -12,13 +12,17 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
-import { getTableName } from "drizzle-orm";
 
-import { escapeName, type SybaseDialect } from "../dialect.js";
+import { escapeName, escapeTableName, type SybaseDialect } from "../dialect.js";
+import type {
+  SybaseConnectionSession,
+  SybaseSession,
+  SybaseTransactionSession
+} from "../session.js";
+import type { AnySybaseTable, SybaseUpdateValues } from "../table.js";
 
 /** @internal */
 const ColumnsSymbol = Symbol.for("drizzle:Columns");
-import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,23 +37,24 @@ export interface SybaseUpdateResult {
 // Builder
 // ---------------------------------------------------------------------------
 
-export class SybaseUpdateBuilder {
+export class SybaseUpdateBuilder<TTable extends AnySybaseTable = AnySybaseTable> {
   private setValues: Record<string, unknown> = {};
   private whereCondition?: string;
 
   constructor(
-    private readonly table: any,
+    private readonly table: TTable,
     private readonly dialect: SybaseDialect,
-    private readonly session: SybaseSession | SybaseTransactionSession
+    private readonly session: SybaseSession | SybaseTransactionSession | SybaseConnectionSession
   ) {}
 
-  set(values: Record<string, unknown>): this {
+  set(values: SybaseUpdateValues<TTable>): this {
     this.setValues = values;
     return this;
   }
 
-  where(condition: SQL): this {
-    this.whereCondition = this.dialect.sqlToQuery(condition);
+  /** `undefined` (as `and()` of no conditions returns) means no condition, as in drizzle. */
+  where(condition: SQL | undefined): this {
+    this.whereCondition = condition ? this.dialect.sqlToQuery(condition) : undefined;
     return this;
   }
 
@@ -75,8 +80,8 @@ export class SybaseUpdateBuilder {
   // ---------------------------------------------------------------------------
 
   private buildSql(): string {
-    const columns = this.table[ColumnsSymbol];
-    const tableName = escapeName(getTableName(this.table));
+    const columns: Record<string, any> = (this.table as any)[ColumnsSymbol];
+    const tableName = escapeTableName(this.table);
 
     const setClauses: string[] = [];
 

@@ -45,6 +45,8 @@
 #include <sybfront.h>
 #include <sybdb.h>
 #include <uv.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -57,10 +59,11 @@
 #define ERR_BUF_SIZE 4096
 // Maximum rows to return by default (safety limit against accidental OOM).
 #define DEFAULT_MAX_ROWS 1000000
-// Default TDS network packet size (bytes). Larger than the FreeTDS default
-// of 512 — fewer round-trips on big result sets. The server may negotiate
-// down if it can't go this high.
-#define DEFAULT_PACKET_SIZE 4096
+// Default TDS network packet size (bytes): ASE's out-of-the-box `max network
+// packet size`. The server does not negotiate a larger request down — it
+// refuses the login (Msg 4002, as for a bad password) — so the default is the
+// stock limit; a server configured lower (down to 512) needs packetSize set.
+#define DEFAULT_PACKET_SIZE 2048
 
 // ---------------------------------------------------------------------------
 // Global mutex for serializing inherently process-wide db-lib calls.
@@ -72,6 +75,40 @@
 
 static uv_once_t global_init_once = UV_ONCE_INIT;
 static uv_mutex_t login_mutex;
+
+/*
+ * Messages raised while dbopen() runs. The handlers find a connection through
+ * the DBPROCESS's user data, which does not exist until dbopen() returns, so
+ * without this every login failure — bad password, unknown database, a packet
+ * size the server refuses — surfaced only as "Failed to connect".
+ *
+ * Thread-local, not guarded by login_mutex: db-lib calls the handlers on the
+ * thread that made the call, so a thread's login messages are exactly what its
+ * own dbopen() raised. A shared buffer would also collect errors other threads
+ * raise with no DBPROCESS (db-lib reports e.g. allocation failures that way)
+ * — racing on the buffer and blaming the wrong login.
+ */
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#else
+#define THREAD_LOCAL _Thread_local
+#endif
+static THREAD_LOCAL char login_error[ERR_BUF_SIZE];
+static THREAD_LOCAL int login_in_progress = 0;
+
+static void append_login_error(const char *fmt, ...) {
+  if (!login_in_progress) {
+    return;
+  }
+  size_t used = strlen(login_error);
+  if (used + 1 >= sizeof(login_error)) {
+    return;
+  }
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(login_error + used, sizeof(login_error) - used, fmt, args);
+  va_end(args);
+}
 
 static void init_globals(void) {
   uv_mutex_init(&login_mutex);
@@ -109,7 +146,7 @@ typedef struct {
   int timed_out;        // set when err_handler sees SYBETIME
   int timeout_seconds;  // remembered so watchdog can compute its deadline
   uv_mutex_t lock;
-  int in_flight;        // # of running queries on this connection (0 or 1)
+  int in_flight;        // # of queries pinning this connection, from enqueue to completion
   int pending_close;    // 1 if fn_close was called while in_flight > 0
 } SybaseConnection;
 
@@ -147,6 +184,23 @@ static void conn_release(SybaseConnection *conn) {
 }
 
 /**
+ * `dead` is written by the worker (err_handler), the watchdog thread and the
+ * JS thread (fn_close), so every access goes through `conn->lock`.
+ */
+static void conn_mark_dead(SybaseConnection *conn) {
+  uv_mutex_lock(&conn->lock);
+  conn->dead = 1;
+  uv_mutex_unlock(&conn->lock);
+}
+
+static int conn_is_dead(SybaseConnection *conn) {
+  uv_mutex_lock(&conn->lock);
+  int dead = conn->dead;
+  uv_mutex_unlock(&conn->lock);
+  return dead;
+}
+
+/**
  * Actually free a connection. Must be called outside conn->lock; this
  * function destroys the lock itself.
  */
@@ -161,6 +215,69 @@ static void destroy_connection(SybaseConnection *conn) {
   }
   uv_mutex_destroy(&conn->lock);
   free(conn);
+}
+
+/**
+ * Close a connection now, or — if a query is still running on it — mark it
+ * so the last worker to finish frees it (see conn_release).
+ */
+static void close_connection(SybaseConnection *conn) {
+  uv_mutex_lock(&conn->lock);
+  int can_destroy_now = (conn->in_flight == 0);
+  int already_pending = conn->pending_close;
+  conn->pending_close = 1;
+  conn->dead = 1;  // reject any subsequent acquire
+  uv_mutex_unlock(&conn->lock);
+
+  if (can_destroy_now && !already_pending) {
+    destroy_connection(conn);
+  }
+  // else: the worker holding in_flight frees it in conn_release.
+}
+
+// ---------------------------------------------------------------------------
+// JS-facing connection handle
+//
+// JS holds an external pointing at this box, never at the connection itself:
+// the connection is freed on close, but the external lives on for as long as
+// JS keeps a reference. Clearing `conn` on close makes every later use of the
+// handle — a second close, isAlive, query — see a closed connection instead of
+// freed memory. Only the JS thread touches the box, so it needs no lock.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+  SybaseConnection *conn;  // NULL once closed
+} ConnHandle;
+
+// Identifies externals created by connect(), so an arbitrary value passed as a
+// handle is rejected rather than dereferenced.
+static const napi_type_tag CONN_HANDLE_TAG = {0x8f1c2a7d3b4e5f60ULL, 0x91a2b3c4d5e6f708ULL};
+
+/** GC of a handle that was never closed: close the connection it still owns. */
+static void conn_handle_finalize(napi_env env, void *data, void *hint) {
+  (void)env;
+  (void)hint;
+  ConnHandle *handle = (ConnHandle *)data;
+  if (handle->conn) {
+    close_connection(handle->conn);
+    handle->conn = NULL;
+  }
+  free(handle);
+}
+
+/**
+ * The handle behind `value`, or NULL (with a TypeError thrown) if `value` is
+ * not one returned by connect().
+ */
+static ConnHandle *get_conn_handle(napi_env env, napi_value value) {
+  bool tagged = false;
+  void *data = NULL;
+  if (napi_check_object_type_tag(env, value, &CONN_HANDLE_TAG, &tagged) != napi_ok || !tagged ||
+      napi_get_value_external(env, value, &data) != napi_ok || data == NULL) {
+    napi_throw_type_error(env, NULL, "Expected a connection handle returned by connect()");
+    return NULL;
+  }
+  return (ConnHandle *)data;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +297,11 @@ static int err_handler(DBPROCESS *dbproc, int severity, int dberr,
     conn = (SybaseConnection *)dbgetuserdata(dbproc);
   }
 
+  if (!conn) {
+    // During dbopen there is no connection to attach it to yet.
+    append_login_error("DB-Lib error %d (severity %d): %s\n", dberr, severity, dberrstr);
+  }
+
   if (conn) {
     size_t cur_len = strlen(conn->last_error);
     if (cur_len < ERR_BUF_SIZE - 100) {
@@ -193,7 +315,7 @@ static int err_handler(DBPROCESS *dbproc, int severity, int dberr,
     }
 
     if (DBDEAD(dbproc)) {
-      conn->dead = 1;
+      conn_mark_dead(conn);
     }
   }
 
@@ -223,6 +345,11 @@ static int msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate,
     conn = (SybaseConnection *)dbgetuserdata(dbproc);
   }
 
+  if (!conn) {
+    append_login_error("Msg %ld, Level %d, State %d: %s\n", (long)msgno, severity, msgstate,
+                       msgtext);
+  }
+
   if (conn) {
     size_t cur_len = strlen(conn->last_error);
     if (cur_len < ERR_BUF_SIZE - 200) {
@@ -249,8 +376,61 @@ static void clear_error(SybaseConnection *conn) {
 typedef struct {
   char *name;
   char **values;
+  // Byte length per value; allocated only for binary columns, whose values
+  // are raw bytes (may contain NUL) rather than NUL-terminated text.
+  int *lengths;
   int type;
 } ResultColumn;
+
+/** Whether a column carries raw bytes, handed to JS as a Buffer. */
+static int is_binary_type(int coltype) {
+  return coltype == SYBBINARY || coltype == SYBVARBINARY || coltype == SYBIMAGE;
+}
+
+/**
+ * Discard the rest of the current result set. dbnextrow() returns FAIL — and
+ * keeps returning it — once the connection is dead, so a bare
+ * `while (dbnextrow() != NO_MORE_ROWS)` would spin forever on a broken
+ * stream. Returns FAIL in that case so the caller can bail out.
+ */
+static RETCODE discard_rows(DBPROCESS *dbproc) {
+  RETCODE rc;
+  while ((rc = dbnextrow(dbproc)) != NO_MORE_ROWS) {
+    if (rc == FAIL) {
+      return FAIL;
+    }
+  }
+  return SUCCEED;
+}
+
+/*
+ * ASE's unsigned integer types. db-lib defines no names for them, so they reach
+ * `dbcoltype` as their TDS type codes — the same code whether or not the column
+ * is nullable (checked against ASE 15.7).
+ */
+#define TDS_USMALLINT 65
+#define TDS_UINT 66
+#define TDS_UBIGINT 67
+/* Nullable variant, as computed expressions report it; the size says which. */
+#define TDS_UINTN 68
+
+/** `dbcoltype`, with the nullable unsigned variant resolved by size like db-lib does for the rest. */
+static int column_type(DBPROCESS *dbproc, int column) {
+  int type = dbcoltype(dbproc, column);
+  if (type != TDS_UINTN) {
+    return type;
+  }
+  switch (dbcollen(dbproc, column)) {
+    case 2:
+      return TDS_USMALLINT;
+    case 4:
+      return TDS_UINT;
+    case 8:
+      return TDS_UBIGINT;
+    default:
+      return type;
+  }
+}
 
 /**
  * Sybase system type name for a db-lib column type, using the same spelling as
@@ -264,6 +444,16 @@ typedef struct {
  * need no cases here.
  */
 static const char *syb_type_name(int coltype) {
+  switch (coltype) {
+    case TDS_USMALLINT:
+      return "usmallint";
+    case TDS_UINT:
+      return "uint";
+    case TDS_UBIGINT:
+      return "ubigint";
+    default:
+      break;
+  }
   switch (coltype) {
     case SYBINT1:
       return "tinyint";
@@ -418,6 +608,7 @@ static void free_columns(ResultColumn *columns, int num_columns, int num_rows) {
       }
       free(columns[i].values);
     }
+    free(columns[i].lengths);
     free(columns[i].name);
   }
   free(columns);
@@ -495,15 +686,18 @@ static void connect_execute(napi_env env, void *data) {
   if (w->timeout_seconds > 0) {
     dbsetlogintime(w->timeout_seconds);
   }
+  login_error[0] = '\0';
+  login_in_progress = 1;
   w->conn->dbproc = dbopen(w->conn->login, server);
+  login_in_progress = 0;
   uv_mutex_unlock(&login_mutex);
 
   if (!w->conn->dbproc) {
-    if (w->conn->has_error) {
-      snprintf(w->error, sizeof(w->error), "%s", w->conn->last_error);
-    } else {
-      snprintf(w->error, sizeof(w->error), "Failed to connect to %s:%d",
-               w->host, w->port);
+    // Prefix, then as much of the server's messages as fits: they are what
+    // says why (e.g. Msg 4002, Msg 911), and may be truncated, never overrun.
+    int n = snprintf(w->error, sizeof(w->error), "Failed to connect to %s:%d", w->host, w->port);
+    if (login_error[0] != '\0' && n > 0 && (size_t)n < sizeof(w->error)) {
+      snprintf(w->error + n, sizeof(w->error) - (size_t)n, ": %s", login_error);
     }
     dbloginfree(w->conn->login);
     uv_mutex_destroy(&w->conn->lock);
@@ -552,14 +746,32 @@ static void connect_complete(napi_env env, napi_status status, void *data) {
   ConnectWork *w = (ConnectWork *)data;
 
   if (status == napi_cancelled || !w->success) {
+    // Cancelled after a successful connect: nothing will ever own it.
+    if (w->success && w->conn) {
+      close_connection(w->conn);
+    }
     napi_value error_msg, error_obj;
     napi_create_string_utf8(env, w->error, NAPI_AUTO_LENGTH, &error_msg);
     napi_create_error(env, NULL, error_msg, &error_obj);
     napi_reject_deferred(env, w->deferred, error_obj);
   } else {
     napi_value result;
-    napi_create_external(env, w->conn, NULL, NULL, &result);
-    napi_resolve_deferred(env, w->deferred, result);
+    ConnHandle *handle = (ConnHandle *)malloc(sizeof(ConnHandle));
+    if (handle == NULL ||
+        napi_create_external(env, handle, conn_handle_finalize, NULL, &result) != napi_ok) {
+      // No handle for JS to close it through: close it here.
+      free(handle);
+      close_connection(w->conn);
+      napi_value error_msg, error_obj;
+      napi_create_string_utf8(env, "Could not create a connection handle", NAPI_AUTO_LENGTH,
+                              &error_msg);
+      napi_create_error(env, NULL, error_msg, &error_obj);
+      napi_reject_deferred(env, w->deferred, error_obj);
+    } else {
+      handle->conn = w->conn;
+      napi_type_tag_object(env, result, &CONN_HANDLE_TAG);
+      napi_resolve_deferred(env, w->deferred, result);
+    }
   }
 
   napi_delete_async_work(env, w->work);
@@ -667,6 +879,10 @@ typedef struct {
   SybaseConnection *conn;
   char *sql;
   int max_rows;
+  // 1 when the caller asked for maxRows: hitting it is then the requested
+  // truncation. Hitting the internal safety cap instead fails the query.
+  int max_rows_explicit;
+  int truncated;
   int hard_timeout_ms;
   // Results
   ResultColumn *columns;
@@ -680,6 +896,11 @@ typedef struct {
   // dereferencing w->conn — which may have been freed by then.
   int conn_dead;
   int conn_timed_out;
+  // 1 while this work item holds an in-flight slot on `conn`. Taken in
+  // fn_query on the JS thread *before* the work is queued, so a close issued
+  // while the work waits in the libuv queue defers the free instead of
+  // leaving the worker with a dangling pointer.
+  int holds_conn;
   // Watchdog
   Watchdog wd;
 } QueryWork;
@@ -694,7 +915,7 @@ static void watchdog_thread(void *arg) {
     if (rc == UV_ETIMEDOUT && !wd->finished) {
       wd->fired = 1;
       if (wd->conn) {
-        wd->conn->dead = 1;
+        conn_mark_dead(wd->conn);
       }
     }
   }
@@ -740,33 +961,48 @@ static void watchdog_stop(Watchdog *wd) {
   wd->started = 0;
 }
 
+/**
+ * Drop this work item's in-flight slot. May free the connection if a close is
+ * pending; w->conn must not be dereferenced afterwards.
+ */
+static void work_release_conn(QueryWork *w) {
+  if (w->holds_conn) {
+    w->holds_conn = 0;
+    conn_release(w->conn);
+  }
+}
+
 static void query_execute(napi_env env, void *data) {
   (void)env;
   QueryWork *w = (QueryWork *)data;
 
-  if (!w->conn) {
+  // No slot means the connection was already closed when the query was
+  // submitted; w->conn may be freed, so it must not be touched.
+  if (!w->holds_conn) {
     snprintf(w->error, sizeof(w->error), "Connection is closed");
     w->success = 0;
     return;
   }
 
-  // Acquire an in-flight slot. If the connection is closed (or close is
-  // pending from a JS-side hard-timeout abort) we reject without touching
-  // dbproc — the close path in conn_release will free the struct.
-  if (conn_acquire(w->conn) != 0) {
+  // Closed while this work waited in the libuv queue — the slot kept the
+  // struct alive, but the caller has abandoned the connection, so do not
+  // send the SQL.
+  uv_mutex_lock(&w->conn->lock);
+  int closing = w->conn->pending_close;
+  uv_mutex_unlock(&w->conn->lock);
+  if (closing) {
     snprintf(w->error, sizeof(w->error), "Connection is closed");
     w->success = 0;
-    // Important: do NOT touch w->conn after this point, except via
-    // query_complete which checks pending_close before re-acquiring.
+    work_release_conn(w);
     return;
   }
 
   // Check if connection is dead.
-  if (w->conn->dead || DBDEAD(w->conn->dbproc)) {
+  if (conn_is_dead(w->conn) || DBDEAD(w->conn->dbproc)) {
     snprintf(w->error, sizeof(w->error), "Connection is dead");
-    w->conn->dead = 1;
+    conn_mark_dead(w->conn);
     w->success = 0;
-    conn_release(w->conn);
+    work_release_conn(w);
     return;
   }
 
@@ -814,6 +1050,13 @@ static void query_execute(napi_env env, void *data) {
       } else {
         snprintf(w->error, sizeof(w->error), "dbresults() failed");
       }
+      // A statement-level error (e.g. a duplicate key) fails only that
+      // statement: the server goes on with the rest of the batch, whose
+      // results are still pending. Left unread, they make the next query on
+      // this connection fail with "results pending" (DB-Lib 20019).
+      if (!DBDEAD(w->conn->dbproc)) {
+        dbcancel(w->conn->dbproc);
+      }
       free_columns(w->columns, w->num_columns, w->num_rows);
       w->columns = NULL;
       w->num_columns = 0;
@@ -830,14 +1073,18 @@ static void query_execute(napi_env env, void *data) {
       if (cnt > 0) {
         w->affected_rows += cnt;
       }
-      while (dbnextrow(w->conn->dbproc) != NO_MORE_ROWS) {}
+      if (discard_rows(w->conn->dbproc) == FAIL) {
+        goto rows_failed;
+      }
       continue;
     }
 
     // If we already found a result set, skip subsequent ones
     // (we return the FIRST result set with columns)
     if (found_resultset) {
-      while (dbnextrow(w->conn->dbproc) != NO_MORE_ROWS) {}
+      if (discard_rows(w->conn->dbproc) == FAIL) {
+        goto rows_failed;
+      }
       continue;
     }
     found_resultset = 1;
@@ -855,8 +1102,17 @@ static void query_execute(napi_env env, void *data) {
     for (int i = 0; i < w->num_columns; i++) {
       const char *colname = dbcolname(w->conn->dbproc, i + 1);
       w->columns[i].name = strdup(colname ? colname : "");
-      w->columns[i].type = dbcoltype(w->conn->dbproc, i + 1);
+      w->columns[i].type = column_type(w->conn->dbproc, i + 1);
       w->columns[i].values = NULL;
+      if (!w->columns[i].name) {
+        snprintf(w->error, sizeof(w->error), "Memory allocation failed for column names");
+        free_columns(w->columns, w->num_columns, 0);
+        w->columns = NULL;
+        w->num_columns = 0;
+        dbcancel(w->conn->dbproc);
+        w->success = 0;
+        goto done;
+      }
     }
 
     // Read rows
@@ -866,7 +1122,11 @@ static void query_execute(napi_env env, void *data) {
 
     for (int i = 0; i < w->num_columns; i++) {
       w->columns[i].values = (char **)calloc(capacity, sizeof(char *));
-      if (!w->columns[i].values) {
+      if (w->columns[i].values && is_binary_type(w->columns[i].type)) {
+        w->columns[i].lengths = (int *)calloc(capacity, sizeof(int));
+      }
+      if (!w->columns[i].values ||
+          (is_binary_type(w->columns[i].type) && !w->columns[i].lengths)) {
         snprintf(w->error, sizeof(w->error), "Memory allocation failed for rows");
         free_columns(w->columns, w->num_columns, w->num_rows);
         w->columns = NULL;
@@ -902,8 +1162,11 @@ static void query_execute(napi_env env, void *data) {
 
       // Safety: cap rows
       if (w->num_rows >= max_rows) {
+        w->truncated = 1;
         // Drain remaining rows without storing
-        while (dbnextrow(w->conn->dbproc) != NO_MORE_ROWS) {}
+        if (discard_rows(w->conn->dbproc) == FAIL) {
+          goto rows_failed;
+        }
         break;
       }
 
@@ -926,7 +1189,28 @@ static void query_execute(napi_env env, void *data) {
             goto done;
           }
           w->columns[i].values = new_vals;
+          if (w->columns[i].lengths) {
+            int *new_lens = (int *)realloc(w->columns[i].lengths, capacity * sizeof(int));
+            if (!new_lens) {
+              snprintf(w->error, sizeof(w->error), "Memory realloc failed at row %d", w->num_rows);
+              free_columns(w->columns, w->num_columns, w->num_rows);
+              w->columns = NULL;
+              w->num_columns = 0;
+              w->num_rows = 0;
+              dbcancel(w->conn->dbproc);
+              w->success = 0;
+              goto done;
+            }
+            w->columns[i].lengths = new_lens;
+          }
         }
+      }
+
+      // Clear this row's slots first: realloc'd storage is uninitialized, and a
+      // failure partway through the row frees it with `num_rows + 1`, which
+      // must only see the values actually stored so far.
+      for (int i = 0; i < w->num_columns; i++) {
+        w->columns[i].values[w->num_rows] = NULL;
       }
 
       // Read column values
@@ -936,6 +1220,26 @@ static void query_execute(napi_env env, void *data) {
 
         if (datalen == 0 && dbdata(w->conn->dbproc, col) == NULL) {
           w->columns[i].values[w->num_rows] = NULL;
+        } else if (w->columns[i].lengths) {
+          // Binary: keep the raw bytes. Converting to SYBCHAR would hand JS a
+          // hex string, which is neither what the schema declares nor what a
+          // write of the same value produces.
+          char *bytes = (char *)malloc(datalen > 0 ? (size_t)datalen : 1);
+          if (!bytes) {
+            snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
+            free_columns(w->columns, w->num_columns, w->num_rows + 1);
+            w->columns = NULL;
+            w->num_columns = 0;
+            w->num_rows = 0;
+            dbcancel(w->conn->dbproc);
+            w->success = 0;
+            goto done;
+          }
+          if (datalen > 0) {
+            memcpy(bytes, dbdata(w->conn->dbproc, col), (size_t)datalen);
+          }
+          w->columns[i].values[w->num_rows] = bytes;
+          w->columns[i].lengths[w->num_rows] = datalen;
         } else {
           int coltype = dbcoltype(w->conn->dbproc, col);
           BYTE *src = dbdata(w->conn->dbproc, col);
@@ -947,7 +1251,7 @@ static void query_execute(napi_env env, void *data) {
           char *buf = (buf_size <= 8192) ? stack_buf : (char *)malloc(buf_size);
           if (!buf) {
             snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
-            free_columns(w->columns, w->num_columns, w->num_rows);
+            free_columns(w->columns, w->num_columns, w->num_rows + 1);
             w->columns = NULL;
             w->num_columns = 0;
             w->num_rows = 0;
@@ -977,7 +1281,7 @@ static void query_execute(napi_env env, void *data) {
               if (buf != stack_buf) {
                 free(buf);
               }
-              free_columns(w->columns, w->num_columns, w->num_rows);
+              free_columns(w->columns, w->num_columns, w->num_rows + 1);
               w->columns = NULL;
               w->num_columns = 0;
               w->num_rows = 0;
@@ -1005,6 +1309,18 @@ static void query_execute(napi_env env, void *data) {
           if (buf != stack_buf) {
             free(buf);
           }
+
+          // A NULL here would be read back as SQL NULL — silently wrong data.
+          if (!w->columns[i].values[w->num_rows]) {
+            snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
+            free_columns(w->columns, w->num_columns, w->num_rows + 1);
+            w->columns = NULL;
+            w->num_columns = 0;
+            w->num_rows = 0;
+            dbcancel(w->conn->dbproc);
+            w->success = 0;
+            goto done;
+          }
         }
       }
       w->num_rows++;
@@ -1017,8 +1333,28 @@ static void query_execute(napi_env env, void *data) {
     }
   }
 
-  // Check if any error occurred during result processing
-  if (w->conn->has_error && !found_resultset && w->affected_rows == 0) {
+  // Rows were dropped without the caller asking for a cap: returning the rest
+  // as if it were the whole result would be silently wrong data.
+  if (w->truncated && !w->max_rows_explicit) {
+    snprintf(w->error, sizeof(w->error),
+             "Result exceeded %d rows; pass maxRows to accept a truncated result, "
+             "or narrow the query",
+             DEFAULT_MAX_ROWS);
+    free_columns(w->columns, w->num_columns, w->num_rows);
+    w->columns = NULL;
+    w->num_columns = 0;
+    w->num_rows = 0;
+    w->success = 0;
+    goto done;
+  }
+
+  // Any server error (severity > 10) or db-lib error fails the query, even if
+  // a result set or affected rows were seen first. Runtime errors such as a
+  // conversion failure or divide-by-zero arrive after the column metadata and
+  // abort the rest of the batch without making dbresults() return FAIL —
+  // reporting success there would hide a failed statement (and, for a
+  // paginated select, a skipped trailing `SET ROWCOUNT 0`).
+  if (w->conn->has_error) {
     snprintf(w->error, sizeof(w->error), "%s", w->conn->last_error);
     free_columns(w->columns, w->num_columns, w->num_rows);
     w->columns = NULL;
@@ -1029,6 +1365,21 @@ static void query_execute(napi_env env, void *data) {
   }
 
   w->success = 1;
+  goto done;
+
+rows_failed:
+  // The result stream broke while discarding rows (typically a dead
+  // connection). No dbcancel: there is nothing left to cancel on.
+  if (w->conn->has_error) {
+    snprintf(w->error, sizeof(w->error), "%s", w->conn->last_error);
+  } else {
+    snprintf(w->error, sizeof(w->error), "dbnextrow() failed");
+  }
+  free_columns(w->columns, w->num_columns, w->num_rows);
+  w->columns = NULL;
+  w->num_columns = 0;
+  w->num_rows = 0;
+  w->success = 0;
 
 done:
   // Stop the watchdog before returning. If it already fired (forced cancel),
@@ -1047,7 +1398,7 @@ done:
 
   // Snapshot connection flags before releasing — w->conn may be freed
   // inside conn_release if a close was pending.
-  w->conn_dead = w->conn->dead;
+  w->conn_dead = conn_is_dead(w->conn);
   w->conn_timed_out = w->conn->timed_out;
 
   // Release the in-flight slot. If a close was queued while we were running
@@ -1055,7 +1406,7 @@ done:
   // the SybaseConnection struct are actually freed. After this call we MUST
   // NOT touch w->conn — query_complete will run on the JS thread but only
   // reads w->error / w->wd.fired / w->success, never w->conn->dbproc.
-  conn_release(w->conn);
+  work_release_conn(w);
 }
 
 static void query_complete(napi_env env, napi_status status, void *data) {
@@ -1114,6 +1465,9 @@ static void query_complete(napi_env env, napi_status status, void *data) {
 
         if (w->columns[c].values[r] == NULL) {
           napi_get_null(env, &val);
+        } else if (w->columns[c].lengths) {
+          napi_create_buffer_copy(env, (size_t)w->columns[c].lengths[r],
+                                  w->columns[c].values[r], NULL, &val);
         } else {
           int coltype = w->columns[c].type;
           char *strval = w->columns[c].values[r];
@@ -1130,6 +1484,12 @@ static void query_complete(napi_env env, napi_status status, void *data) {
             // corrupting the result, which is the behaviour we want here.
             long long llval = atoll(strval);
             napi_create_bigint_int64(env, llval, &val);
+          } else if (coltype == TDS_USMALLINT || coltype == TDS_UINT) {
+            // Up to 4294967295: past int32, but exact in a double.
+            napi_create_double(env, (double)strtoul(strval, NULL, 10), &val);
+          } else if (coltype == TDS_UBIGINT) {
+            // Up to 18446744073709551615 — past even int64, so a uint64 BigInt.
+            napi_create_bigint_uint64(env, (uint64_t)strtoull(strval, NULL, 10), &val);
           } else if (coltype == SYBFLT8 || coltype == SYBREAL) {
             double dval = atof(strval);
             napi_create_double(env, dval, &val);
@@ -1171,6 +1531,8 @@ static void query_complete(napi_env env, napi_status status, void *data) {
   }
 
   // Cleanup — always runs regardless of success/failure
+  // A cancelled work item never ran query_execute, so its slot is still held.
+  work_release_conn(w);
   free_columns(w->columns, w->num_columns, w->num_rows);
   free(w->sql);
   napi_delete_async_work(env, w->work);
@@ -1187,16 +1549,31 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
   napi_value args[3];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
 
+  ConnHandle *handle = get_conn_handle(env, args[0]);
+  if (handle == NULL) {
+    return NULL;  // TypeError pending
+  }
+
+  size_t sql_len = 0;
+  if (argc < 2 || napi_get_value_string_utf8(env, args[1], NULL, 0, &sql_len) != napi_ok) {
+    napi_throw_type_error(env, NULL, "Expected the SQL as a string");
+    return NULL;
+  }
+
   QueryWork *w = (QueryWork *)calloc(1, sizeof(QueryWork));
-
-  // Get connection
-  napi_get_value_external(env, args[0], (void **)&w->conn);
-
-  // Get SQL string
-  size_t sql_len;
-  napi_get_value_string_utf8(env, args[1], NULL, 0, &sql_len);
-  w->sql = (char *)malloc(sql_len + 1);
+  char *sql = (char *)malloc(sql_len + 1);
+  if (w == NULL || sql == NULL) {
+    free(w);
+    free(sql);
+    napi_throw_error(env, NULL, "Out of memory");
+    return NULL;
+  }
+  w->sql = sql;
   napi_get_value_string_utf8(env, args[1], w->sql, sql_len + 1, &sql_len);
+
+  // A closed handle has no connection: the query is rejected as on a closed
+  // connection (holds_conn stays 0 below).
+  w->conn = handle->conn;
 
   // Defaults
   w->max_rows = DEFAULT_MAX_ROWS;
@@ -1219,7 +1596,12 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
       napi_get_named_property(env, args[2], "maxRows", &v);
       napi_typeof(env, v, &vtype);
       if (vtype == napi_number) {
-        napi_get_value_int32(env, v, &w->max_rows);
+        int32_t requested = 0;
+        napi_get_value_int32(env, v, &requested);
+        if (requested > 0) {
+          w->max_rows = requested;
+          w->max_rows_explicit = 1;
+        }
       }
 
       napi_get_named_property(env, args[2], "hardTimeoutMs", &v);
@@ -1233,10 +1615,32 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
   napi_value promise;
   napi_create_promise(env, &w->deferred, &promise);
 
+  // Pin the connection now, on the JS thread, rather than when a worker picks
+  // the job up: fn_close only defers the free while in_flight > 0, and the
+  // job may sit in the libuv queue behind other queries for a long time.
+  w->holds_conn = (w->conn != NULL && conn_acquire(w->conn) == 0);
+
   napi_value work_name;
   napi_create_string_utf8(env, "sybase_query", NAPI_AUTO_LENGTH, &work_name);
-  napi_create_async_work(env, NULL, work_name, query_execute, query_complete, w, &w->work);
-  napi_queue_async_work(env, w->work);
+  napi_status st = napi_create_async_work(env, NULL, work_name, query_execute, query_complete,
+                                          w, &w->work);
+  if (st == napi_ok) {
+    st = napi_queue_async_work(env, w->work);
+    if (st != napi_ok) {
+      napi_delete_async_work(env, w->work);
+    }
+  }
+  if (st != napi_ok) {
+    // query_complete will never run, so undo here what it would have:
+    // release the connection slot, settle the promise and free the work.
+    work_release_conn(w);
+    napi_value msg, err;
+    napi_create_string_utf8(env, "Failed to schedule query", NAPI_AUTO_LENGTH, &msg);
+    napi_create_error(env, NULL, msg, &err);
+    napi_reject_deferred(env, w->deferred, err);
+    free(w->sql);
+    free(w);
+  }
 
   return promise;
 }
@@ -1263,21 +1667,15 @@ static napi_value fn_close(napi_env env, napi_callback_info info) {
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
 
-  SybaseConnection *conn;
-  napi_get_value_external(env, args[0], (void **)&conn);
-
-  if (conn) {
-    uv_mutex_lock(&conn->lock);
-    int can_destroy_now = (conn->in_flight == 0);
-    int already_pending = conn->pending_close;
-    conn->pending_close = 1;
-    conn->dead = 1;  // reject any subsequent acquire
-    uv_mutex_unlock(&conn->lock);
-
-    if (can_destroy_now && !already_pending) {
-      destroy_connection(conn);
-    }
-    // else: worker (or someone holding in_flight) will free in conn_release.
+  ConnHandle *handle = get_conn_handle(env, args[0]);
+  if (handle == NULL) {
+    return NULL;  // TypeError pending
+  }
+  // Closing twice is a no-op: the second call finds no connection.
+  if (handle->conn) {
+    SybaseConnection *conn = handle->conn;
+    handle->conn = NULL;
+    close_connection(conn);
   }
 
   napi_value undefined;
@@ -1294,8 +1692,11 @@ static napi_value fn_is_alive(napi_env env, napi_callback_info info) {
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
 
-  SybaseConnection *conn;
-  napi_get_value_external(env, args[0], (void **)&conn);
+  ConnHandle *handle = get_conn_handle(env, args[0]);
+  if (handle == NULL) {
+    return NULL;  // TypeError pending
+  }
+  SybaseConnection *conn = handle->conn;
 
   int alive = 0;
   if (conn) {

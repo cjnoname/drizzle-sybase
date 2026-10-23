@@ -59,21 +59,46 @@
 // Table
 export { sybaseTable } from "./table.js";
 export { SybaseTable } from "./table.js";
+export type {
+  AnySybaseTable,
+  InferInsertModel,
+  InferSelectModel,
+  SybaseInsertValues,
+  SybaseTableColumns,
+  SybaseTableWithColumns,
+  SybaseUpdateValues
+} from "./table.js";
 
 // Column types
+export { SybaseColumn, SybaseColumnBuilder } from "./columns/index.js";
+export type {
+  SybaseColumnRead,
+  SybaseColumnTypeConfig,
+  SybaseColumnWrite
+} from "./columns/index.js";
 export {
   int,
   bigint,
   smallint,
   tinyint,
+  unsignedSmallint,
+  unsignedInt,
+  unsignedBigint,
   varchar,
   nvarchar,
   char,
   nchar,
+  univarchar,
+  unichar,
   text,
   ntext,
+  unitext,
   datetime,
   smalldatetime,
+  date,
+  time,
+  bigdatetime,
+  bigtime,
   numeric,
   decimal,
   float,
@@ -100,15 +125,16 @@ export {
 } from "./errors.js";
 
 // Connection + Pool
-export { SybaseConnection, SybasePool } from "./connection.js";
+export { SybaseConnection } from "./connection.js";
 export type {
   SybaseConnectionConfig,
-  SybasePoolConfig,
-  SybasePoolMetrics,
   SybaseLogger,
   SybaseQueryLog,
+  SybaseQueryOptions,
   QueryResult
 } from "./connection.js";
+export { SybasePool } from "./pool.js";
+export type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
 
 // Dialect
 export { SybaseDialect, escapeName, escapeString, serializeValue } from "./dialect.js";
@@ -126,7 +152,7 @@ export {
 } from "./datetime.js";
 
 // Session
-export { SybaseSession, SybaseTransactionSession } from "./session.js";
+export { SybaseConnectionSession, SybaseSession, SybaseTransactionSession } from "./session.js";
 export type {
   SybaseTransactionOptions,
   SybaseIsolationLevel,
@@ -144,11 +170,18 @@ export type {
   SybaseSelectConfig,
   SybaseSelectField,
   SybaseSelectJoin,
-  SybaseSelectWithCTE,
   SybaseInsertResult,
   SybaseUpdateResult,
   SybaseDeleteResult
 } from "./query-builders/index.js";
+export type {
+  InitialSelectState,
+  SybaseSelectError,
+  SybaseSelectFields,
+  SybaseSelectFieldValue,
+  SybaseSelectResult,
+  SybaseSelectState
+} from "./query-builders/select-types.js";
 
 // Re-export SQL type for convenience (type-only)
 export type { SQL } from "drizzle-orm";

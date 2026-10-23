@@ -35,7 +35,10 @@ export interface NativeBinding {
     username: string;
     password: string;
     timeout?: number;
-    /** TDS network packet size in bytes. Defaults to 4096 (FreeTDS default is 512). */
+    /**
+     * TDS network packet size in bytes. Defaults to 2048, ASE's out-of-the-box
+     * `max network packet size`; more than the server allows fails the login.
+     */
     packetSize?: number;
   }): Promise<unknown>;
   query(

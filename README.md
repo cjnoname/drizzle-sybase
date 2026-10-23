@@ -39,7 +39,7 @@ const db = createSybaseDrizzle({
   max: 10 // max pool connections
 });
 
-// SELECT
+// SELECT — rows are keyed by property name ({ id, name, email, createdAt })
 const rows = await db.select().from(users).where(eq(users.name, "Alice"));
 
 // INSERT (returns @@identity for identity columns)
@@ -63,6 +63,48 @@ const result = await db.execute(sql`EXEC sp_helpdb`);
 // Cleanup
 await db.close();
 ```
+
+## Type Inference
+
+Row and insert types are inferred from the table definition, matching exactly
+what the driver returns at runtime:
+
+```ts
+type User = typeof users.$inferSelect; // or InferSelectModel<typeof users>
+// { id: number; name: string; email: string | null; createdAt: Date | null }
+
+type NewUser = typeof users.$inferInsert; // or InferInsertModel<typeof users>
+// { name: string; email?: string | null; createdAt?: Date | null }
+```
+
+- **Nullability**: a column is `T | null` unless it is `.notNull()` (or a primary key).
+- **Insert**: a column is required only if it is not null and nothing else fills it. Optional are columns with `.default(value)` or `.hasDatabaseDefault()` — both declare a database `DEFAULT`, as `.default()` does in drizzle: the driver omits the column and the server fills it, `value` itself is never sent — and columns with `.$defaultFn()` / `.$onUpdateFn()`, which the driver computes. Identity columns are not accepted at all; the server assigns them.
+- **Select results** follow the query. `db.select()` returns the table row; `db.select({ ... })` returns one key per field — a `sql<number>` expression is a `number`, a raw string expression `unknown`. A `leftJoin` makes the joined table's columns nullable, a `rightJoin` every earlier table's. A table given by name (`from("#tmp")`) is untyped.
+- **Clashing joins** do not compile: with no fields, every column lands in one flat row, so joining two tables that share a property name is a type error naming the property. Pass the fields explicitly instead.
+- **Use the returned builder.** Builders change in place (as in drizzle), but only the value a method returns carries the updated type: chain the calls, or keep the result (`const joined = q.leftJoin(...)`) — a bare `q.leftJoin(...)` leaves `q` typed as before.
+- **Narrowing**: `.$type<"active" | "disabled">()` narrows a column's value type.
+
+| SQL type                                                                           | Read as   | Accepted on write                                                                            |
+| ---------------------------------------------------------------------------------- | --------- | -------------------------------------------------------------------------------------------- |
+| `int`, `smallint`, `tinyint`, `unsigned smallint`, `unsigned int`, `float`, `real` | `number`  | `number`                                                                                     |
+| `bigint`, `unsigned bigint`                                                        | `bigint`  | `bigint` or a digit string                                                                   |
+| `numeric`/`decimal`, `money`, `smallmoney`                                         | `string`  | a digit string; also a `number` if precision ≤ 15, a `bigint` if a wider integer (see below) |
+| `bit`                                                                              | `boolean` | `boolean`                                                                                    |
+| `datetime`, `smalldatetime`                                                        | `Date`    | `Date`                                                                                       |
+| `date`, `time`, `bigdatetime`, `bigtime`                                           | `string`  | `string` (see [Date and Time Columns](#date-and-time-columns))                               |
+| `char`, `varchar`, `nchar`, `nvarchar`, `unichar`, `univarchar`, `text`            | `string`  | `string`                                                                                     |
+| `binary`, `varbinary`, `image`                                                     | `Buffer`  | `Buffer`                                                                                     |
+| `unitext`                                                                          | `Buffer`  | `Buffer` — UTF-16LE: `Buffer.from(s, "utf16le")` / `buf.toString("utf16le")`                 |
+
+`unitext` is bytes because db-lib receives it as an image: there is no way to tell
+it apart in a result, and a string literal written to it goes through the server
+charset and loses what that cannot represent. UTF-16LE bytes round-trip exactly.
+`ntext()` is deprecated — ASE has no such type.
+
+Every insert/update value may also be a SQL expression, e.g. `` sql`getdate()` ``.
+
+Comparison operators come from `drizzle-orm` and do not check the compared
+value against the column type: `eq(users.id, "x")` compiles.
 
 ## Why not `child_process` + `tsql`?
 
@@ -134,9 +176,17 @@ This will:
 
 ## Sybase SQL Dialect Notes
 
-- **No LIMIT/OFFSET**: Uses `SET ROWCOUNT` for pagination
+- **No LIMIT/OFFSET**: `limit()` is `SELECT TOP n` (offsets fetch `offset + limit` rows and skip the first `offset`); `limit()`/`offset()` take non-negative integers only. TOP, unlike `SET ROWCOUNT`, leaves nothing set on the connection
 - **No RETURNING**: Uses `SELECT @@identity` after INSERT
-- **No multi-row VALUES**: Each row is a separate INSERT statement
+- **No multi-row VALUES**: Each row is a separate INSERT statement; a multi-row insert runs all-or-nothing (in its own transaction, or under a savepoint inside `db.transaction`), so its locks are held until the last row is written
+- **No CTEs (`WITH`) and no `FULL OUTER JOIN`**: ASE supports neither; use derived tables / `UNION` of left and right joins
+- **Server-aborted transactions**: ASE rolls a transaction back on its own after some errors (conversion, divide-by-zero, deadlock). Once that happens the `tx` handle refuses further statements and `db.transaction` rejects instead of committing
+- **Raw multi-statement batches are not atomic**: after a statement-level error (e.g. a duplicate key) ASE carries on with the rest of the batch, so earlier and later statements may already be applied when the error is reported. Run such batches inside `db.transaction()` if they must be all-or-nothing
+- **Session state does not leak between pool users**: a connection always returns to the pool with no open transaction, `ROWCOUNT 0`, chained mode off, its original isolation level and the configured database. A raw statement outside `db.transaction()` that leaves a transaction open is rolled back and reported as an error — use `db.transaction()` instead. A connection that ran `setuser` is discarded rather than reused, since its original identity cannot be restored reliably. Other `SET` options (`dateformat`, `textsize`, ...) are not reset
+- **Inside `db.transaction()`, the callback must not end the transaction itself**: a batch containing `COMMIT` or a `ROLLBACK` without a savepoint name is refused before it is sent — once it ran, the rest of its batch would run in autocommit. A procedure that commits or rolls back cannot be seen in the SQL: the driver detects it after the call and refuses every later statement (what the procedure committed stays committed). Savepoints (`save tran x` / `rollback tran x`) are fine
+- **Results are capped at 1,000,000 rows**: a larger result fails rather than being silently cut short. Pass `maxRows` to accept a truncated result
+- **Packet size**: `packetSize` defaults to 2048, ASE's out-of-the-box `max network packet size`. A server whose limit was raised (e.g. to 4096) can take a larger value for fewer round-trips on big results; one whose limit was lowered (it can go down to 512) needs a smaller one. A request above the server's limit is refused with the same "Login failed" (Msg 4002) as a wrong password — the error message points this out
+- **Temporary tables do not outlive their query or transaction**: a `#temp` table created by a pool query is dropped when that query finishes (the next one may run on another connection), and one created inside `db.transaction()` is dropped when the transaction ends. To use one across several statements, run them in `db.withConnection(async conn => ...)`: one connection, no transaction, and its `#temp` tables are dropped when the callback returns. (Inside `db.transaction()` ASE only allows creating them when `ddl in tran` is enabled.)
 - **Identifiers**: Quoted with `[brackets]`
 - **Date format**: `'YYYY-MM-DD HH:MM:SS.mmm'` (no T separator)
 
@@ -203,7 +253,7 @@ await db.update(winf).set({ totPrRoyalty: total.toFixed(4) }).where(...);
 
 `$mapToDriver` can do that last step per column. There is no `$mapFromDriver`:
 results are decoded from the type metadata the addon reports, and at that point
-the query's schema is no longer available — `db.select()` may return `*`, joined
+the query's schema is no longer available — `db.select().from("NAME")` returns `*`, joined
 columns can share a name, and an aggregate belongs to no column. Converting on
 read is a line at the use site instead.
 
@@ -242,6 +292,13 @@ query. Leaving `timeZone` unset makes reads and writes exact inverses in UTC,
 which is correct as long as nothing else interprets the stored values; set it when
 the stored wall clocks are meant to be a particular zone's local time.
 
+**Set it to the zone the server's clock is in.** Values written by the server
+itself (`getdate()`, column defaults, other applications) are in that zone, and
+reading them as another would shift every one by the difference. When a
+connection opens, the driver compares the server's offset (`getdate()` against
+`getutcdate()`) with `timeZone`'s and, if they differ, emits a process warning
+with code `DRIZZLE_SYBASE_TIMEZONE`, once per server, database and zone.
+
 A stored wall clock cannot always be mapped to one instant, because the column
 holds no offset. Both cases follow `Temporal`'s `compatible` disambiguation,
 which is also what `new Date("YYYY-MM-DDTHH:mm")` does with the process zone:
@@ -272,6 +329,14 @@ several common locales drops the seconds and milliseconds entirely — under
 
 Reverse-engineer Sybase ASE tables into drizzle-sybase definitions, Zod
 schemas, and TypeScript types — the Sybase equivalent of `drizzle-kit pull`.
+
+The generated file imports `zod`, which this package does not depend on:
+install it in the project that uses the generated code (`npm i zod`; the output
+is checked against Zod 4). The `<Table>Row` / `New<Table>` types it exports are
+identical to `typeof table.$inferSelect` / `$inferInsert`.
+
+`nchar`/`nvarchar` lengths are read in characters using the server's own
+`@@ncharsize`, so they are right on single-byte server charsets too.
 
 ### CLI
 

@@ -27,12 +27,11 @@
  * ```
  */
 import type { SQL } from "drizzle-orm";
-import { getTableName } from "drizzle-orm";
 
-import type { SybasePoolConfig, SybasePoolMetrics } from "./connection.js";
-import { SybasePool } from "./connection.js";
-import { SybaseDialect, escapeName } from "./dialect.js";
+import { SybaseDialect } from "./dialect.js";
 import type { SybaseDialectConfig } from "./dialect.js";
+import type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
+import { SybasePool } from "./pool.js";
 import {
   SybaseSelectBuilder,
   SybaseInsertBuilder,
@@ -40,8 +39,14 @@ import {
   SybaseDeleteBuilder
 } from "./query-builders/index.js";
 import type { SybaseSelectField } from "./query-builders/index.js";
+import type { InitialSelectState, SybaseSelectFields } from "./query-builders/select-types.js";
 import { SybaseSession } from "./session.js";
-import type { SybaseTransactionOptions, SybaseTransactionSession } from "./session.js";
+import type {
+  SybaseConnectionSession,
+  SybaseTransactionOptions,
+  SybaseTransactionSession
+} from "./session.js";
+import type { AnySybaseTable } from "./table.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,14 +61,23 @@ export type SybaseDrizzleConfig = SybasePoolConfig & {
 };
 
 export interface SybaseDrizzle {
-  /** Start a SELECT query. */
-  select(fields?: Record<string, any>): SybaseSelectBuilder;
+  /**
+   * Start a SELECT query.
+   *
+   * With no fields, every column of the source tables is selected, keyed by
+   * property name, and the row type is inferred from the table definitions.
+   * With fields, each key holds that field's value.
+   */
+  select(): SybaseSelectBuilder<InitialSelectState<undefined>>;
+  select<TFields extends SybaseSelectFields>(
+    fields: TFields
+  ): SybaseSelectBuilder<InitialSelectState<TFields>>;
   /** Start an INSERT query. */
-  insert(table: any): SybaseInsertBuilder;
+  insert<TTable extends AnySybaseTable>(table: TTable): SybaseInsertBuilder<TTable>;
   /** Start an UPDATE query. */
-  update(table: any): SybaseUpdateBuilder;
+  update<TTable extends AnySybaseTable>(table: TTable): SybaseUpdateBuilder<TTable>;
   /** Start a DELETE query. */
-  delete(table: any): SybaseDeleteBuilder;
+  delete<TTable extends AnySybaseTable>(table: TTable): SybaseDeleteBuilder<TTable>;
   /** Execute raw SQL using Drizzle's `sql` template tag. */
   execute<T extends Record<string, unknown> = Record<string, unknown>>(
     query: SQL
@@ -90,6 +104,22 @@ export interface SybaseDrizzle {
     fn: (tx: SybaseDrizzleTx) => Promise<T>,
     options?: SybaseTransactionOptions
   ): Promise<T>;
+  /**
+   * Run statements on one connection, outside a transaction — for work that
+   * spans several statements on the same session, such as `#temp` tables
+   * (which a plain query drops when it finishes). Statements autocommit.
+   * Afterwards `#temp` tables are dropped and the session is reset; a
+   * transaction left open is rolled back and reported as an error.
+   *
+   * @example
+   * ```ts
+   * await db.withConnection(async conn => {
+   *   await conn.executeRaw("select id into #ids from orders where ...");
+   *   return conn.select().from(sybaseTable("#ids", { id: int("id") }));
+   * });
+   * ```
+   */
+  withConnection<T>(fn: (conn: SybaseDrizzleTx) => Promise<T>): Promise<T>;
   /** Close all connections and shut down the pool. */
   close(): Promise<void>;
   /**
@@ -122,10 +152,13 @@ export interface SybaseDrizzle {
  * Transaction handle — executes on a single held connection.
  */
 export interface SybaseDrizzleTx {
-  select(fields?: Record<string, any>): SybaseSelectBuilder;
-  insert(table: any): SybaseInsertBuilder;
-  update(table: any): SybaseUpdateBuilder;
-  delete(table: any): SybaseDeleteBuilder;
+  select(): SybaseSelectBuilder<InitialSelectState<undefined>>;
+  select<TFields extends SybaseSelectFields>(
+    fields: TFields
+  ): SybaseSelectBuilder<InitialSelectState<TFields>>;
+  insert<TTable extends AnySybaseTable>(table: TTable): SybaseInsertBuilder<TTable>;
+  update<TTable extends AnySybaseTable>(table: TTable): SybaseUpdateBuilder<TTable>;
+  delete<TTable extends AnySybaseTable>(table: TTable): SybaseDeleteBuilder<TTable>;
   execute<T extends Record<string, unknown> = Record<string, unknown>>(
     query: SQL
   ): Promise<{ rows: T[]; rowCount: number }>;
@@ -146,32 +179,20 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
   const pool = new SybasePool(config);
   const session = new SybaseSession(pool, config.timeZone);
 
-  const resolveFields = (fields?: Record<string, any>): SybaseSelectField[] => {
+  /** `undefined` (no fields) lets the builder select every column by property name. */
+  const resolveFields = (fields?: SybaseSelectFields): SybaseSelectField[] | undefined => {
     if (!fields) {
-      return [{ expression: "*" }];
+      return undefined;
     }
     return Object.entries(fields).map(([alias, field]) => {
-      if (field && field.name && field.table) {
-        const tableName = getTableName(field.table);
-        return {
-          expression: `${escapeName(tableName)}.${escapeName(field.name)}`,
-          alias
-        };
+      const expression = dialect.renderExpression(field, "field");
+      if (expression === undefined) {
+        throw new Error(
+          `Cannot resolve field "${alias}": unsupported value type. ` +
+            `Expected a column reference, SQL expression, or string.`
+        );
       }
-      if (field && typeof field.getSQL === "function") {
-        const sqlStr = dialect.sqlToQuery(field.getSQL());
-        return { expression: sqlStr, alias };
-      }
-      if (field && typeof field.toQuery === "function") {
-        return { expression: dialect.sqlToQuery(field), alias };
-      }
-      if (typeof field === "string") {
-        return { expression: field, alias };
-      }
-      throw new Error(
-        `Cannot resolve field "${alias}": unsupported value type. ` +
-          `Expected a column reference, SQL expression, or string.`
-      );
+      return { expression, alias };
     });
   };
 
@@ -182,20 +203,23 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
    * on, so they are built from one definition — keeping them as two literals made
    * it possible to change one and forget the other.
    */
-  const queryApi = (on: SybaseSession | SybaseTransactionSession): SybaseDrizzleTx => ({
-    select(fields?: Record<string, any>) {
-      return new SybaseSelectBuilder(dialect, on, resolveFields(fields));
-    },
+  const queryApi = (
+    on: SybaseSession | SybaseTransactionSession | SybaseConnectionSession
+  ): SybaseDrizzleTx => ({
+    // One implementation behind the two `select` overloads: the fields only
+    // shape the result type, which the overloads describe.
+    select: ((fields?: SybaseSelectFields) =>
+      new SybaseSelectBuilder(dialect, on, resolveFields(fields))) as SybaseDrizzleTx["select"],
 
-    insert(table: any) {
+    insert<TTable extends AnySybaseTable>(table: TTable) {
       return new SybaseInsertBuilder(table, dialect, on);
     },
 
-    update(table: any) {
+    update<TTable extends AnySybaseTable>(table: TTable) {
       return new SybaseUpdateBuilder(table, dialect, on);
     },
 
-    delete(table: any) {
+    delete<TTable extends AnySybaseTable>(table: TTable) {
       return new SybaseDeleteBuilder(table, dialect, on);
     },
 
@@ -220,6 +244,10 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
       options?: SybaseTransactionOptions
     ): Promise<T> {
       return session.transaction(txSession => fn(queryApi(txSession)), options);
+    },
+
+    async withConnection<T>(fn: (conn: SybaseDrizzleTx) => Promise<T>): Promise<T> {
+      return session.withConnection(connSession => fn(queryApi(connSession)));
     },
 
     async close() {

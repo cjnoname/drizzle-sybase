@@ -28,4 +28,11 @@ describe("native binding", () => {
     expect(version).toContain("FreeTDS");
     expect(version).toContain("db-lib");
   });
+
+  // Anything but a handle from connect() must be rejected, never dereferenced.
+  it.each([[{}], [42], [null], ["handle"]])("rejects %j as a connection handle", handle => {
+    expect(() => native.close(handle)).toThrow(TypeError);
+    expect(() => native.isAlive(handle)).toThrow(TypeError);
+    expect(() => native.query(handle, "select 1")).toThrow(TypeError);
+  });
 });

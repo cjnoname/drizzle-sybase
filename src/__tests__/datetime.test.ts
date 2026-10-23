@@ -16,6 +16,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   decodeDateTimeColumns,
+  describeTimeZoneMismatch,
   formatSybaseDateTime,
   parseSybaseDateTime,
   resolveTimeZone
@@ -415,5 +416,38 @@ describe("parseSybaseDateTime rejects impossible calendar dates", () => {
     expect(parseSybaseDateTime("2024-02-29 12:00:00.003", "UTC")?.toISOString()).toBe(
       "2024-02-29T12:00:00.003Z"
     );
+  });
+});
+
+describe("describeTimeZoneMismatch", () => {
+  const WINTER = new Date("2026-06-15T00:00:00Z");
+  const SUMMER = new Date("2026-12-15T00:00:00Z");
+
+  it.each([
+    [600, SYDNEY, WINTER],
+    [660, SYDNEY, SUMMER],
+    [0, "UTC", SUMMER],
+    [330, "Asia/Kolkata", SUMMER],
+    [-240, "America/New_York", WINTER]
+  ])("accepts a server at %i minutes in %s", (offset, zone, now) => {
+    expect(describeTimeZoneMismatch(offset, zone, now)).toBeUndefined();
+  });
+
+  // The ASE these tests run against keeps Sydney time; left at the UTC default
+  // every datetime is off by the full offset.
+  it("reports a Sydney server read as UTC, with the size of the error", () => {
+    const message = describeTimeZoneMismatch(660, "UTC", SUMMER);
+    expect(message).toContain("UTC+11:00");
+    expect(message).toContain("off by 11 hours");
+    expect(message).toContain("timeZone");
+  });
+
+  it("catches a zone whose DST is out of step with the server", () => {
+    // A server that does not observe DST, configured as Sydney, in summer.
+    expect(describeTimeZoneMismatch(600, SYDNEY, SUMMER)).toContain("off by 1 hours");
+  });
+
+  it("formats negative and half-hour offsets", () => {
+    expect(describeTimeZoneMismatch(-210, "UTC", SUMMER)).toContain("UTC-03:30");
   });
 });

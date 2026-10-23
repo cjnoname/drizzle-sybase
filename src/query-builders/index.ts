@@ -1,10 +1,5 @@
 export { SybaseSelectBuilder } from "./select.js";
-export type {
-  SybaseSelectConfig,
-  SybaseSelectField,
-  SybaseSelectJoin,
-  SybaseSelectWithCTE
-} from "./select.js";
+export type { SybaseSelectConfig, SybaseSelectField, SybaseSelectJoin } from "./select.js";
 
 export { SybaseInsertBuilder } from "./insert.js";
 export type { SybaseInsertResult } from "./insert.js";

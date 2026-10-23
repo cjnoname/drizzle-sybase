@@ -11,7 +11,12 @@ import { describe, it, expect } from "vitest";
 import { generateSchemaCode, toCamelCase } from "../codegen.js";
 import { assertSafeIdentifier, fetchColumns, fetchIndexes, fetchTables } from "../fetch.js";
 import { introspectWith, runCli } from "../index.js";
-import { decimalRepresentation, resolveMapping, SYBASE_TYPE_MAP } from "../type-map.js";
+import {
+  decimalRepresentation,
+  effectiveLength,
+  resolveMapping,
+  SYBASE_TYPE_MAP
+} from "../type-map.js";
 import type { ColumnMeta, IndexMeta, IntrospectDb, TableMeta } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -26,7 +31,8 @@ function createMockDb(responder: Responder) {
     executed,
     async executeRaw<T extends Record<string, unknown>>(rawSql: string) {
       executed.push(rawSql);
-      const rows = responder(rawSql) as T[];
+      // A single-byte server charset, like the ASE the integration tests use.
+      const rows = (rawSql.includes("@@ncharsize") ? [{ n: 1, u: 2 }] : responder(rawSql)) as T[];
       return { rows, rowCount: rows.length };
     }
   };
@@ -47,10 +53,20 @@ describe("type-map", () => {
     expect(SYBASE_TYPE_MAP.image.value).toBe("buffer");
   });
 
-  it("flags national char types for byte-length halving", () => {
-    expect(SYBASE_TYPE_MAP.nvarchar.nationalChar).toBe(true);
-    expect(SYBASE_TYPE_MAP.nchar.nationalChar).toBe(true);
-    expect(SYBASE_TYPE_MAP.varchar.nationalChar).toBeUndefined();
+  it("divides catalog byte lengths by the server's bytes per character", () => {
+    expect(SYBASE_TYPE_MAP.nvarchar.charSize).toBe("nchar");
+    expect(SYBASE_TYPE_MAP.nchar.charSize).toBe("nchar");
+    expect(SYBASE_TYPE_MAP.univarchar.charSize).toBe("unichar");
+    expect(SYBASE_TYPE_MAP.unichar.charSize).toBe("unichar");
+    expect(SYBASE_TYPE_MAP.varchar.charSize).toBeUndefined();
+    const nchar4 = col({ name: "C", typeName: "nchar", length: 4 });
+    // A single-byte server charset stores nchar(4) in 4 bytes (checked on ASE 15.7).
+    expect(effectiveLength(nchar4, SYBASE_TYPE_MAP.nchar, { nchar: 1, unichar: 2 })).toBe(4);
+    expect(effectiveLength(nchar4, SYBASE_TYPE_MAP.nchar, { nchar: 2, unichar: 2 })).toBe(2);
+  });
+
+  it("has no ntext: ASE has no such type", () => {
+    expect(Object.hasOwn(SYBASE_TYPE_MAP, "ntext")).toBe(false);
   });
 
   it("falls back to varchar for unknown types", () => {
@@ -336,6 +352,9 @@ function col(overrides: Partial<ColumnMeta> & Pick<ColumnMeta, "name" | "typeNam
   };
 }
 
+/** A double-byte national charset, so nchar lengths halve. */
+const CHAR_SIZES = { nchar: 2, unichar: 2 };
+
 function table(name: string, columns: ColumnMeta[], indexes: IndexMeta[] = []): TableMeta {
   return { name, owner: "dbo", columns, indexes };
 }
@@ -350,7 +369,7 @@ describe("generateSchemaCode", () => {
       ],
       [{ indexName: "pk_users", isPrimary: true, isUnique: true, columns: ["ID"] }]
     );
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('export const users = sybaseTable("USERS"');
     expect(code).toContain('id: int("ID").identity().notNull().primaryKey()');
     expect(code).toContain('name: varchar("NAME", { length: 50 })');
@@ -363,7 +382,7 @@ describe("generateSchemaCode", () => {
       [col({ name: "WORK_ID", typeName: "int" }), col({ name: "OFFER_ID", typeName: "int" })],
       [{ indexName: "pk_mdof", isPrimary: true, isUnique: true, columns: ["WORK_ID", "OFFER_ID"] }]
     );
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain("// Composite primary key: workId, offerId");
     // No inline .primaryKey() for composite keys
     expect(code).not.toContain(".primaryKey()");
@@ -373,14 +392,14 @@ describe("generateSchemaCode", () => {
 
   it("halves national char byte length", () => {
     const t = table("T", [col({ name: "C", typeName: "nvarchar", length: 100, isNullable: true })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('nvarchar("C", { length: 50 })');
     expect(code).toContain(".max(50)");
   });
 
   it("renders numeric precision/scale", () => {
     const t = table("T", [col({ name: "AMT", typeName: "numeric", precision: 10, scale: 2 })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('numeric("AMT", { precision: 10, scale: 2 })');
   });
 
@@ -404,7 +423,7 @@ describe("generateSchemaCode", () => {
       col({ name: "SMALL_AMOUNT", typeName: "smallmoney" }),
       col({ name: "WHEN", typeName: "datetime" })
     ]);
-    const select = schemaBlock(generateSchemaCode([t], "mydb").code, "Schema");
+    const select = schemaBlock(generateSchemaCode([t], "mydb", CHAR_SIZES).code, "Schema");
 
     expect(select).toContain("big: z.bigint()");
     expect(select).toContain("smallInt: z.string()");
@@ -431,7 +450,7 @@ describe("generateSchemaCode", () => {
       col({ name: "AMOUNT", typeName: "money" }),
       col({ name: "SMALL_AMOUNT", typeName: "smallmoney" })
     ]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     const insert = schemaBlock(code, "InsertSchema");
 
     expect(insert).toContain("smallInt: z.union([z.number().int(), integerLiteral])");
@@ -456,7 +475,7 @@ describe("generateSchemaCode", () => {
 
   it("omits the numeric literal helpers when no column needs them", () => {
     const t = table("T", [col({ name: "NAME", typeName: "varchar", length: 10 })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).not.toContain("integerLiteral");
     expect(code).not.toContain("decimalLiteral");
   });
@@ -468,7 +487,7 @@ describe("generateSchemaCode", () => {
       col({ name: "N", typeName: "numeric", length: 5, precision: 9, scale: 0 }),
       col({ name: "M", typeName: "money", length: 8 })
     ]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).not.toContain(".max(");
   });
 
@@ -478,7 +497,7 @@ describe("generateSchemaCode", () => {
       col({ name: "NOTE", typeName: "varchar", length: 10, isNullable: true }),
       col({ name: "NAME", typeName: "varchar", length: 10 })
     ]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     const insertBlock = code.slice(code.indexOf("InsertSchema"));
     expect(insertBlock).not.toContain("id:");
     expect(insertBlock).toContain("note: z.string().max(10).nullable().optional()");
@@ -486,36 +505,48 @@ describe("generateSchemaCode", () => {
   });
 
   it("warns and falls back to varchar for unmapped types", () => {
-    const t = table("T", [col({ name: "WHEN", typeName: "date", length: 16, isNullable: true })]);
-    const { code, warnings } = generateSchemaCode([t], "mydb");
-    expect(code).toContain('varchar("WHEN", { length: 16 })');
+    const t = table("T", [
+      col({ name: "LOC", typeName: "text_locator", length: 16, isNullable: true })
+    ]);
+    const { code, warnings } = generateSchemaCode([t], "mydb", CHAR_SIZES);
+    expect(code).toContain('varchar("LOC", { length: 16 })');
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain('unmapped Sybase type "date"');
+    expect(warnings[0]).toContain('unmapped Sybase type "text_locator"');
   });
+
+  // The catalog length of these is storage bytes, not characters.
+  it.each(["date", "time", "bigdatetime", "bigtime", "text", "unitext"])(
+    "puts no length limit on %s",
+    typeName => {
+      const t = table("T", [col({ name: "C", typeName, length: 16 })]);
+      const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
+      expect(code).not.toContain(".max(");
+    }
+  );
 
   it("only imports the column factories that are used", () => {
     const t = table("T", [col({ name: "FLAG", typeName: "bit" })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain("import { sybaseTable, bit }");
     expect(code).not.toContain("varchar");
   });
 
   it("omits precision/scale when the catalog reports null", () => {
     const t = table("T", [col({ name: "N", typeName: "numeric", precision: null, scale: null })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('numeric("N")');
     expect(code).not.toContain("precision: null");
   });
 
   it("emits precision-only when scale is null", () => {
     const t = table("T", [col({ name: "N", typeName: "numeric", precision: 8, scale: null })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('numeric("N", { precision: 8 })');
   });
 
   it("clamps a zero/negative catalog length to a valid width", () => {
     const t = table("T", [col({ name: "C", typeName: "varchar", length: 0 })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('varchar("C", { length: 1 })');
     // .max() is skipped entirely for a zero-length column
     expect(code).not.toContain(".max(");
@@ -523,7 +554,7 @@ describe("generateSchemaCode", () => {
 
   it("produces valid identifiers for digit-leading table names", () => {
     const t = table("2024_DATA", [col({ name: "ID", typeName: "int" })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     // Variable / type names must be valid TS identifiers (digit-prefixed -> $).
     expect(code).toContain('export const $2024Data = sybaseTable("2024_DATA"');
     expect(code).toContain("export type $2024DataRow");
@@ -533,7 +564,7 @@ describe("generateSchemaCode", () => {
 
   it("escapes a reserved word used as a table name", () => {
     const t = table("class", [col({ name: "ID", typeName: "int" })]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('export const $class = sybaseTable("class"');
     expect(code).not.toMatch(/export const class\b/);
   });
@@ -543,16 +574,97 @@ describe("generateSchemaCode", () => {
       col({ name: "1ST", typeName: "int" }),
       col({ name: "with space", typeName: "varchar", length: 5, isNullable: true })
     ]);
-    const { code } = generateSchemaCode([t], "mydb");
+    const { code } = generateSchemaCode([t], "mydb", CHAR_SIZES);
     expect(code).toContain('"1st": int("1ST")');
     expect(code).toContain('"with space": varchar("with space", { length: 5 })');
   });
 
   it("does not emit a dangling comma when no extra column factories are needed", () => {
-    const { code } = generateSchemaCode([], "mydb");
+    const { code } = generateSchemaCode([], "mydb", CHAR_SIZES);
     expect(code).toContain('import { sybaseTable } from "drizzle-sybase";');
     expect(code).not.toContain("sybaseTable,  }");
     expect(code).not.toContain("sybaseTable, }");
+  });
+});
+
+describe("generateSchemaCode identifier collisions", () => {
+  const declared = (code: string) =>
+    code
+      .split("\n")
+      .map(l => /^export (?:const|type) (\w+)/.exec(l)?.[1])
+      .filter((n): n is string => !!n);
+
+  // `orders_schema` camel-cases to `ordersSchema`, which is also the select
+  // schema generated for `orders` — two `export const ordersSchema`.
+  it("never declares the same identifier twice", () => {
+    const tables = [
+      table("orders", [col({ name: "ID", typeName: "int" })]),
+      table("orders_schema", [col({ name: "ID", typeName: "int" })])
+    ];
+    const { code, warnings } = generateSchemaCode(tables, "mydb", CHAR_SIZES);
+    const names = declared(code);
+    expect(new Set(names).size).toBe(names.length);
+    expect(code).toContain('sybaseTable("orders_schema"');
+    expect(warnings.some(w => w.includes("orders_schema"))).toBe(true);
+  });
+
+  it("gives colliding column property names distinct keys in the table and both schemas", () => {
+    const t = table("T", [
+      col({ name: "A_B", typeName: "int" }),
+      col({ name: "a_b", typeName: "int" })
+    ]);
+    const { code, warnings } = generateSchemaCode([t], "mydb", CHAR_SIZES);
+    const tableBlock = code.slice(code.indexOf("sybaseTable("), code.indexOf("});"));
+    expect(tableBlock).toContain('aB: int("A_B")');
+    expect(tableBlock).toContain('aB_2: int("a_b")');
+    expect(code.match(/aB_2: z\./g)).toHaveLength(2);
+    expect(warnings.some(w => w.includes("a_b"))).toBe(true);
+  });
+
+  it("does not shadow an imported name", () => {
+    const { code } = generateSchemaCode(
+      [table("z", [col({ name: "ID", typeName: "int" })])],
+      "mydb",
+      CHAR_SIZES
+    );
+    expect(declared(code)).not.toContain("z");
+  });
+});
+
+describe("owner-qualified introspection", () => {
+  it("reads columns and indexes of the owner's table, not a same-named one", async () => {
+    const db = createMockDb(() => []);
+    await fetchColumns(db, "mydb", "T", "alice");
+    await fetchIndexes(db, "mydb", "T", "alice");
+    expect(db.executed.every(sql => !sql.includes("mydb..T"))).toBe(true);
+    expect(db.executed.some(sql => sql.includes("OBJECT_ID('mydb.alice.T')"))).toBe(true);
+  });
+
+  it("passes each table's owner through introspectWith and emits it when not dbo", async () => {
+    const db = createMockDb(sql => {
+      if (sql.includes("sysobjects")) {
+        return [{ name: "T", owner: "alice" }];
+      }
+      if (sql.includes("syscolumns") && sql.includes("systypes")) {
+        return [
+          { name: "ID", colid: 1, type_name: "int", length: 4, prec: null, scale: null, status: 0 }
+        ];
+      }
+      return [];
+    });
+    const { code } = await introspectWith(db, { database: "mydb", owner: "alice" });
+    expect(db.executed.some(sql => sql.includes("OBJECT_ID('mydb.alice.T')"))).toBe(true);
+    expect(code).toContain('sybaseTable("T", {');
+    expect(code).toContain('}, { owner: "alice" });');
+  });
+
+  it("leaves dbo tables unqualified", () => {
+    const { code } = generateSchemaCode(
+      [table("T", [col({ name: "ID", typeName: "int" })])],
+      "mydb",
+      CHAR_SIZES
+    );
+    expect(code).not.toContain("owner:");
   });
 });
 
@@ -592,6 +704,45 @@ describe("introspectWith", () => {
     expect(code).toContain('id: int("ID").identity().notNull().primaryKey()');
     expect(warnings).toEqual([]);
   });
+
+  // nchar(4) is 4 bytes on a single-byte server charset; halving it would make
+  // the generated schema reject values the column holds.
+  it("converts char byte lengths with the server's own char sizes", async () => {
+    const db = createMockDb(sql => {
+      if (sql.includes("sysobjects")) {
+        return [{ name: "T", owner: "dbo" }];
+      }
+      if (sql.includes("syscolumns") && sql.includes("systypes")) {
+        return [
+          {
+            name: "N",
+            colid: 1,
+            type_name: "nchar",
+            length: 4,
+            prec: null,
+            scale: null,
+            status: 0
+          },
+          {
+            name: "U",
+            colid: 2,
+            type_name: "univarchar",
+            length: 20,
+            prec: null,
+            scale: null,
+            status: 0
+          }
+        ];
+      }
+      return [];
+    });
+
+    const { code } = await introspectWith(db, { database: "mydb", tables: ["T"] });
+    expect(code).toContain('nchar("N", { length: 4 })');
+    expect(code).toContain("z.string().max(4)");
+    expect(code).toContain('univarchar("U", { length: 10 })');
+    expect(code).toContain("z.string().max(10)");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -606,11 +757,20 @@ describe("runCli", () => {
       errors.push(String(msg));
     };
     const original = console.error;
+    // runCli falls back to SYBASE_* env vars; with them set (as for the
+    // integration suite) nothing would be missing and it would connect.
+    const savedEnv = { ...process.env };
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("SYBASE_")) {
+        delete process.env[key];
+      }
+    }
     console.error = spy as typeof console.error;
     try {
       await runCli([]);
     } finally {
       console.error = original;
+      process.env = savedEnv;
     }
     expect(process.exitCode).toBe(1);
     expect(errors.join("\n")).toContain("Usage:");
@@ -641,7 +801,7 @@ describe("import collection", () => {
     const tables = [...Object.keys(SYBASE_TYPE_MAP)].map((typeName, i) =>
       table(`T${i}`, [col({ name: "C", typeName, length: 10, precision: 9, scale: 2 })])
     );
-    const { code } = generateSchemaCode(tables, "mydb");
+    const { code } = generateSchemaCode(tables, "mydb", CHAR_SIZES);
     const imported = /^import \{ sybaseTable, (.+) \} from "drizzle-sybase";$/m
       .exec(code)![1]!
       .split(", ");

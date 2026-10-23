@@ -11,6 +11,18 @@ describe("escapeName", () => {
   it("escapes brackets in names", () => {
     expect(escapeName("table]name")).toBe("[table]]name]");
   });
+
+  // ASE rejects a quoted identifier starting with '#' (Msg 11717).
+  it("leaves temporary table names unquoted", () => {
+    expect(escapeName("#t")).toBe("#t");
+    expect(escapeName("#tmp_2$x")).toBe("#tmp_2$x");
+  });
+
+  it("rejects a temporary table name that cannot be written unquoted", () => {
+    expect(() => escapeName("#bad name")).toThrow(/Invalid temporary table name/);
+    expect(() => escapeName("#")).toThrow(/Invalid temporary table name/);
+    expect(() => escapeName("#x]; drop table t")).toThrow(/Invalid temporary table name/);
+  });
 });
 
 describe("escapeString", () => {

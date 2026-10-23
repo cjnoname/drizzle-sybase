@@ -24,12 +24,13 @@ import { writeFileSync } from "node:fs";
 
 import { createSybaseDrizzle } from "../db.js";
 import { generateSchemaCode, type GeneratedCode } from "./codegen.js";
-import { fetchColumns, fetchIndexes, fetchTables } from "./fetch.js";
+import { fetchCharSizes, fetchColumns, fetchIndexes, fetchTables } from "./fetch.js";
 import type { IntrospectConfig, IntrospectDb, TableMeta } from "./types.js";
 
 export type { IntrospectConfig, IntrospectDb, ColumnMeta, IndexMeta, TableMeta } from "./types.js";
 export type { GeneratedCode } from "./codegen.js";
 export { SYBASE_TYPE_MAP } from "./type-map.js";
+export type { CharSizes } from "./type-map.js";
 
 /**
  * Introspect a Sybase database using an already-connected db handle.
@@ -43,17 +44,18 @@ export async function introspectWith(
   options: { database: string; tables?: string[]; owner?: string }
 ): Promise<GeneratedCode> {
   const tables = await fetchTables(db, options.database, options.tables, options.owner);
+  const charSizes = await fetchCharSizes(db);
 
   const tableMetas: TableMeta[] = [];
   for (const { name, owner } of tables) {
     const [columns, indexes] = await Promise.all([
-      fetchColumns(db, options.database, name),
-      fetchIndexes(db, options.database, name)
+      fetchColumns(db, options.database, name, owner),
+      fetchIndexes(db, options.database, name, owner)
     ]);
     tableMetas.push({ name, owner, columns, indexes });
   }
 
-  return generateSchemaCode(tableMetas, options.database);
+  return generateSchemaCode(tableMetas, options.database, charSizes);
 }
 
 /**
@@ -69,7 +71,9 @@ export async function introspectSybase(config: IntrospectConfig): Promise<Genera
     username: config.username,
     password: config.password,
     max: 2,
-    timeout: config.timeout ?? 30
+    timeout: config.timeout ?? 30,
+    // Reads only the catalog, never a datetime value.
+    warnOnTimeZoneMismatch: false
   });
 
   try {

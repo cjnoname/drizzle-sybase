@@ -7,5 +7,5 @@
   "trailingComma": "none",
   "arrowParens": "avoid",
   "sortImports": true,
-  "ignorePatterns": ["CHANGELOG.md"]
+  "ignorePatterns": ["CHANGELOG.md", "src/introspect/__tests__/fixtures/**"]
 }

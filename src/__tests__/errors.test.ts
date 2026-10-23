@@ -4,9 +4,9 @@
  */
 import { describe, it, expect, afterAll } from "vitest";
 
-import { SybasePool } from "../connection.js";
 import { SybaseError, SybaseConnectionError } from "../errors.js";
 import { native } from "../native/index.js";
+import { SybasePool } from "../pool.js";
 
 const config = {
   host: process.env.SYBASE_HOST ?? "",

@@ -12,7 +12,12 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "verbatimModuleSyntax": true,
-    "types": ["node"]
+    "types": ["node"],
+    // Lets the generated-schema fixture import the package by name, as user
+    // code does, while checking it against the source.
+    "paths": {
+      "drizzle-sybase": ["./src/index.ts"]
+    }
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "npm"]

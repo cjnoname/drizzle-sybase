@@ -4,7 +4,8 @@
  * Key Sybase differences:
  * - No RETURNING / OUTPUT clause
  * - Identity value retrieved via SELECT @@identity after INSERT
- * - Sybase ASE does NOT support multi-row VALUES — each row is a separate INSERT
+ * - Sybase ASE does NOT support multi-row VALUES — each row is a separate INSERT,
+ *   run all-or-nothing (in a transaction, or under a savepoint inside one)
  * - Omitted columns let DB defaults apply
  *
  * @example
@@ -20,13 +21,17 @@
  * ]);
  * ```
  */
-import { getTableName } from "drizzle-orm";
 
-import { escapeName, type SybaseDialect } from "../dialect.js";
+import { escapeName, escapeTableName, type SybaseDialect } from "../dialect.js";
+import type {
+  SybaseConnectionSession,
+  SybaseSession,
+  SybaseTransactionSession
+} from "../session.js";
+import type { AnySybaseTable, SybaseInsertValues } from "../table.js";
 
 /** @internal */
 const ColumnsSymbol = Symbol.for("drizzle:Columns");
-import type { SybaseSession, SybaseTransactionSession } from "../session.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,20 +61,20 @@ export interface SybaseInsertResult {
 // Builder
 // ---------------------------------------------------------------------------
 
-export class SybaseInsertBuilder {
+export class SybaseInsertBuilder<TTable extends AnySybaseTable = AnySybaseTable> {
   private table: any;
   private insertValues: Record<string, unknown>[] = [];
 
   constructor(
-    table: any,
+    table: TTable,
     private readonly dialect: SybaseDialect,
-    private readonly session: SybaseSession | SybaseTransactionSession
+    private readonly session: SybaseSession | SybaseTransactionSession | SybaseConnectionSession
   ) {
     this.table = table;
   }
 
-  values(values: Record<string, unknown> | Record<string, unknown>[]): this {
-    const arr = Array.isArray(values) ? values : [values];
+  values(values: SybaseInsertValues<TTable> | SybaseInsertValues<TTable>[]): this {
+    const arr: Record<string, unknown>[] = Array.isArray(values) ? values : [values];
     if (arr.length === 0) {
       throw new Error("Cannot insert empty array of values. Provide at least one row.");
     }
@@ -83,7 +88,11 @@ export class SybaseInsertBuilder {
 
   async execute(): Promise<SybaseInsertResult> {
     const fullSql = this.buildSql();
-    const result = await this.session.execute<Record<string, string>>(fullSql);
+    // One INSERT per row: atomic only if the batch runs as a unit.
+    const result =
+      this.insertValues.length > 1
+        ? await this.session.executeAtomic<Record<string, string>>(fullSql)
+        : await this.session.execute<Record<string, string>>(fullSql);
 
     const hasIdentity = this.hasIdentityColumn();
     let insertId: number | undefined;
@@ -143,7 +152,7 @@ export class SybaseInsertBuilder {
       ([_, col]: [string, any]) => !col.shouldDisableInsert()
     );
 
-    const tableName = escapeName(getTableName(this.table));
+    const tableName = escapeTableName(this.table);
 
     return this.insertValues.map(row => {
       const providedEntries = allColEntries.filter(([fieldName, col]: [string, any]) => {

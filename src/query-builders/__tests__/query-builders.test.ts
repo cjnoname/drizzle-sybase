@@ -1,4 +1,4 @@
-import { eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, sql, sql as sql_ } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 /**
  * Query builder unit tests.
@@ -7,11 +7,13 @@ import type { SQL } from "drizzle-orm";
 import { describe, it, expect } from "vitest";
 
 import { int, money, numeric, smallmoney, varchar } from "../../columns/index.js";
+import { createSybaseDrizzle } from "../../db.js";
 import { SybaseDialect, escapeName, escapeString, serializeValue } from "../../dialect.js";
 import type { SybaseSession, SybaseTransactionSession } from "../../session.js";
 import { sybaseTable } from "../../table.js";
 import { SybaseDeleteBuilder } from "../delete.js";
 import { SybaseInsertBuilder } from "../insert.js";
+import type { InitialSelectState } from "../select-types.js";
 import { SybaseSelectBuilder } from "../select.js";
 import { SybaseUpdateBuilder } from "../update.js";
 
@@ -20,6 +22,8 @@ import { SybaseUpdateBuilder } from "../update.js";
 // ---------------------------------------------------------------------------
 
 type MockableSession = SybaseSession | SybaseTransactionSession;
+
+const usersForUndefinedWhere = sybaseTable("U", { name: varchar("name", { length: 5 }) });
 
 function createMockSession(rows: Record<string, unknown>[] = []) {
   const executed: string[] = [];
@@ -35,6 +39,11 @@ function createMockSession(rows: Record<string, unknown>[] = []) {
     async executeRaw(rawSql: string, _options?: { maxRows?: number }) {
       executed.push(rawSql);
       return { rows: [], columns: [], rowCount: 0, affectedRows: 0 };
+    },
+    async executeAtomic<T extends Record<string, unknown> = Record<string, unknown>>(
+      rawSql: string
+    ) {
+      return mock.execute<T>(rawSql);
     }
   };
   return mock as unknown as MockableSession & { executed: string[] };
@@ -113,39 +122,62 @@ describe("SybaseSelectBuilder", () => {
     expect(sql).toBe("select distinct * from [users]");
   });
 
-  it("generates SELECT with LIMIT (SET ROWCOUNT)", () => {
+  // TOP, not SET ROWCOUNT: nothing is left in the session for the next pool user.
+  it("generates SELECT with LIMIT as TOP", () => {
     const session = createMockSession();
     const builder = new SybaseSelectBuilder(dialect, session);
     const sql = builder.from("users").limit(10).toSQL();
-    expect(sql).toBe("SET ROWCOUNT 10\nselect * from [users]\nSET ROWCOUNT 0");
+    expect(sql).toBe("select top 10 * from [users]");
+  });
+
+  // ASE accepts only DISTINCT before TOP.
+  it("puts DISTINCT before TOP", () => {
+    const builder = new SybaseSelectBuilder(dialect, createMockSession());
+    expect(builder.from("users").distinct().limit(5).toSQL()).toBe(
+      "select distinct top 5 * from [users]"
+    );
   });
 
   it("generates SELECT with LIMIT + OFFSET", () => {
     const session = createMockSession();
     const builder = new SybaseSelectBuilder(dialect, session);
     const sql = builder.from("users").limit(10).offset(20).toSQL();
-    expect(sql).toBe("SET ROWCOUNT 30\nselect * from [users]\nSET ROWCOUNT 0");
+    expect(sql).toBe("select top 30 * from [users]");
   });
 
-  it("ignores negative offset", () => {
-    const session = createMockSession();
-    const builder = new SybaseSelectBuilder(dialect, session);
-    const sql = builder.from("users").limit(5).offset(-1).toSQL();
-    expect(sql).toBe("SET ROWCOUNT 5\nselect * from [users]\nSET ROWCOUNT 0");
+  it.each([-1, 1.5, Number.NaN, Infinity, 2 ** 31, "1; drop table t" as unknown as number])(
+    "rejects invalid limit/offset %j",
+    value => {
+      const builder = new SybaseSelectBuilder(dialect, createMockSession()).from("users");
+      expect(() => builder.limit(value)).toThrow(RangeError);
+      expect(() => builder.offset(value)).toThrow(RangeError);
+    }
+  );
+
+  it("rejects offset + limit beyond the TOP range", () => {
+    const builder = new SybaseSelectBuilder(dialect, createMockSession())
+      .from("users")
+      .limit(2 ** 30)
+      .offset(2 ** 30);
+    expect(() => builder.toSQL()).toThrow(RangeError);
   });
 
-  it("limit(0) generates WHERE 1=0 to return no rows", () => {
+  it("limit(0) generates TOP 0 to return no rows", () => {
     const session = createMockSession();
     const builder = new SybaseSelectBuilder(dialect, session);
     const sql = builder.from("users").limit(0).toSQL();
-    expect(sql).toContain("where 1=0");
+    expect(sql).toBe("select top 0 * from [users]");
   });
 
-  it("ignores negative limit", () => {
-    const session = createMockSession();
-    const builder = new SybaseSelectBuilder(dialect, session);
-    const sql = builder.from("users").limit(-1).toSQL();
-    expect(sql).toBe("select * from [users]");
+  // `where 1=0` alone is not enough: an aggregate without GROUP BY returns one
+  // row over an empty input, so count(*) would come back as [{ n: 0 }].
+  it("limit(0) returns no rows without running the query, even for an aggregate", async () => {
+    const session = createMockSession([{ n: 0 }]);
+    const builder = new SybaseSelectBuilder(dialect, session, [
+      { expression: "count(*)", alias: "n" }
+    ]);
+    expect(await builder.from("users").limit(0)).toEqual([]);
+    expect(session.executed).toEqual([]);
   });
 
   it("execute() calls session and returns rows", async () => {
@@ -215,12 +247,10 @@ describe("SybaseSelectBuilder", () => {
     expect(result).toContain("right join [orders] on");
   });
 
-  it("generates SELECT with FULL JOIN", () => {
+  it("has no FULL JOIN (ASE does not support it)", () => {
     const session = createMockSession();
     const builder = new SybaseSelectBuilder(dialect, session);
-    const joinOn = sql`[users].[id] = [orders].[user_id]`;
-    const result = builder.from("users").fullJoin("orders", joinOn).toSQL();
-    expect(result).toContain("full join [orders] on");
+    expect("fullJoin" in builder).toBe(false);
   });
 
   it("generates SELECT with multiple JOINs", () => {
@@ -237,6 +267,25 @@ describe("SybaseSelectBuilder", () => {
     expect(result).toContain("left join [payments] on");
   });
 
+  // `and()` with no conditions returns undefined; drizzle treats that as "no WHERE".
+  it("treats an undefined condition as none, as drizzle does", () => {
+    const select = new SybaseSelectBuilder(dialect, createMockSession())
+      .from("users")
+      .where(and())
+      .having(undefined)
+      .toSQL();
+    expect(select).toBe("select * from [users]");
+    const update = new SybaseUpdateBuilder(usersForUndefinedWhere, dialect, createMockSession())
+      .set({ name: "a" })
+      .where(undefined)
+      .toSQL();
+    expect(update).toBe("update [U] set [name] = 'a'");
+    const del = new SybaseDeleteBuilder(usersForUndefinedWhere, dialect, createMockSession())
+      .where(and())
+      .toSQL();
+    expect(del).toBe("delete from [U]");
+  });
+
   it("generates SELECT with WHERE using sql template", () => {
     const session = createMockSession();
     const builder = new SybaseSelectBuilder(dialect, session);
@@ -248,19 +297,10 @@ describe("SybaseSelectBuilder", () => {
     expect(result).toContain("'Alice'");
   });
 
-  it("supports CTE (WITH clause)", () => {
+  it("has no CTE support (ASE has no WITH clause)", () => {
     const session = createMockSession();
-    const fields = [{ expression: "*" }];
-    const builder = new SybaseSelectBuilder(dialect, session, fields);
-    // Manually set config for CTE
-    const result = builder as any;
-    result.config = {
-      fields,
-      table: "[users]",
-      withList: [{ alias: "active_users", sql: "select * from [users] where active = 1" }]
-    };
-    const sqlStr = result.buildSql();
-    expect(sqlStr).toContain("with [active_users] as (select * from [users] where active = 1)");
+    const builder = new SybaseSelectBuilder(dialect, session);
+    expect("with" in builder).toBe(false);
   });
 
   it("supports from() with table object", () => {
@@ -271,7 +311,7 @@ describe("SybaseSelectBuilder", () => {
     });
     const builder = new SybaseSelectBuilder(dialect, session);
     const result = builder.from(table).toSQL();
-    expect(result).toBe("select * from [users]");
+    expect(result).toBe("select [users].[id] as [id], [users].[name] as [name] from [users]");
   });
 });
 
@@ -619,7 +659,7 @@ describe("exact numeric parameters", () => {
   });
 
   it("wraps money literals in JOIN ... ON and HAVING", () => {
-    const joined = new SybaseSelectBuilder(dialect, createMockSession())
+    const joined = new SybaseSelectBuilder(dialect, createMockSession(), [{ expression: "1" }])
       .from(winf)
       .innerJoin(winf, eq(winf.totPrRoyalty, "1.5000"))
       .toSQL();
@@ -734,4 +774,121 @@ describe("insertId precision", () => {
       expect(r.insertIdText).toBe(digits);
     }
   );
+});
+
+describe("aliased columns (col.as)", () => {
+  const db = createSybaseDrizzle({
+    host: "h",
+    port: 1,
+    database: "d",
+    username: "u",
+    password: "p"
+  });
+  const people = sybaseTable("P", {
+    id: int("ID").notNull(),
+    name: varchar("NAME", { length: 20 })
+  });
+
+  // drizzle's semantics: an aliased column renders as its alias.
+  it("orders by the alias", () => {
+    const sqlText = db
+      .select({ display: people.name })
+      .from(people)
+      .orderBy(people.name.as("display"))
+      .toSQL();
+    expect(sqlText).toBe("select [P].[NAME] as [display] from [P] order by [display]");
+  });
+
+  it("selects the original column when used as a field", () => {
+    const sqlText = db
+      .select({ who: people.name.as("ignored") })
+      .from(people)
+      .toSQL();
+    expect(sqlText).toBe("select [P].[NAME] as [who] from [P]");
+  });
+
+  it("renders as the alias inside sql templates", () => {
+    const sqlText = db
+      .select({ id: people.id })
+      .from(people)
+      .where(sql_`${people.name.as("n")} is not null`)
+      .toSQL();
+    expect(sqlText).toContain("where [n] is not null");
+  });
+
+  it("leaves the column itself untouched", () => {
+    people.name.as("other");
+    expect(people.name.name).toBe("NAME");
+    expect(people.name.isAlias).toBe(false);
+  });
+});
+
+describe("default select fields", () => {
+  const dialect = new SybaseDialect();
+  const users = sybaseTable("USERS", { userId: int("USER_ID"), name: varchar("NAME") });
+  const orders = sybaseTable("ORDERS", { orderId: int("ORDER_ID"), userId: int("USER_ID") });
+
+  // `select *` returns database column names ({ USER_ID }), while the table
+  // definition and the generated schemas use property names ({ userId }).
+  it("selects every column of a schema table under its property name", () => {
+    const sql = new SybaseSelectBuilder(dialect, createMockSession()).from(users).toSQL();
+    expect(sql).toBe("select [USERS].[USER_ID] as [userId], [USERS].[NAME] as [name] from [USERS]");
+  });
+
+  it("includes joined tables' columns", () => {
+    const products = sybaseTable("P", { sku: varchar("SKU") });
+    const sql = new SybaseSelectBuilder(dialect, createMockSession())
+      .from(users)
+      .innerJoin(products, sql_`1=1`)
+      .toSQL();
+    expect(sql).toContain("[P].[SKU] as [sku]");
+  });
+
+  // A flat row cannot hold two `userId`s; silently keeping one would lose data.
+  // Typed callers are stopped at compile time (see inference.test-d.ts); this
+  // runtime check is for everyone else.
+  it("refuses an implicit select whose joined properties collide", () => {
+    const builder = new SybaseSelectBuilder<InitialSelectState<undefined>>(
+      dialect,
+      createMockSession()
+    )
+      .from(users)
+      // @ts-expect-error -- the clash is a type error too
+      .innerJoin(orders, eq(users.userId, orders.userId));
+    expect(() => builder.toSQL()).toThrow(/userId.*select\(\{/s);
+  });
+
+  it("keeps select * for a table given by name", () => {
+    const sql = new SybaseSelectBuilder(dialect, createMockSession()).from("USERS").toSQL();
+    expect(sql).toBe("select * from [USERS]");
+  });
+
+  it("leaves explicit fields alone", () => {
+    const sql = new SybaseSelectBuilder(dialect, createMockSession(), [
+      { expression: "count(*)", alias: "n" }
+    ])
+      .from(users)
+      .toSQL();
+    expect(sql).toBe("select count(*) as [n] from [USERS]");
+  });
+});
+
+describe("owner-qualified tables", () => {
+  const dialect = new SybaseDialect();
+  const t = sybaseTable("T", { id: int("ID"), name: varchar("NAME") }, { owner: "alice" });
+
+  it("qualifies the table in select, insert, update and delete", () => {
+    const session = createMockSession();
+    expect(new SybaseSelectBuilder(dialect, session).from(t).where(eq(t.id, 1)).toSQL()).toBe(
+      "select [alice].[T].[ID] as [id], [alice].[T].[NAME] as [name] from [alice].[T] " +
+        "where [alice].[T].[ID] = 1"
+    );
+    expect(new SybaseInsertBuilder(t, dialect, session).values({ name: "x" }).toSQL()).toBe(
+      "insert into [alice].[T] ([NAME]) values ('x')"
+    );
+    expect(new SybaseUpdateBuilder(t, dialect, session).set({ name: "x" }).toSQL()).toBe(
+      "update [alice].[T] set [NAME] = 'x'"
+    );
+    expect(new SybaseDeleteBuilder(t, dialect, session).toSQL()).toBe("delete from [alice].[T]");
+  });
 });

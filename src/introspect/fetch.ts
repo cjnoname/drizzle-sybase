@@ -12,6 +12,7 @@
  */
 
 import { escapeString } from "../dialect.js";
+import type { CharSizes } from "./type-map.js";
 import type { ColumnMeta, IndexMeta, IntrospectDb } from "./types.js";
 
 const VALID_SQL_IDENTIFIER = /^[A-Za-z0-9_]+$/;
@@ -29,6 +30,20 @@ export function assertSafeIdentifier(
   if (!value || !VALID_SQL_IDENTIFIER.test(value) || value.length > 128) {
     throw new Error(`Unsafe ${label}: "${value}". Only [A-Za-z0-9_] allowed, max 128 chars.`);
   }
+}
+
+/**
+ * Catalog name for `OBJECT_ID()` / `index_col()`: `db.owner.table` when the
+ * owner is known, `db..table` otherwise. Without the owner, ASE resolves the
+ * name to the current user's table first and then dbo's, which can be a
+ * different, same-named table from the one `fetchTables` found.
+ */
+function objectName(database: string, tableName: string, owner?: string): string {
+  if (!owner) {
+    return `${database}..${tableName}`;
+  }
+  assertSafeIdentifier(owner, "owner");
+  return `${database}.${owner}.${tableName}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +67,23 @@ interface TableRow extends Record<string, unknown> {
 export interface FetchedTable {
   name: string;
   owner: string;
+}
+
+/**
+ * Bytes per character of the server's `nchar` and `unichar` types. Catalog
+ * lengths of those columns are in bytes, and `@@ncharsize` follows the server
+ * charset (1 on a single-byte one), so it cannot be assumed.
+ */
+export async function fetchCharSizes(db: IntrospectDb): Promise<CharSizes> {
+  const { rows } = await db.executeRaw<{ n: unknown; u: unknown }>(
+    "SELECT @@ncharsize AS n, @@unicharsize AS u"
+  );
+  const n = Number(rows[0]?.n);
+  const u = Number(rows[0]?.u);
+  if (!(Number.isInteger(n) && n > 0 && Number.isInteger(u) && u > 0)) {
+    throw new Error("Could not read @@ncharsize / @@unicharsize from the server");
+  }
+  return { nchar: n, unichar: u };
 }
 
 export async function fetchTables(
@@ -108,10 +140,12 @@ interface DefaultRow extends Record<string, unknown> {
 export async function fetchColumns(
   db: IntrospectDb,
   database: string,
-  tableName: string
+  tableName: string,
+  owner?: string
 ): Promise<ColumnMeta[]> {
   assertSafeIdentifier(database, "database");
   assertSafeIdentifier(tableName, "tableName");
+  const object = objectName(database, tableName, owner);
 
   // Resolve UDTs to base system types via the systypes hierarchy.
   // UDTs have usertype >= 100; resolve to the base type (usertype < 100) by
@@ -134,7 +168,7 @@ export async function fetchColumns(
        c.status
      FROM ${database}..syscolumns c
      JOIN ${database}..systypes t ON c.usertype = t.usertype
-     WHERE c.id = OBJECT_ID('${database}..${tableName}')
+     WHERE c.id = OBJECT_ID('${object}')
      ORDER BY c.colid`
   );
 
@@ -144,7 +178,7 @@ export async function fetchColumns(
        com.text AS default_text
      FROM ${database}..syscolumns c
      JOIN ${database}..syscomments com ON com.id = c.cdefault
-     WHERE c.id = OBJECT_ID('${database}..${tableName}')
+     WHERE c.id = OBJECT_ID('${object}')
        AND c.cdefault != 0`
   );
 
@@ -187,15 +221,17 @@ interface IndexRow extends Record<string, unknown> {
 export async function fetchIndexes(
   db: IntrospectDb,
   database: string,
-  tableName: string
+  tableName: string,
+  owner?: string
 ): Promise<IndexMeta[]> {
   assertSafeIdentifier(database, "database");
   assertSafeIdentifier(tableName, "tableName");
+  const object = objectName(database, tableName, owner);
 
   const result = await db.executeRaw<IndexRow>(
     `SELECT i.name AS index_name, i.indid, i.status, i.keycnt
      FROM ${database}..sysindexes i
-     WHERE i.id = OBJECT_ID('${database}..${tableName}')
+     WHERE i.id = OBJECT_ID('${object}')
        AND i.indid > 0
        AND i.indid < 255
        AND i.name NOT LIKE 't%'`
@@ -204,7 +240,7 @@ export async function fetchIndexes(
   const indexes: IndexMeta[] = [];
 
   for (const row of result.rows) {
-    const columns = await fetchIndexColumns(db, database, tableName, row.indid, row.keycnt);
+    const columns = await fetchIndexColumns(db, object, row.indid, row.keycnt);
     if (columns.length > 0) {
       indexes.push({
         indexName: row.index_name,
@@ -233,8 +269,7 @@ interface IndexColRow extends Record<string, unknown> {
  */
 async function fetchIndexColumns(
   db: IntrospectDb,
-  database: string,
-  tableName: string,
+  object: string,
   indid: number,
   keycnt: number
 ): Promise<string[]> {
@@ -242,7 +277,7 @@ async function fetchIndexColumns(
     return [];
   }
 
-  const objectRef = escapeString(`${database}..${tableName}`);
+  const objectRef = escapeString(object);
   const selects: string[] = [];
   for (let keyno = 1; keyno <= keycnt; keyno++) {
     selects.push(

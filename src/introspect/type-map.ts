@@ -50,16 +50,26 @@ export interface DecimalWidth {
   scale: number;
 }
 
+/** Bytes per character of the server's national and Unicode char types. */
+export interface CharSizes {
+  /** `@@ncharsize`. */
+  nchar: number;
+  /** `@@unicharsize`. */
+  unichar: number;
+}
+
 export interface TypeMapping {
   /** drizzle-sybase column factory name (also the import identifier). */
   factory: string;
   size: SizeKind;
   value: ValueKind;
   /**
-   * National (Unicode) char types store byte length in the catalog but the
-   * builder/zod expect character length, so the byte length is halved.
+   * The catalog stores the byte length of these char types, but the builder and
+   * Zod expect characters. How many bytes a character takes is a server
+   * setting: `@@ncharsize` for `nchar`/`nvarchar` (1 on a single-byte server
+   * charset), `@@unicharsize` for `unichar`/`univarchar`.
    */
-  nationalChar?: boolean;
+  charSize?: keyof CharSizes;
   /**
    * Width fixed by the type itself, for types whose precision/scale the catalog
    * does not report (`size: "none"`).
@@ -80,16 +90,33 @@ export const SYBASE_TYPE_MAP: Readonly<Record<string, TypeMapping>> = {
   bigint: { factory: "bigint", size: "none", value: "bigint", width: { precision: 19, scale: 0 } },
   smallint: { factory: "smallint", size: "none", value: "number" },
   tinyint: { factory: "tinyint", size: "none", value: "number" },
+  usmallint: { factory: "unsignedSmallint", size: "none", value: "number" },
+  uint: { factory: "unsignedInt", size: "none", value: "number" },
+  // Up to 18446744073709551615 — 20 digits, read as a BigInt like bigint.
+  ubigint: {
+    factory: "unsignedBigint",
+    size: "none",
+    value: "bigint",
+    width: { precision: 20, scale: 0 }
+  },
 
   varchar: { factory: "varchar", size: "length", value: "string" },
-  nvarchar: { factory: "nvarchar", size: "length", value: "string", nationalChar: true },
+  nvarchar: { factory: "nvarchar", size: "length", value: "string", charSize: "nchar" },
   char: { factory: "char", size: "length", value: "string" },
-  nchar: { factory: "nchar", size: "length", value: "string", nationalChar: true },
+  nchar: { factory: "nchar", size: "length", value: "string", charSize: "nchar" },
+  univarchar: { factory: "univarchar", size: "length", value: "string", charSize: "unichar" },
+  unichar: { factory: "unichar", size: "length", value: "string", charSize: "unichar" },
   text: { factory: "text", size: "none", value: "string" },
-  ntext: { factory: "ntext", size: "none", value: "string" },
+  // db-lib receives unitext as image: read and written as UTF-16LE bytes.
+  unitext: { factory: "unitext", size: "none", value: "buffer" },
 
   datetime: { factory: "datetime", size: "none", value: "date" },
   smalldatetime: { factory: "smalldatetime", size: "none", value: "date" },
+  // Not instants, or finer than a Date: returned as canonical text.
+  date: { factory: "date", size: "none", value: "string" },
+  time: { factory: "time", size: "none", value: "string" },
+  bigdatetime: { factory: "bigdatetime", size: "none", value: "string" },
+  bigtime: { factory: "bigtime", size: "none", value: "string" },
 
   numeric: { factory: "numeric", size: "precision", value: "decimal" },
   decimal: { factory: "numeric", size: "precision", value: "decimal" },
@@ -139,13 +166,19 @@ export function resolveMapping(typeName: string): {
 }
 
 /**
- * Effective character length for a column, halving the catalog byte length for
- * national (Unicode) char types. Never returns less than 1 — a zero/negative
- * catalog length would otherwise emit `{ length: 0 }`, which is not a valid
- * column width.
+ * Effective character length for a column: the catalog byte length divided by
+ * the server's bytes per character for national and Unicode char types. Never
+ * returns less than 1 — a zero/negative catalog length would otherwise emit
+ * `{ length: 0 }`, which is not a valid column width.
  */
-export function effectiveLength(col: ColumnMeta, mapping: TypeMapping): number {
-  const raw = mapping.nationalChar ? Math.floor(col.length / 2) : col.length;
+export function effectiveLength(
+  col: ColumnMeta,
+  mapping: TypeMapping,
+  charSizes: CharSizes
+): number {
+  const raw = mapping.charSize
+    ? Math.floor(col.length / Math.max(1, charSizes[mapping.charSize]))
+    : col.length;
   return raw > 0 ? raw : 1;
 }
 

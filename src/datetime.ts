@@ -229,6 +229,39 @@ const offsetMinutesAt = (instant: Date, timeZone: string): number =>
   (asUtcMs(wallClockAt(instant, timeZone)) - instant.getTime()) / MS_PER_MINUTE;
 
 /**
+ * Compare the server's clock with the zone values are converted in.
+ *
+ * `datetime` values are a naive wall clock, read and written as `timeZone`'s.
+ * If the server keeps its clock in another zone, every value is off by the
+ * difference — silently, in both directions. The server reveals its own
+ * offset (`getdate()` against `getutcdate()`), so a mismatch can be caught.
+ *
+ * Returns a description of the mismatch, or `undefined` if the offsets agree.
+ * Only the current offset is visible, so a zone with the same offset today but
+ * different DST rules would pass; one that differs now is certainly wrong.
+ *
+ * @internal
+ */
+export const describeTimeZoneMismatch = (
+  serverOffsetMinutes: number,
+  timeZone: string,
+  now: Date = new Date()
+): string | undefined => {
+  const expected = Math.round(offsetMinutesAt(now, timeZone));
+  if (expected === serverOffsetMinutes) {
+    return undefined;
+  }
+  const hours = (minutes: number) =>
+    `UTC${minutes < 0 ? "-" : "+"}${pad(Math.floor(Math.abs(minutes) / 60))}:${pad(Math.abs(minutes) % 60)}`;
+  return (
+    `The Sybase server's clock is at ${hours(serverOffsetMinutes)}, but datetime values are ` +
+    `converted as ${timeZone} (${hours(expected)}), so every datetime read or written is off by ` +
+    `${Math.abs(serverOffsetMinutes - expected) / 60} hours. Set \`timeZone\` to the IANA zone ` +
+    `the server keeps its clock in (e.g. "Australia/Sydney").`
+  );
+};
+
+/**
  * The two offsets that bracket a wall clock, sampled a day either side.
  *
  * A day is enough: no zone is further than 16 hours from UTC, so the instant a

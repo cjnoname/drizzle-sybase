@@ -11,6 +11,7 @@ import {
   effectiveLength,
   resolveMapping,
   SYBASE_TYPE_MAP,
+  type CharSizes,
   type TypeMapping
 } from "./type-map.js";
 import type { ColumnMeta, TableMeta } from "./types.js";
@@ -114,12 +115,12 @@ export interface GeneratedCode {
 // Column builder rendering
 // ---------------------------------------------------------------------------
 
-function renderColumnBuilder(col: ColumnMeta, mapping: TypeMapping): string {
+function renderColumnBuilder(col: ColumnMeta, mapping: TypeMapping, charSizes: CharSizes): string {
   const colName = JSON.stringify(col.name);
   let builder: string;
   switch (mapping.size) {
     case "length":
-      builder = `${mapping.factory}(${colName}, { length: ${effectiveLength(col, mapping)} })`;
+      builder = `${mapping.factory}(${colName}, { length: ${effectiveLength(col, mapping, charSizes)} })`;
       break;
     case "precision": {
       // precision/scale should always be present for numeric/decimal, but guard
@@ -147,6 +148,10 @@ function renderColumnBuilder(col: ColumnMeta, mapping: TypeMapping): string {
   }
   if (!col.isNullable) {
     builder += ".notNull()";
+  }
+  // Mirrors the insert schema, where such a column is optional.
+  if (col.defaultValue) {
+    builder += ".hasDatabaseDefault()";
   }
   return builder;
 }
@@ -239,7 +244,12 @@ function renderDecimalZodType(
   }
 }
 
-function renderZodType(col: ColumnMeta, mapping: TypeMapping, purpose: SchemaPurpose): string {
+function renderZodType(
+  col: ColumnMeta,
+  mapping: TypeMapping,
+  purpose: SchemaPurpose,
+  charSizes: CharSizes
+): string {
   let zod: string;
   switch (mapping.value) {
     case "number":
@@ -266,9 +276,11 @@ function renderZodType(col: ColumnMeta, mapping: TypeMapping, purpose: SchemaPur
       break;
     default: {
       zod = "z.string()";
-      const isText = mapping.factory === "text" || mapping.factory === "ntext";
-      if (col.length > 0 && !isText) {
-        zod += `.max(${effectiveLength(col, mapping)})`;
+      // Only a declared length counts characters. For the rest the catalog
+      // length is storage bytes (a text pointer is 16, a date 4) and says
+      // nothing about how long the string form is.
+      if (col.length > 0 && mapping.size === "length") {
+        zod += `.max(${effectiveLength(col, mapping, charSizes)})`;
       }
       break;
     }
@@ -297,8 +309,109 @@ function tableTypeName(table: TableMeta): string {
   return safeIdentifier(capitalize(toCamelCase(table.name)));
 }
 
-function generateTableDefinition(table: TableMeta, warnings: string[]): string {
-  const varName = tableVarName(table);
+/** Every name generated for one table, allocated up front so none collide. */
+interface TableNames {
+  varName: string;
+  typeName: string;
+  /** Property key per column, by catalog column name. */
+  keys: Map<string, string>;
+}
+
+const valueNamesOf = (varName: string) => [
+  varName,
+  `${varName}Indexes`,
+  `${varName}Schema`,
+  `${varName}InsertSchema`
+];
+const typeNamesOf = (typeName: string) => [`${typeName}Row`, `New${typeName}`];
+
+/**
+ * Allocate every declared identifier and column key before any code is emitted.
+ *
+ * Derived names make collisions easy to hit with ordinary catalogs: `orders`
+ * declares `ordersSchema`, which is also the table const for `orders_schema`;
+ * a table named `z` would shadow the zod import; `A_B` and `a_b` both
+ * camel-case to `aB`. Any clash gets a numeric suffix, applied to all of that
+ * table's names at once so they still read as a set, plus a warning. Tables
+ * are taken in the given order, which is stable (the catalog query sorts by
+ * name), so regenerating yields the same names.
+ */
+function planNames(tables: TableMeta[], warnings: string[]): Map<TableMeta, TableNames> {
+  const takenValues = new Set<string>([
+    "sybaseTable",
+    "z",
+    INTEGER_LITERAL,
+    DECIMAL_LITERAL,
+    ...FACTORY_ORDER
+  ]);
+  const takenTypes = new Set<string>();
+  const plan = new Map<TableMeta, TableNames>();
+
+  for (const table of tables) {
+    const baseVar = tableVarName(table);
+    const baseType = tableTypeName(table);
+    let varName = baseVar;
+    let typeName = baseType;
+    for (let n = 2; ; n++) {
+      const free =
+        valueNamesOf(varName).every(name => !takenValues.has(name)) &&
+        typeNamesOf(typeName).every(name => !takenTypes.has(name));
+      if (free) {
+        break;
+      }
+      varName = `${baseVar}_${n}`;
+      typeName = `${baseType}_${n}`;
+    }
+    if (varName !== baseVar) {
+      warnings.push(
+        `Table "${table.name}": generated name "${baseVar}" collides with another declaration — emitted as "${varName}".`
+      );
+    }
+    valueNamesOf(varName).forEach(name => takenValues.add(name));
+    typeNamesOf(typeName).forEach(name => takenTypes.add(name));
+
+    const keys = new Map<string, string>();
+    const takenKeys = new Set<string>();
+    for (const col of table.columns) {
+      const base = toCamelCase(col.name);
+      let key = base;
+      for (let n = 2; takenKeys.has(key); n++) {
+        key = `${base}_${n}`;
+      }
+      if (key !== base) {
+        warnings.push(
+          `Table "${table.name}" column "${col.name}": property "${base}" is already used — emitted as "${key}".`
+        );
+      }
+      takenKeys.add(key);
+      keys.set(col.name, key);
+    }
+
+    plan.set(table, { varName, typeName, keys });
+  }
+  return plan;
+}
+
+/**
+ * Owner argument for `sybaseTable`, or "" to leave the table unqualified.
+ *
+ * dbo tables stay unqualified: an unqualified name already resolves to dbo's
+ * table for any user without a same-named table of their own, and it keeps the
+ * common case's generated code unchanged. Any other owner is only reachable
+ * by that user unqualified, so it is emitted.
+ */
+function ownerOption(table: TableMeta): string {
+  return table.owner && table.owner.toLowerCase() !== "dbo"
+    ? `, { owner: ${JSON.stringify(table.owner)} }`
+    : "";
+}
+
+function generateTableDefinition(
+  table: TableMeta,
+  names: TableNames,
+  warnings: string[],
+  charSizes: CharSizes
+): string {
   const pk = findPrimaryKey(table);
   const isSingleColumnPk = pk?.columns.length === 1;
 
@@ -309,7 +422,7 @@ function generateTableDefinition(table: TableMeta, warnings: string[]): string {
         `Table "${table.name}" column "${col.name}": unmapped Sybase type "${col.typeName}" — emitted as varchar(${col.length}). Verify the generated type.`
       );
     }
-    let line = `  ${memberKey(toCamelCase(col.name))}: ${renderColumnBuilder(col, mapping)}`;
+    let line = `  ${memberKey(names.keys.get(col.name)!)}: ${renderColumnBuilder(col, mapping, charSizes)}`;
     if (isSingleColumnPk && pk.columns[0] === col.name) {
       line += ".primaryKey()";
     }
@@ -321,19 +434,19 @@ function generateTableDefinition(table: TableMeta, warnings: string[]): string {
   // them as a comment so the information is not silently lost (it also remains
   // available in the exported `<table>Indexes` constant below).
   if (pk && pk.columns.length > 1) {
-    lines.push(`// Composite primary key: ${pk.columns.map(c => toCamelCase(c)).join(", ")}`);
+    const pkKeys = pk.columns.map(c => names.keys.get(c) ?? toCamelCase(c));
+    lines.push(`// Composite primary key: ${pkKeys.join(", ")}`);
   }
-  lines.push(`export const ${varName} = sybaseTable(${JSON.stringify(table.name)}, {`);
+  lines.push(`export const ${names.varName} = sybaseTable(${JSON.stringify(table.name)}, {`);
   lines.push(columnLines.join(",\n"));
-  lines.push("});");
+  lines.push(`}${ownerOption(table)});`);
   return lines.join("\n") + "\n";
 }
 
-function generateIndexInfo(table: TableMeta): string {
+function generateIndexInfo(table: TableMeta, names: TableNames): string {
   if (table.indexes.length === 0) {
     return "";
   }
-  const varName = tableVarName(table);
   const indexLines = table.indexes.map(idx => {
     const flags: string[] = [];
     if (idx.isPrimary) {
@@ -347,15 +460,14 @@ function generateIndexInfo(table: TableMeta): string {
     return `  { name: ${JSON.stringify(idx.indexName)}, columns: [${cols}]${flagStr} }`;
   });
 
-  return `export const ${varName}Indexes = [\n${indexLines.join(",\n")}\n] as const;\n`;
+  return `export const ${names.varName}Indexes = [\n${indexLines.join(",\n")}\n] as const;\n`;
 }
 
-function generateSelectSchema(table: TableMeta): string {
-  const varName = tableVarName(table);
-  const typeName = tableTypeName(table);
+function generateSelectSchema(table: TableMeta, names: TableNames, charSizes: CharSizes): string {
+  const { varName, typeName } = names;
   const fieldLines = table.columns.map(col => {
     const { mapping } = resolveMapping(col.typeName);
-    return `  ${memberKey(toCamelCase(col.name))}: ${renderZodType(col, mapping, "select")}`;
+    return `  ${memberKey(names.keys.get(col.name)!)}: ${renderZodType(col, mapping, "select", charSizes)}`;
   });
   return (
     `export const ${varName}Schema = z.object({\n${fieldLines.join(",\n")}\n});\n` +
@@ -363,18 +475,17 @@ function generateSelectSchema(table: TableMeta): string {
   );
 }
 
-function generateInsertSchema(table: TableMeta): string {
-  const varName = tableVarName(table);
-  const typeName = tableTypeName(table);
+function generateInsertSchema(table: TableMeta, names: TableNames, charSizes: CharSizes): string {
+  const { varName, typeName } = names;
   const fieldLines = table.columns
     .filter(col => !col.isIdentity)
     .map(col => {
       const { mapping } = resolveMapping(col.typeName);
-      let zod = renderZodType(col, mapping, "insert");
+      let zod = renderZodType(col, mapping, "insert", charSizes);
       if (col.isNullable || col.defaultValue) {
         zod += ".optional()";
       }
-      return `  ${memberKey(toCamelCase(col.name))}: ${zod}`;
+      return `  ${memberKey(names.keys.get(col.name)!)}: ${zod}`;
     });
   return (
     `export const ${varName}InsertSchema = z.object({\n${fieldLines.join(",\n")}\n});\n` +
@@ -417,9 +528,20 @@ function collectImports(tables: TableMeta[]): string[] {
 const DIVIDER =
   "// ═══════════════════════════════════════════════════════════════════════════════";
 
-export function generateSchemaCode(tables: TableMeta[], database: string): GeneratedCode {
+/**
+ * @param charSizes Bytes per character of the server's national and Unicode
+ *   char types, used to turn catalog byte lengths into character lengths.
+ *   They depend on the server charset, so there is no safe default:
+ *   `introspectWith` reads them from the server.
+ */
+export function generateSchemaCode(
+  tables: TableMeta[],
+  database: string,
+  charSizes: CharSizes
+): GeneratedCode {
   const warnings: string[] = [];
   const imports = collectImports(tables);
+  const names = planNames(tables, warnings);
   const lines: string[] = [];
 
   lines.push("/**");
@@ -440,7 +562,7 @@ export function generateSchemaCode(tables: TableMeta[], database: string): Gener
   lines.push(DIVIDER);
   lines.push("");
   for (const table of tables) {
-    lines.push(generateTableDefinition(table, warnings));
+    lines.push(generateTableDefinition(table, names.get(table)!, warnings, charSizes));
     lines.push("");
   }
 
@@ -449,7 +571,7 @@ export function generateSchemaCode(tables: TableMeta[], database: string): Gener
   lines.push(DIVIDER);
   lines.push("");
   for (const table of tables) {
-    const indexCode = generateIndexInfo(table);
+    const indexCode = generateIndexInfo(table, names.get(table)!);
     if (indexCode) {
       lines.push(indexCode);
       lines.push("");
@@ -461,7 +583,7 @@ export function generateSchemaCode(tables: TableMeta[], database: string): Gener
   lines.push(DIVIDER);
   lines.push("");
   for (const table of tables) {
-    lines.push(generateSelectSchema(table));
+    lines.push(generateSelectSchema(table, names.get(table)!, charSizes));
     lines.push("");
   }
 
@@ -469,7 +591,9 @@ export function generateSchemaCode(tables: TableMeta[], database: string): Gener
   lines.push("// Zod Schemas (Insert)");
   lines.push(DIVIDER);
   lines.push("");
-  const insertSchemas = tables.map(table => generateInsertSchema(table));
+  const insertSchemas = tables.map(table =>
+    generateInsertSchema(table, names.get(table)!, charSizes)
+  );
   // Emitted only when referenced, so a schema with no exact numeric columns does
   // not carry an unused const.
   if (insertSchemas.some(s => s.includes(INTEGER_LITERAL) || s.includes(DECIMAL_LITERAL))) {

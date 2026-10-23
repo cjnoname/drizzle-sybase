@@ -2,9 +2,9 @@
  * Sybase ASE SQL dialect — generates Sybase-compatible SQL from Drizzle's AST.
  *
  * Key differences from MSSQL:
- * - No OFFSET/FETCH → use SET ROWCOUNT for pagination
+ * - No OFFSET/FETCH → SELECT TOP (offset + limit), the offset skipped client-side.
+ *   TOP rather than SET ROWCOUNT: it changes no session state.
  * - No OUTPUT/RETURNING → use SELECT @@identity after INSERT for identity
- * - Supports TOP N (ASE 12.5+) but we use SET ROWCOUNT for consistency
  * - Identifiers quoted with [] (same as MSSQL)
  * - Parameters inlined (db-lib supports params, but inline is simpler for now)
  * - String concatenation with +
@@ -12,9 +12,11 @@
 import { Buffer } from "node:buffer";
 
 import type { SQL } from "drizzle-orm";
+import { getTableName } from "drizzle-orm";
 import { CodecsCollection, refineCodecs, type Codecs } from "drizzle-orm/codecs";
 
 import { castExactNumericLiteral, SYBASE_CODECS } from "./codecs.js";
+import { OriginalColumn } from "./columns/index.js";
 import { formatSybaseDateTime, resolveTimeZone } from "./datetime.js";
 import type { SybaseSelectConfig } from "./query-builders/select.js";
 
@@ -24,8 +26,36 @@ import type { SybaseSelectConfig } from "./query-builders/select.js";
 
 /**
  * Escape a Sybase identifier with brackets.
+ *
+ * Temporary table names (`#name`) are the exception: ASE rejects a quoted
+ * identifier that starts with `#` (Msg 11717), so they are emitted as plain
+ * identifiers — which requires them to be valid ones.
  */
-export const escapeName = (name: string): string => `[${name.replace(/\]/g, "]]")}]`;
+export const escapeName = (name: string): string => {
+  if (name.startsWith("#")) {
+    if (!/^#[A-Za-z0-9_@#$]+$/.test(name)) {
+      throw new Error(
+        `Invalid temporary table name ${JSON.stringify(name)}: ASE cannot quote a name ` +
+          "starting with '#', so it may contain only letters, digits, _, @, # and $"
+      );
+    }
+    return name;
+  }
+  return `[${name.replace(/\]/g, "]]")}]`;
+};
+
+const TableSchemaSymbol = Symbol.for("drizzle:Schema");
+
+/**
+ * Escaped reference to a table object: `[owner].[name]` when it was defined
+ * with an owner, `[name]` otherwise. The same form drizzle-orm uses when it
+ * renders the table's columns, so FROM and WHERE always agree.
+ */
+export const escapeTableName = (table: any): string => {
+  const owner: string | undefined = table[TableSchemaSymbol];
+  const name = escapeName(getTableName(table));
+  return owner === undefined ? name : `${escapeName(owner)}.${name}`;
+};
 
 /**
  * Escape a string value for inline SQL (single-quote wrapping + escaping).
@@ -185,21 +215,63 @@ export class SybaseDialect {
   }
 
   /**
+   * SQL for anything the query builders accept as a column: a table column,
+   * an aliased column (`col.as(...)`), a SQL expression or a raw string.
+   *
+   * `use` decides the one difference between the places they appear:
+   * - `"field"` — a select field. An aliased column selects the column it
+   *   aliases (the field's key names the result). Returns `undefined` for a
+   *   value it cannot render, so the caller can name the offending field.
+   * - `"reference"` — ORDER BY / GROUP BY. An aliased column refers to its
+   *   alias, as drizzle renders one; anything else falls back to its name or
+   *   text (e.g. `orderBy(1)` for the first column).
+   */
+  renderExpression(value: unknown, use: "field"): string | undefined;
+  renderExpression(value: unknown, use: "reference"): string;
+  renderExpression(value: unknown, use: "field" | "reference"): string | undefined {
+    if (typeof value === "string") {
+      return value;
+    }
+    const v = value as any;
+    if (v && v.isAlias) {
+      if (use === "reference") {
+        return escapeName(v.name);
+      }
+      if (typeof v[OriginalColumn] === "function") {
+        const column = v[OriginalColumn]();
+        return `${escapeTableName(column.table)}.${escapeName(column.name)}`;
+      }
+    }
+    // A column (name + table) before getSQL: its getSQL() is a minimal
+    // wrapper, not a full SQL object to render.
+    if (v && v.name && v.table) {
+      return `${escapeTableName(v.table)}.${escapeName(v.name)}`;
+    }
+    if (v && typeof v.getSQL === "function") {
+      return this.sqlToQuery(v.getSQL());
+    }
+    if (v && typeof v.toQuery === "function") {
+      return this.sqlToQuery(v as SQL);
+    }
+    if (use === "field") {
+      return undefined;
+    }
+    return v && v.name ? escapeName(v.name) : String(value);
+  }
+
+  /**
    * Build a SELECT SQL string from config.
    */
   buildSelectQuery(config: SybaseSelectConfig): string {
     const parts: string[] = [];
 
-    // WITH (CTE)
-    if (config.withList && config.withList.length > 0) {
-      const ctes = config.withList.map(w => `${escapeName(w.alias)} as (${w.sql})`).join(", ");
-      parts.push(`with ${ctes}`);
-    }
-
-    // SELECT [DISTINCT]
+    // SELECT [DISTINCT] [TOP n] — ASE requires DISTINCT before TOP.
     let selectClause = "select";
     if (config.distinct) {
       selectClause += " distinct";
+    }
+    if (config.top !== undefined) {
+      selectClause += ` top ${config.top}`;
     }
 
     // Fields
