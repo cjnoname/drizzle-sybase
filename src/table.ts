@@ -156,6 +156,7 @@ export class SybaseTable<
     readonly schema: TOwner;
     readonly columns: Record<string, Column>;
     readonly dialect: "sybase";
+    readonly isAlias: false;
   };
 
   // Static Symbol map matching Table.Symbol structure
