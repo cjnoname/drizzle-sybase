@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.1.0](https://github.com/cjnoname/drizzle-sybase/compare/v3.0.0...v3.1.0) (2026-10-24)
+
+
+### Features
+
+* Add isAlias property to SybaseTable class ([547cda3](https://github.com/cjnoname/drizzle-sybase/commit/547cda321ba80e8f7624481060aac46755c675ca))
+
 ## [3.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v2.0.1...v3.0.0) (2026-10-23)
 
 
