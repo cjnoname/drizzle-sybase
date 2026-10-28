@@ -54,6 +54,9 @@
 #include <stdio.h>
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1795,7 +1798,11 @@ static wchar_t *wide_path(const char *path) {
 }
 #endif
 
-/** Create (exclusively: never an existing file) `path` for writing. */
+/**
+ * Create (exclusively: never an existing file) `path` for writing. On POSIX it
+ * is readable by its owner only, since it holds query results, and it is not
+ * inherited by child processes. On Windows it takes its directory's ACL.
+ */
 static FILE *open_output(const char *path) {
 #if defined(_WIN32)
   wchar_t *wide = wide_path(path);
@@ -1803,7 +1810,17 @@ static FILE *open_output(const char *path) {
   free(wide);
   return f;
 #else
-  return fopen(path, "wbx");
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return NULL;
+  }
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    int saved = errno;
+    close(fd);
+    errno = saved;
+  }
+  return f;
 #endif
 }
 

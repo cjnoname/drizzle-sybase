@@ -7,7 +7,15 @@
  * Or create a .env.test file (not committed to git).
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -844,6 +852,16 @@ describe.skipIf(!hasConfig)("rows streamed to a CSV file (live)", () => {
     expect(file.rowCount).toBe(3);
     expect(parseCsv(readFileSync(path, "utf8"))).toHaveLength(4);
   });
+
+  // It holds query results: whatever the umask, only its owner may read it.
+  it.skipIf(process.platform === "win32")(
+    "creates the file readable by its owner only",
+    async () => {
+      const path = join(dir, "private.csv");
+      await pool.queryToFile("select 1 as v", { path });
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    }
+  );
 
   /** Files in the directory other than the ones named, i.e. leftover temporaries. */
   const strays = (...expected: string[]) =>

@@ -150,7 +150,9 @@ the number of rows (only with the largest single value) and the event loop
 stays free. The file is written beside `path` and renamed into place when the
 query succeeds: a failed query leaves an existing file untouched and no partial
 one behind, and a query whose connection was closed before it finished (as on a
-hard timeout) publishes nothing. The file is not fsynced: it is meant to be read
+hard timeout) publishes nothing. On Linux and macOS the file is created
+readable by its owner only (mode `0600`), since it holds query results; `chmod`
+it if another user must read it. The file is not fsynced: it is meant to be read
 right away (by DuckDB, or an upload), not to survive a crash of the machine.
 
 ```ts
