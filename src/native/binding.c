@@ -1552,37 +1552,35 @@ static size_t utf8_sanitize(const unsigned char *in, size_t n, unsigned char *ou
   unsigned char lower = 0x80, upper = 0xBF;
   for (size_t i = 0; i < n; i++) {
     unsigned char b = in[i];
-    if (needed == 0) {
-      seq_start = i;
-      if (b <= 0x7F) {
-        out[len++] = b;
-      } else if (b >= 0xC2 && b <= 0xDF) {
-        needed = 1;
-      } else if (b >= 0xE0 && b <= 0xEF) {
-        lower = b == 0xE0 ? 0xA0 : 0x80;
-        upper = b == 0xED ? 0x9F : 0xBF;
-        needed = 2;
-      } else if (b >= 0xF0 && b <= 0xF4) {
-        lower = b == 0xF0 ? 0x90 : 0x80;
-        upper = b == 0xF4 ? 0x8F : 0xBF;
-        needed = 3;
-      } else {
-        out[len++] = 0xEF, out[len++] = 0xBF, out[len++] = 0xBD;
+    if (needed > 0) {
+      if (b >= lower && b <= upper) {
+        lower = 0x80, upper = 0xBF;
+        if (++seen == needed) {
+          memcpy(out + len, in + seq_start, (size_t)needed + 1);
+          len += (size_t)needed + 1;
+          needed = 0, seen = 0;
+        }
+        continue;
       }
-      continue;
-    }
-    if (b < lower || b > upper) {
       // The sequence so far is one invalid subpart; this byte starts afresh.
       out[len++] = 0xEF, out[len++] = 0xBF, out[len++] = 0xBD;
       needed = 0, seen = 0, lower = 0x80, upper = 0xBF;
-      i--;
-      continue;
     }
-    lower = 0x80, upper = 0xBF;
-    if (++seen == needed) {
-      memcpy(out + len, in + seq_start, (size_t)needed + 1);
-      len += (size_t)needed + 1;
-      needed = 0, seen = 0;
+    seq_start = i;
+    if (b <= 0x7F) {
+      out[len++] = b;
+    } else if (b >= 0xC2 && b <= 0xDF) {
+      needed = 1;
+    } else if (b >= 0xE0 && b <= 0xEF) {
+      lower = b == 0xE0 ? 0xA0 : 0x80;
+      upper = b == 0xED ? 0x9F : 0xBF;
+      needed = 2;
+    } else if (b >= 0xF0 && b <= 0xF4) {
+      lower = b == 0xF0 ? 0x90 : 0x80;
+      upper = b == 0xF4 ? 0x8F : 0xBF;
+      needed = 3;
+    } else {
+      out[len++] = 0xEF, out[len++] = 0xBF, out[len++] = 0xBD;
     }
   }
   if (needed > 0) {
