@@ -135,6 +135,7 @@ export type {
 } from "./connection.js";
 export { SybasePool } from "./pool.js";
 export type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
+export type { SybaseColumnarResult, SybaseColumnValues, SybaseResultColumn } from "./result.js";
 
 // Dialect
 export { SybaseDialect, escapeName, escapeString, serializeValue } from "./dialect.js";

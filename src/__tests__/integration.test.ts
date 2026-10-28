@@ -156,6 +156,24 @@ describe.skipIf(!hasConfig)("native binding (real connection)", () => {
   });
 });
 
+/**
+ * Prelude for a child script that imports the TypeScript sources directly: Node
+ * strips the types, but the sources import each other as `.js`, as compiled.
+ */
+const RESOLVE_TS = `
+  import { registerHooks } from "node:module";
+  registerHooks({
+    resolve(specifier, context, next) {
+      try {
+        return next(specifier, context);
+      } catch (err) {
+        if (!specifier.startsWith(".") || !specifier.endsWith(".js")) throw err;
+        return next(specifier.slice(0, -3) + ".ts", context);
+      }
+    }
+  });
+`;
+
 describe.skipIf(!hasConfig)("native close while a query is queued", () => {
   // With a single libuv worker busy, the second query waits in the queue.
   // Closing its connection then used to free the struct the queued worker
@@ -163,7 +181,7 @@ describe.skipIf(!hasConfig)("native close while a query is queued", () => {
   // cannot take the test runner down with it.
   it("rejects the queued query instead of crashing the process", () => {
     const nativeUrl = new URL("../native/index.ts", import.meta.url).href;
-    const script = `
+    const script = `${RESOLVE_TS}
       const { native } = await import(${JSON.stringify(nativeUrl)});
       const cfg = JSON.parse(process.env.CFG);
       const a = await native.connect(cfg);
@@ -194,7 +212,7 @@ describe.skipIf(!hasConfig)("native close while a query is queued", () => {
   // the handle after close read freed memory. Run in a child, as above.
   it("keeps a closed handle safe to close, check and query", () => {
     const nativeUrl = new URL("../native/index.ts", import.meta.url).href;
-    const script = `
+    const script = `${RESOLVE_TS}
       const { native } = await import(${JSON.stringify(nativeUrl)});
       const cfg = JSON.parse(process.env.CFG);
       const out = [];
@@ -646,6 +664,106 @@ describe.skipIf(!hasConfig)("decoded value types match the type registry", () =>
     } finally {
       await pool.close();
     }
+  });
+});
+
+/**
+ * The column-by-column path end to end: the same values as the row path, typed
+ * arrays where the type allows, and text runs split back correctly.
+ */
+describe.skipIf(!hasConfig)("column-by-column results (live)", () => {
+  // One row in three NULL in every column, so each kind carries a NULL mask.
+  const MIXED = `select number as id,
+    case when number % 3 = 0 then null else convert(tinyint, number % 256) end as ti,
+    case when number % 3 = 0 then null else convert(int, number - 100) end as i,
+    case when number % 3 = 0 then null else convert(bigint, number) * 4294967296 end as bi,
+    case when number % 3 = 0 then null else convert(unsigned int, number) end as ui,
+    case when number % 3 = 0 then null else convert(float, number) / 7 end as f,
+    case when number % 3 = 0 then null else convert(real, number) / 7 end as r,
+    case when number % 3 = 0 then null else convert(money, number) / 100 end as m,
+    case when number % 3 = 0 then null else convert(char(6), convert(varchar, number)) end as c,
+    case when number % 3 = 0 then null else dateadd(minute, number * 41, '2016-03-30') end as dt,
+    case when number % 3 = 0 then null else convert(varbinary(4), number) end as vb,
+    convert(bit, number % 2) as bt
+    from master..spt_values where type = 'P' order by number`;
+
+  let pool: SybasePool;
+  let session: SybaseSession;
+
+  beforeAll(() => {
+    pool = new SybasePool({ ...config, max: 1 });
+    session = new SybaseSession(pool, "Australia/Sydney");
+  });
+
+  afterAll(async () => {
+    await pool.close();
+  });
+
+  it("holds exactly what the rows hold", async () => {
+    const { rows } = await session.execute(MIXED);
+    const columnar = await session.executeColumns(MIXED);
+    expect(columnar.rowCount).toBe(rows.length);
+    const rebuilt = Array.from({ length: columnar.rowCount }, (_, r) =>
+      Object.fromEntries(
+        columnar.columns.map(c => {
+          const value = c.nulls?.[r] === 1 ? null : c.values[r];
+          // datetime arrives as epoch milliseconds; rows hold the same instant as a Date.
+          return [
+            c.name,
+            c.type === "datetime" && value !== null ? new Date(value as number) : value
+          ];
+        })
+      )
+    );
+    expect(rebuilt).toEqual(rows);
+    expect(Object.fromEntries(columnar.columns.map(c => [c.name, c.values.constructor]))).toEqual({
+      id: Int32Array,
+      ti: Int32Array,
+      i: Int32Array,
+      bi: BigInt64Array,
+      ui: Float64Array,
+      f: Float64Array,
+      r: Float64Array,
+      m: Array,
+      c: Array,
+      dt: Float64Array,
+      vb: Array,
+      bt: Array
+    });
+    expect(rows[1]!.dt).toEqual(new Date("2016-03-29T13:41:00.000Z"));
+  });
+
+  it("is reachable from the pool and the drizzle handle", async () => {
+    const db = createSybaseDrizzle({ ...config, max: 1, timeZone: "Australia/Sydney" });
+    try {
+      const fromDb = await db.executeColumns(sql`select convert(int, ${7}) as v`);
+      expect(fromDb.columns[0]!.values).toEqual(Int32Array.of(7));
+      // Without a session, datetime stays canonical text, as in pool.query rows.
+      const fromPool = await pool.queryColumns("select convert(datetime, '2016-06-09') as d");
+      expect(fromPool.columns[0]!.values).toEqual(["2016-06-09 00:00:00.000"]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("splits long text that spans many runs", async () => {
+    // ~400 KB of text: many of the addon's 16 KB runs.
+    const { rows } = await pool.query<{ n: number; s: string }>(
+      "select number as n, replicate('x', 200) + convert(varchar, number) as s " +
+        "from master..spt_values where type = 'P' order by number"
+    );
+    expect(rows.length).toBeGreaterThan(1000);
+    for (const row of rows) {
+      expect(row.s).toBe(`${"x".repeat(200)}${row.n}`);
+    }
+  });
+
+  it("decodes values as the row path always has", async () => {
+    const { rows } = await pool.query(
+      "select convert(real, 3.14) as r, convert(char(5), 'ab') as c, " +
+        "convert(text, null) as t, 'a' + char(0) + 'b' as nul"
+    );
+    expect(rows).toEqual([{ r: 3.1400001, c: "ab", t: "", nul: "a" }]);
   });
 });
 

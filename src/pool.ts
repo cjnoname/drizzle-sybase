@@ -24,6 +24,7 @@ import {
   SybaseTimeoutError,
   SybasePoolError
 } from "./errors.js";
+import type { SybaseColumnarResult } from "./result.js";
 import {
   isReadOnlySql,
   mayChangeIdentity,
@@ -429,6 +430,22 @@ export class SybasePool {
     sql: string,
     options?: SybaseQueryOptions
   ): Promise<QueryResult<T>> {
+    return this.run(sql, options, conn => conn.query<T>(sql, options));
+  }
+
+  /**
+   * Like {@link query}, but the result column by column — for bulk reads, where
+   * building an object per row is most of the cost.
+   */
+  async queryColumns(sql: string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult> {
+    return this.run(sql, options, conn => conn.queryColumns(sql, options));
+  }
+
+  private async run<R extends { rowCount: number }>(
+    sql: string,
+    options: SybaseQueryOptions | undefined,
+    execute: (conn: SybaseConnection) => Promise<R>
+  ): Promise<R> {
     // Classified only when a retry is actually possible: scanning every
     // statement up front would cost a full pass over large batches on the
     // common path, where nothing fails.
@@ -451,7 +468,7 @@ export class SybasePool {
       /** Set when the statement succeeded but left the session in a state that had to be undone. */
       let stateError: SybaseError | undefined;
       try {
-        const result = await conn.query<T>(sql, options);
+        const result = await execute(conn);
         const durationMs = Date.now() - startTime;
         this._totalQueriesExecuted++;
         this._queryDurationSum += durationMs;

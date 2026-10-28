@@ -106,6 +106,41 @@ Every insert/update value may also be a SQL expression, e.g. `` sql`getdate()` `
 Comparison operators come from `drizzle-orm` and do not check the compared
 value against the column type: `eq(users.id, "x")` compiles.
 
+## Bulk Reads (Column by Column)
+
+For exports — Arrow, DuckDB, Parquet, CSV — `db.executeColumns()` returns the
+result column by column instead of as one object per row. Each column is a
+single array holding every row's value, decoded as in row results:
+
+```ts
+const { columns, rowCount } = await db.executeColumns(
+  sql`select id, name, created_at from users where id > ${lo} and id <= ${hi}`,
+  { maxRows: 5_000_000 }
+);
+for (const { name, type, values, nulls } of columns) {
+  // name: "id", type: "int", values: Int32Array, nulls: Uint8Array | undefined
+}
+```
+
+- Fixed-width columns are typed arrays — `Int32Array` (`tinyint`,
+  `smallint`, `int`), `Float64Array` (`float`, `real`, `unsigned smallint`,
+  `unsigned int`), `BigInt64Array` (`bigint`), `BigUint64Array`
+  (`unsigned bigint`), and `Float64Array` of epoch milliseconds for `datetime`
+  and `smalldatetime` (the instant a row's `Date` holds — `new Date(ms)` — at
+  8 bytes per value instead of a ~100-byte `Date`). A typed array cannot hold
+  `null`, so NULL reads as `0` there: check `nulls`, which is 1 for each NULL
+  (and `undefined` when the column has none).
+- Every other column is a plain array with `null` in place: `boolean` (`bit`),
+  `Buffer` (binary types), `string` (the rest, including `money` and
+  `numeric`).
+- It is also on `tx`, `withConnection`'s handle, `SybaseSession`
+  (`executeColumns`), `SybasePool` and `SybaseConnection` (`queryColumns`; there,
+  as with their `query`, datetime columns are canonical text).
+
+Row results are built from the same column data, so `execute()` and
+`select()` are fast too; the column form saves building the row objects and
+hands numbers over without boxing them.
+
 ## Why not `child_process` + `tsql`?
 
 |                | Old (tsql child_process)    | New (native db-lib)            |

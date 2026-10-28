@@ -11,6 +11,10 @@
 import { dlopen } from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { resolveTimeZone } from "../datetime.js";
+import { toColumnarResult, toRowResult } from "../result.js";
+import type { NativeResult, SybaseColumnarResult } from "../result.js";
+
 export interface NativeQueryOptions {
   maxRows?: number;
   /**
@@ -25,6 +29,12 @@ export interface NativeQueryOptions {
    * Defaults to `max(2 * connection.timeout * 1000, 30000)` on the native side.
    */
   hardTimeoutMs?: number;
+  /**
+   * Decode `datetime` and `smalldatetime` columns to `Date`, reading their
+   * stored wall clock in this IANA zone. Without it they come back as canonical
+   * `YYYY-MM-DD HH:MM:SS.mmm` text.
+   */
+  timeZone?: string;
 }
 
 export interface NativeBinding {
@@ -53,10 +63,69 @@ export interface NativeBinding {
     rowCount: number;
     affectedRows: number;
   }>;
+  /** Like {@link query}, but the result column by column. */
+  queryColumns(
+    conn: unknown,
+    sql: string,
+    options?: NativeQueryOptions
+  ): Promise<SybaseColumnarResult>;
   close(conn: unknown): void;
   isAlive(conn: unknown): boolean;
   getVersion(): string;
 }
+
+/** The addon's own exports. Its `query` resolves to the result column by column. */
+interface NativeAddon extends Omit<NativeBinding, "query" | "queryColumns"> {
+  query(
+    conn: unknown,
+    sql: string,
+    options: { maxRows?: number; hardTimeoutMs?: number; wallClockDateTimes: boolean }
+  ): Promise<NativeResult>;
+}
+
+/**
+ * The binding on top of the addon: decodes its column-by-column result.
+ *
+ * The addon is called synchronously, so an invalid handle still throws its
+ * TypeError from the call itself rather than through the promise.
+ */
+const wrapAddon = (addon: NativeAddon): NativeBinding => {
+  const run = (conn: unknown, sql: string, options: NativeQueryOptions | undefined) => {
+    const timeZone =
+      options?.timeZone === undefined ? undefined : resolveTimeZone(options.timeZone);
+    const pending = addon
+      .query(conn, sql, {
+        maxRows: options?.maxRows,
+        hardTimeoutMs: options?.hardTimeoutMs,
+        wallClockDateTimes: timeZone !== undefined
+      })
+      .then(raw => {
+        // An addon from an older build hands over rows instead.
+        if (!Array.isArray(raw.data)) {
+          throw new Error(
+            "drizzle-sybase: the loaded native addon predates the JS layer (no column data in " +
+              "its result). Reinstall drizzle-sybase so the bundled addon matches."
+          );
+        }
+        return raw;
+      });
+    return { pending, timeZone };
+  };
+  return {
+    connect: config => addon.connect(config),
+    query: (conn, sql, options) => {
+      const { pending, timeZone } = run(conn, sql, options);
+      return pending.then(raw => toRowResult(raw, timeZone));
+    },
+    queryColumns: (conn, sql, options) => {
+      const { pending, timeZone } = run(conn, sql, options);
+      return pending.then(raw => toColumnarResult(raw, timeZone));
+    },
+    close: conn => addon.close(conn),
+    isAlive: conn => addon.isAlive(conn),
+    getVersion: () => addon.getVersion()
+  };
+};
 
 function loadBundled(): NativeBinding | null {
   const platform = process.platform;
@@ -78,9 +147,9 @@ function loadBundled(): NativeBinding | null {
   }
 
   try {
-    const mod = { exports: {} } as { exports: NativeBinding };
+    const mod = { exports: {} } as { exports: NativeAddon };
     dlopen(mod, fileURLToPath(addonUrl));
-    return mod.exports;
+    return wrapAddon(mod.exports);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(

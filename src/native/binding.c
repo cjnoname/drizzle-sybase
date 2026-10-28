@@ -45,6 +45,7 @@
 #include <sybfront.h>
 #include <sybdb.h>
 #include <uv.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
@@ -373,13 +374,65 @@ static void clear_error(SybaseConnection *conn) {
   conn->timed_out = 0;
 }
 
+/**
+ * How a column's values are stored on the worker thread and handed to JS.
+ *
+ * Results are kept column by column, in the representation JS receives, so
+ * that the JS thread does one call per column instead of several per cell:
+ * fixed-width values are decoded from db-lib's binary form here and copied to
+ * JS as one typed array; text is packed back to back and crosses as a few large
+ * strings that JS splits.
+ */
+typedef enum {
+  KIND_TEXT,       // UTF-8 text, each value followed by a NUL separator
+  KIND_BINARY,     // raw bytes, back to back, for JS to cut into one Buffer per value
+  KIND_INT32,      // tinyint, smallint, int
+  KIND_FLOAT64,    // float, real, usmallint, uint
+  KIND_INT64,      // bigint
+  KIND_UINT64,     // ubigint
+  KIND_BOOL,       // bit
+  KIND_WALLCLOCK,  // datetime, smalldatetime: the wall clock as ms since 1970, read as UTC
+} ValueKind;
+
+/** The `kind` JS sees for each ValueKind. */
+static const char *const KIND_NAMES[] = {"text",  "binary", "int32", "float64",
+                                         "int64", "uint64", "bool",  "wallclock"};
+
+/** Bytes per value of a fixed-width kind; 0 for text and binary. */
+static size_t kind_size(ValueKind kind) {
+  switch (kind) {
+    case KIND_INT32:
+      return sizeof(int32_t);
+    case KIND_FLOAT64:
+    case KIND_WALLCLOCK:
+      return sizeof(double);
+    case KIND_INT64:
+      return sizeof(int64_t);
+    case KIND_UINT64:
+      return sizeof(uint64_t);
+    case KIND_BOOL:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 typedef struct {
   char *name;
-  char **values;
-  // Byte length per value; allocated only for binary columns, whose values
-  // are raw bytes (may contain NUL) rather than NUL-terminated text.
-  int *lengths;
   int type;
+  ValueKind kind;
+  // One byte per row, 1 where the value is NULL.
+  unsigned char *nulls;
+  int has_nulls;
+  // Fixed-width kinds: one value per row (0 where NULL).
+  unsigned char *fixed;
+  // Text and binary: the values back to back, and the offset just past each
+  // one. A text value is followed by a NUL, so a run of text values is already
+  // the `\0`-joined string JS splits.
+  char *bytes;
+  size_t bytes_len;
+  size_t bytes_cap;
+  size_t *ends;
 } ResultColumn;
 
 /** Whether a column carries raw bytes, handed to JS as a Buffer. */
@@ -597,18 +650,15 @@ static int format_temporal_value(DBPROCESS *dbproc, int coltype, const void *src
   return written;
 }
 
-static void free_columns(ResultColumn *columns, int num_columns, int num_rows) {
+static void free_columns(ResultColumn *columns, int num_columns) {
   if (!columns) {
     return;
   }
   for (int i = 0; i < num_columns; i++) {
-    if (columns[i].values) {
-      for (int r = 0; r < num_rows; r++) {
-        free(columns[i].values[r]);
-      }
-      free(columns[i].values);
-    }
-    free(columns[i].lengths);
+    free(columns[i].nulls);
+    free(columns[i].fixed);
+    free(columns[i].bytes);
+    free(columns[i].ends);
     free(columns[i].name);
   }
   free(columns);
@@ -884,6 +934,9 @@ typedef struct {
   int max_rows_explicit;
   int truncated;
   int hard_timeout_ms;
+  // 1 to hand datetime/smalldatetime over as wall-clock numbers (KIND_WALLCLOCK)
+  // for the JS layer to turn into Dates, instead of as canonical text.
+  int wall_clock_datetimes;
   // Results
   ResultColumn *columns;
   int num_columns;
@@ -972,6 +1025,528 @@ static void work_release_conn(QueryWork *w) {
   }
 }
 
+/** Drop whatever result the work item has collected. */
+static void discard_results(QueryWork *w) {
+  free_columns(w->columns, w->num_columns);
+  w->columns = NULL;
+  w->num_columns = 0;
+  w->num_rows = 0;
+}
+
+/** How a column of this type is stored (see ValueKind). */
+static ValueKind column_kind(int coltype, int wall_clock_datetimes) {
+  if (is_binary_type(coltype)) {
+    return KIND_BINARY;
+  }
+  if (coltype == TDS_USMALLINT || coltype == TDS_UINT) {
+    // Up to 4294967295: past int32, but exact in a double.
+    return KIND_FLOAT64;
+  }
+  if (coltype == TDS_UBIGINT) {
+    // Up to 18446744073709551615 — past even int64, so a uint64 BigInt.
+    return KIND_UINT64;
+  }
+  switch (coltype) {
+    case SYBINT1:
+    case SYBINT2:
+    case SYBINT4:
+      return KIND_INT32;
+    case SYBINT8:
+      // bigint is 64-bit: up to 9223372036854775807, which a double cannot
+      // hold. A double silently rounds anything past 2^53 (9007199254740993
+      // reads back as 9007199254740992), so the value is handed over as a
+      // BigInt — the only exact JS integer type. Mixing a BigInt into number
+      // arithmetic throws rather than corrupting the result, which is the
+      // behaviour we want here.
+      return KIND_INT64;
+    case SYBFLT8:
+    case SYBREAL:
+      return KIND_FLOAT64;
+    case SYBBIT:
+      return KIND_BOOL;
+    case SYBDATETIME:
+    case SYBDATETIME4:
+      return wall_clock_datetimes ? KIND_WALLCLOCK : KIND_TEXT;
+    default:
+      // Money and decimal stay text to preserve precision (a JS number loses
+      // it beyond ~15 digits), as do every other type JS has no exact form for.
+      return KIND_TEXT;
+  }
+}
+
+/** Days from 1970-01-01 to a proleptic Gregorian date (month 1-12). */
+static int64_t days_from_civil(int64_t year, int month, int day) {
+  year -= month <= 2;
+  int64_t era = (year >= 0 ? year : year - 399) / 400;
+  int64_t year_of_era = year - era * 400;
+  int64_t day_of_year = (153 * (month > 2 ? month - 3 : month + 9) + 2) / 5 + day - 1;
+  int64_t day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+  return era * 146097 + day_of_era - 719468;
+}
+
+/**
+ * A datetime/smalldatetime as its wall clock in milliseconds since 1970-01-01,
+ * read as if it were UTC — the exact value format_temporal_value renders as
+ * text, so both forms decode to the same Date. Returns -1 if it cannot be cracked.
+ */
+static int wall_clock_ms(DBPROCESS *dbproc, int coltype, const BYTE *src, double *out) {
+  DBDATEREC2 di;
+  memset(&di, 0, sizeof(di));
+  if (dbanydatecrack(dbproc, &di, coltype, src) != SUCCEED) {
+    return -1;
+  }
+  // Sybase field naming (no MSDBLIB): month is 0-based.
+  int64_t days = days_from_civil((int64_t)di.dateyear, (int)di.datemonth + 1, (int)di.datedmonth);
+  int64_t seconds = (int64_t)di.datehour * 3600 + (int64_t)di.dateminute * 60 + (int64_t)di.datesecond;
+  int64_t ms = days * 86400000LL + seconds * 1000LL + (int64_t)di.datensecond / 1000000LL;
+  *out = (double)ms;
+  return 0;
+}
+
+/** Write `n` in decimal; returns the number of digits. */
+static int write_decimal(char *out, uint64_t n) {
+  char digits[20];
+  int count = 0;
+  do {
+    digits[count++] = (char)('0' + n % 10);
+    n /= 10;
+  } while (n);
+  for (int i = 0; i < count; i++) {
+    out[i] = digits[count - 1 - i];
+  }
+  return count;
+}
+
+/** An amount in ten-thousandths as `[-]whole.ffff`, the way db-lib renders money. */
+static int write_money(char *out, int negative, uint64_t units) {
+  int len = 0;
+  if (negative) {
+    out[len++] = '-';
+  }
+  len += write_decimal(out + len, units / 10000);
+  unsigned fraction = (unsigned)(units % 10000);
+  out[len++] = '.';
+  out[len++] = (char)('0' + fraction / 1000);
+  out[len++] = (char)('0' + fraction / 100 % 10);
+  out[len++] = (char)('0' + fraction / 10 % 10);
+  out[len++] = (char)('0' + fraction % 10);
+  return len;
+}
+
+/**
+ * Bytes a numeric of each precision (1-77) occupies on the wire: a sign byte,
+ * then the magnitude, big-endian, in the fewest bytes that hold 10^p - 1.
+ */
+static const unsigned char NUMERIC_BYTES[78] = {
+    1,  2,  2,  3,  3,  4,  4,  4,  5,  5,  6,  6,  6,  7,  7,  8,  8,  9,  9,  9,
+    10, 10, 11, 11, 11, 12, 12, 13, 13, 14, 14, 14, 15, 15, 16, 16, 16, 17, 17, 18,
+    18, 19, 19, 19, 20, 20, 21, 21, 21, 22, 22, 23, 23, 24, 24, 24, 25, 25, 26, 26,
+    26, 27, 27, 28, 28, 28, 29, 29, 30, 30, 31, 31, 31, 32, 32, 33, 33, 33};
+
+/**
+ * A numeric/decimal as db-lib renders it: `[-]digits[.fraction]`, exactly
+ * `scale` fraction digits, and a `0` before the point when there is no integer
+ * part. Returns -1 for a value it cannot read (left to dbconvert).
+ */
+static int write_numeric(char *out, const DBNUMERIC *num) {
+  int precision = num->precision;
+  int scale = num->scale;
+  if (precision < 1 || precision > 77 || scale > precision) {
+    return -1;
+  }
+
+  // The magnitude as 32-bit limbs, most significant first.
+  int magnitude_bytes = NUMERIC_BYTES[precision] - 1;
+  int limb_count = (magnitude_bytes + 3) / 4;
+  uint32_t limbs[8] = {0};
+  for (int b = 0; b < magnitude_bytes; b++) {
+    int from_low = magnitude_bytes - 1 - b;
+    limbs[limb_count - 1 - from_low / 4] |= (uint32_t)num->array[1 + b] << (8 * (from_low % 4));
+  }
+
+  // Decimal digits, least significant first, nine at a time.
+  char digits[81];
+  int count = 0;
+  int first = 0;
+  while (first < limb_count && limbs[first] == 0) {
+    first++;
+  }
+  while (first < limb_count) {
+    uint64_t remainder = 0;
+    for (int i = first; i < limb_count; i++) {
+      uint64_t current = (remainder << 32) | limbs[i];
+      limbs[i] = (uint32_t)(current / 1000000000u);
+      remainder = current % 1000000000u;
+    }
+    while (first < limb_count && limbs[first] == 0) {
+      first++;
+    }
+    for (int k = 0; k < 9; k++) {
+      digits[count++] = (char)('0' + remainder % 10);
+      remainder /= 10;
+    }
+  }
+  while (count > 0 && digits[count - 1] == '0') {
+    count--;
+  }
+
+  int len = 0;
+  if (num->array[0] == 1) {
+    out[len++] = '-';
+  }
+  if (count <= scale) {
+    out[len++] = '0';
+    if (scale > 0) {
+      out[len++] = '.';
+      for (int i = count; i < scale; i++) {
+        out[len++] = '0';
+      }
+    }
+    for (int i = count - 1; i >= 0; i--) {
+      out[len++] = digits[i];
+    }
+    return len;
+  }
+  for (int i = count - 1; i >= 0; i--) {
+    out[len++] = digits[i];
+    if (i == scale && scale > 0) {
+      out[len++] = '.';
+    }
+  }
+  return len;
+}
+
+/**
+ * Money and decimal as text, formatted here: dbconvert allocates a copy of
+ * every value and blank-pads its output, which made these the costliest
+ * columns to read. The output matches dbconvert's byte for byte. `out` needs
+ * 128 bytes. Returns -1 if the value is not in the expected form, for the
+ * caller to fall back to dbconvert.
+ */
+static int format_exact_numeric(int coltype, const BYTE *src, int datalen, char *out) {
+  switch (coltype) {
+    case SYBMONEY: {
+      DBMONEY money;
+      if (datalen != (int)sizeof(money)) {
+        return -1;
+      }
+      memcpy(&money, src, sizeof(money));
+      uint64_t bits = ((uint64_t)(uint32_t)money.mnyhigh << 32) | money.mnylow;
+      int negative = money.mnyhigh < 0;
+      return write_money(out, negative, negative ? (uint64_t)0 - bits : bits);
+    }
+    case SYBMONEY4: {
+      DBMONEY4 money;
+      if (datalen != (int)sizeof(money)) {
+        return -1;
+      }
+      memcpy(&money, src, sizeof(money));
+      uint32_t bits = (uint32_t)money.mny4;
+      int negative = money.mny4 < 0;
+      return write_money(out, negative, negative ? (uint32_t)0 - bits : bits);
+    }
+    case SYBNUMERIC:
+    case SYBDECIMAL: {
+      DBNUMERIC num;
+      if (datalen != (int)sizeof(num)) {
+        return -1;
+      }
+      memcpy(&num, src, sizeof(num));
+      return write_numeric(out, &num);
+    }
+    default:
+      return -1;
+  }
+}
+
+/** Make room for `extra` more bytes in a text/binary column. */
+static int reserve_bytes(ResultColumn *col, size_t extra) {
+  if (col->bytes_cap - col->bytes_len >= extra) {
+    return 0;
+  }
+  if (extra > SIZE_MAX - col->bytes_len) {
+    return -1;
+  }
+  size_t cap = col->bytes_cap > 0 ? col->bytes_cap : 4096;
+  while (cap - col->bytes_len < extra) {
+    if (cap > SIZE_MAX / 2) {
+      cap = col->bytes_len + extra;
+      break;
+    }
+    cap *= 2;
+  }
+  char *grown = (char *)realloc(col->bytes, cap);
+  if (!grown) {
+    return -1;
+  }
+  col->bytes = grown;
+  col->bytes_cap = cap;
+  return 0;
+}
+
+/** Size the per-row arrays of every column for `capacity` rows. */
+static int grow_rows(ResultColumn *columns, int num_columns, int capacity) {
+  for (int i = 0; i < num_columns; i++) {
+    ResultColumn *col = &columns[i];
+    unsigned char *nulls = (unsigned char *)realloc(col->nulls, (size_t)capacity);
+    if (!nulls) {
+      return -1;
+    }
+    col->nulls = nulls;
+    size_t size = kind_size(col->kind);
+    if (size > 0) {
+      unsigned char *fixed = (unsigned char *)realloc(col->fixed, (size_t)capacity * size);
+      if (!fixed) {
+        return -1;
+      }
+      col->fixed = fixed;
+    } else {
+      size_t *ends = (size_t *)realloc(col->ends, (size_t)capacity * sizeof(size_t));
+      if (!ends) {
+        return -1;
+      }
+      col->ends = ends;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Decode a fixed-width value from db-lib's binary form into `out`. The
+ * byte-length checks guard against a type whose wire size is not the one
+ * assumed here: reading it anyway would hand JS a wrong number.
+ * Returns -1 (with `w->error` set) on failure.
+ */
+static int store_fixed(QueryWork *w, ResultColumn *col, int coltype, const BYTE *src, int datalen,
+                       unsigned char *out) {
+  int ok = 1;
+  switch (col->kind) {
+    case KIND_INT32: {
+      int32_t v = 0;
+      if (coltype == SYBINT1 && datalen == 1) {
+        v = (int32_t)(*(const DBTINYINT *)src);  // tinyint is unsigned
+      } else if (coltype == SYBINT2 && datalen == 2) {
+        DBSMALLINT s;
+        memcpy(&s, src, sizeof(s));
+        v = s;
+      } else if (coltype == SYBINT4 && datalen == 4) {
+        memcpy(&v, src, sizeof(v));
+      } else {
+        ok = 0;
+      }
+      memcpy(out, &v, sizeof(v));
+      break;
+    }
+    case KIND_FLOAT64: {
+      double v = 0;
+      if (coltype == SYBFLT8 && datalen == 8) {
+        memcpy(&v, src, sizeof(v));
+      } else if (coltype == SYBREAL && datalen == 4) {
+        // Through the shortest text that round-trips the float, as db-lib's
+        // own conversion renders it ("%.9g"): 3.14 reads as 3.1400001, not
+        // the 3.140000104904175 a plain widening gives.
+        DBREAL f;
+        char text[32];
+        memcpy(&f, src, sizeof(f));
+        snprintf(text, sizeof(text), "%.9g", (double)f);
+        v = strtod(text, NULL);
+      } else if (coltype == TDS_USMALLINT && datalen == 2) {
+        uint16_t u;
+        memcpy(&u, src, sizeof(u));
+        v = (double)u;
+      } else if (coltype == TDS_UINT && datalen == 4) {
+        uint32_t u;
+        memcpy(&u, src, sizeof(u));
+        v = (double)u;
+      } else {
+        ok = 0;
+      }
+      memcpy(out, &v, sizeof(v));
+      break;
+    }
+    case KIND_INT64:
+    case KIND_UINT64:
+      if (datalen == 8) {
+        memcpy(out, src, 8);
+      } else {
+        ok = 0;
+      }
+      break;
+    case KIND_BOOL:
+      if (datalen == 1) {
+        *out = *src != 0;
+      } else {
+        ok = 0;
+      }
+      break;
+    case KIND_WALLCLOCK: {
+      double v = 0;
+      if (datalen <= 0 || wall_clock_ms(w->conn->dbproc, coltype, src, &v) != 0) {
+        snprintf(w->error, sizeof(w->error),
+                 "Could not decode %s column '%s' (%d bytes) into a wall clock",
+                 syb_type_name(coltype), col->name, datalen);
+        return -1;
+      }
+      memcpy(out, &v, sizeof(v));
+      break;
+    }
+    default:
+      ok = 0;
+      break;
+  }
+  if (!ok) {
+    snprintf(w->error, sizeof(w->error), "Unexpected %d-byte value in %s column '%s'", datalen,
+             syb_type_name(coltype), col->name);
+    return -1;
+  }
+  return 0;
+}
+
+/**
+ * Append a value as text, followed by the NUL that separates it from the next.
+ * Returns -1 (with `w->error` set) on failure.
+ */
+static int store_text(QueryWork *w, ResultColumn *col, int coltype, const BYTE *src, int datalen) {
+  char *dest;
+  int len;
+
+  if (coltype == SYBCHAR || coltype == SYBVARCHAR || coltype == SYBTEXT) {
+    // Already text: dbconvert would only copy it (after blank-padding the
+    // whole destination buffer).
+    if (reserve_bytes(col, (size_t)datalen + 1) != 0) {
+      goto oom;
+    }
+    dest = col->bytes + col->bytes_len;
+    memcpy(dest, src, (size_t)datalen);
+    len = datalen;
+  } else if (is_temporal_type(coltype)) {
+    // Date/time values are formatted here, never by dbconvert, which renders
+    // them through a locale-dependent format string that in several locales
+    // drops the seconds and milliseconds outright — see format_temporal_value.
+    // There is deliberately no fallback: falling back would reintroduce exactly
+    // the lossy, machine-dependent text this exists to remove, and the JS layer
+    // would then be handed a string it cannot parse. Failing the query says so
+    // directly.
+    const size_t size = 64;
+    if (reserve_bytes(col, size + 1) != 0) {
+      goto oom;
+    }
+    dest = col->bytes + col->bytes_len;
+    len = datalen > 0 ? format_temporal_value(w->conn->dbproc, coltype, src, dest, size) : -1;
+    if (len < 0) {
+      snprintf(w->error, sizeof(w->error),
+               "Could not decode %s column '%s' (%d bytes) into canonical text",
+               syb_type_name(coltype), col->name, datalen);
+      return -1;
+    }
+  } else {
+    // dbconvert blank-pads its output to the whole destination size, so that
+    // is kept to what the type can need. Money and decimal render in at most
+    // 41 characters (38 digits, sign, point and a leading zero); anything else
+    // gets room for the usual expansion, with an 8 KB floor for small values.
+    int is_exact_numeric = coltype == SYBMONEY || coltype == SYBMONEY4 ||
+                           coltype == SYBNUMERIC || coltype == SYBDECIMAL;
+    // dbconvert takes the destination size as an int.
+    if (datalen > (INT_MAX - 64) / 2) {
+      snprintf(w->error, sizeof(w->error), "%s value in column '%s' is too large (%d bytes)",
+               syb_type_name(coltype), col->name, datalen);
+      return -1;
+    }
+    int buf_size = is_exact_numeric ? 128 : datalen > 4096 ? datalen * 2 + 64 : 8192;
+    if (reserve_bytes(col, (size_t)buf_size) != 0) {
+      goto oom;
+    }
+    dest = col->bytes + col->bytes_len;
+    len = is_exact_numeric ? format_exact_numeric(coltype, src, datalen, dest) : -1;
+    if (len < 0) {
+      // A zero-length value is empty text. dbconvert would instead render it
+      // as db-lib's NULL substitute: `buf_size - 1` blanks.
+      len = datalen > 0 ? dbconvert(w->conn->dbproc, coltype, src, datalen, SYBCHAR, (BYTE *)dest,
+                                    buf_size - 1)
+                        : 0;
+    }
+    if (len < 0) {
+      len = 0;
+    }
+  }
+
+  // Trim trailing spaces for CHAR/NCHAR fixed-width types
+  if (coltype == SYBCHAR) {
+    while (len > 0 && dest[len - 1] == ' ') {
+      len--;
+    }
+  }
+  // A value ends at its first NUL, as it always has (values used to be
+  // NUL-terminated strings); it also keeps the separator unambiguous.
+  const char *nul = (const char *)memchr(dest, '\0', (size_t)len);
+  if (nul) {
+    len = (int)(nul - dest);
+  }
+  dest[len] = '\0';
+  col->bytes_len += (size_t)len;
+  col->ends[w->num_rows] = col->bytes_len;
+  col->bytes_len += 1;
+  return 0;
+
+oom:
+  snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
+  return -1;
+}
+
+/**
+ * Store column `i` of the current row. Returns -1 (with `w->error` set) on
+ * failure.
+ */
+static int store_cell(QueryWork *w, int i) {
+  ResultColumn *col = &w->columns[i];
+  int r = w->num_rows;
+  int colno = i + 1;
+  BYTE *src = dbdata(w->conn->dbproc, colno);
+  int datalen = dbdatlen(w->conn->dbproc, colno);
+  size_t size = kind_size(col->kind);
+
+  if (datalen == 0 && src == NULL) {
+    col->nulls[r] = 1;
+    col->has_nulls = 1;
+    if (size > 0) {
+      memset(col->fixed + (size_t)r * size, 0, size);
+    } else if (col->kind == KIND_TEXT) {
+      if (reserve_bytes(col, 1) != 0) {
+        snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
+        return -1;
+      }
+      col->ends[r] = col->bytes_len;
+      col->bytes[col->bytes_len++] = '\0';
+    } else {
+      col->ends[r] = col->bytes_len;
+    }
+    return 0;
+  }
+  col->nulls[r] = 0;
+
+  if (size > 0) {
+    // The resolved type, not dbcoltype(): a nullable unsigned column reports
+    // TDS_UINTN there, and only its size says which type it is.
+    return store_fixed(w, col, col->type, src, datalen, col->fixed + (size_t)r * size);
+  }
+  if (col->kind == KIND_BINARY) {
+    // Binary: keep the raw bytes. Converting to SYBCHAR would hand JS a hex
+    // string, which is neither what the schema declares nor what a write of
+    // the same value produces.
+    if (reserve_bytes(col, (size_t)datalen) != 0) {
+      snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
+      return -1;
+    }
+    if (datalen > 0) {
+      memcpy(col->bytes + col->bytes_len, src, (size_t)datalen);
+    }
+    col->bytes_len += (size_t)datalen;
+    col->ends[r] = col->bytes_len;
+    return 0;
+  }
+  return store_text(w, col, dbcoltype(w->conn->dbproc, colno), src, datalen);
+}
+
 static void query_execute(napi_env env, void *data) {
   (void)env;
   QueryWork *w = (QueryWork *)data;
@@ -1057,10 +1632,7 @@ static void query_execute(napi_env env, void *data) {
       if (!DBDEAD(w->conn->dbproc)) {
         dbcancel(w->conn->dbproc);
       }
-      free_columns(w->columns, w->num_columns, w->num_rows);
-      w->columns = NULL;
-      w->num_columns = 0;
-      w->num_rows = 0;
+      discard_results(w);
       w->success = 0;
       goto done;
     }
@@ -1094,6 +1666,7 @@ static void query_execute(napi_env env, void *data) {
     w->columns = (ResultColumn *)calloc(w->num_columns, sizeof(ResultColumn));
     if (!w->columns) {
       snprintf(w->error, sizeof(w->error), "Memory allocation failed for columns");
+      w->num_columns = 0;
       dbcancel(w->conn->dbproc);
       w->success = 0;
       goto done;
@@ -1103,12 +1676,10 @@ static void query_execute(napi_env env, void *data) {
       const char *colname = dbcolname(w->conn->dbproc, i + 1);
       w->columns[i].name = strdup(colname ? colname : "");
       w->columns[i].type = column_type(w->conn->dbproc, i + 1);
-      w->columns[i].values = NULL;
+      w->columns[i].kind = column_kind(w->columns[i].type, w->wall_clock_datetimes);
       if (!w->columns[i].name) {
         snprintf(w->error, sizeof(w->error), "Memory allocation failed for column names");
-        free_columns(w->columns, w->num_columns, 0);
-        w->columns = NULL;
-        w->num_columns = 0;
+        discard_results(w);
         dbcancel(w->conn->dbproc);
         w->success = 0;
         goto done;
@@ -1120,22 +1691,12 @@ static void query_execute(napi_env env, void *data) {
     w->num_rows = 0;
     int max_rows = w->max_rows > 0 ? w->max_rows : DEFAULT_MAX_ROWS;
 
-    for (int i = 0; i < w->num_columns; i++) {
-      w->columns[i].values = (char **)calloc(capacity, sizeof(char *));
-      if (w->columns[i].values && is_binary_type(w->columns[i].type)) {
-        w->columns[i].lengths = (int *)calloc(capacity, sizeof(int));
-      }
-      if (!w->columns[i].values ||
-          (is_binary_type(w->columns[i].type) && !w->columns[i].lengths)) {
-        snprintf(w->error, sizeof(w->error), "Memory allocation failed for rows");
-        free_columns(w->columns, w->num_columns, w->num_rows);
-        w->columns = NULL;
-        w->num_columns = 0;
-        w->num_rows = 0;
-        dbcancel(w->conn->dbproc);
-        w->success = 0;
-        goto done;
-      }
+    if (grow_rows(w->columns, w->num_columns, capacity) != 0) {
+      snprintf(w->error, sizeof(w->error), "Memory allocation failed for rows");
+      discard_results(w);
+      dbcancel(w->conn->dbproc);
+      w->success = 0;
+      goto done;
     }
 
     RETCODE row_code;
@@ -1146,10 +1707,7 @@ static void query_execute(napi_env env, void *data) {
         } else {
           snprintf(w->error, sizeof(w->error), "dbnextrow() failed");
         }
-        free_columns(w->columns, w->num_columns, w->num_rows);
-        w->columns = NULL;
-        w->num_columns = 0;
-        w->num_rows = 0;
+        discard_results(w);
         dbcancel(w->conn->dbproc);
         w->success = 0;
         goto done;
@@ -1172,155 +1730,23 @@ static void query_execute(napi_env env, void *data) {
 
       // Grow arrays if needed
       if (w->num_rows >= capacity) {
-        capacity *= 2;
-        if (capacity > max_rows) {
-          capacity = max_rows;
+        capacity = capacity > max_rows / 2 ? max_rows : capacity * 2;
+        if (grow_rows(w->columns, w->num_columns, capacity) != 0) {
+          snprintf(w->error, sizeof(w->error), "Memory realloc failed at row %d", w->num_rows);
+          discard_results(w);
+          dbcancel(w->conn->dbproc);
+          w->success = 0;
+          goto done;
         }
-        for (int i = 0; i < w->num_columns; i++) {
-          char **new_vals = (char **)realloc(w->columns[i].values, capacity * sizeof(char *));
-          if (!new_vals) {
-            snprintf(w->error, sizeof(w->error), "Memory realloc failed at row %d", w->num_rows);
-            free_columns(w->columns, w->num_columns, w->num_rows);
-            w->columns = NULL;
-            w->num_columns = 0;
-            w->num_rows = 0;
-            dbcancel(w->conn->dbproc);
-            w->success = 0;
-            goto done;
-          }
-          w->columns[i].values = new_vals;
-          if (w->columns[i].lengths) {
-            int *new_lens = (int *)realloc(w->columns[i].lengths, capacity * sizeof(int));
-            if (!new_lens) {
-              snprintf(w->error, sizeof(w->error), "Memory realloc failed at row %d", w->num_rows);
-              free_columns(w->columns, w->num_columns, w->num_rows);
-              w->columns = NULL;
-              w->num_columns = 0;
-              w->num_rows = 0;
-              dbcancel(w->conn->dbproc);
-              w->success = 0;
-              goto done;
-            }
-            w->columns[i].lengths = new_lens;
-          }
-        }
-      }
-
-      // Clear this row's slots first: realloc'd storage is uninitialized, and a
-      // failure partway through the row frees it with `num_rows + 1`, which
-      // must only see the values actually stored so far.
-      for (int i = 0; i < w->num_columns; i++) {
-        w->columns[i].values[w->num_rows] = NULL;
       }
 
       // Read column values
       for (int i = 0; i < w->num_columns; i++) {
-        int col = i + 1;
-        int datalen = dbdatlen(w->conn->dbproc, col);
-
-        if (datalen == 0 && dbdata(w->conn->dbproc, col) == NULL) {
-          w->columns[i].values[w->num_rows] = NULL;
-        } else if (w->columns[i].lengths) {
-          // Binary: keep the raw bytes. Converting to SYBCHAR would hand JS a
-          // hex string, which is neither what the schema declares nor what a
-          // write of the same value produces.
-          char *bytes = (char *)malloc(datalen > 0 ? (size_t)datalen : 1);
-          if (!bytes) {
-            snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
-            free_columns(w->columns, w->num_columns, w->num_rows + 1);
-            w->columns = NULL;
-            w->num_columns = 0;
-            w->num_rows = 0;
-            dbcancel(w->conn->dbproc);
-            w->success = 0;
-            goto done;
-          }
-          if (datalen > 0) {
-            memcpy(bytes, dbdata(w->conn->dbproc, col), (size_t)datalen);
-          }
-          w->columns[i].values[w->num_rows] = bytes;
-          w->columns[i].lengths[w->num_rows] = datalen;
-        } else {
-          int coltype = dbcoltype(w->conn->dbproc, col);
-          BYTE *src = dbdata(w->conn->dbproc, col);
-
-          // Dynamically size buffer: most conversions expand by at most 2x,
-          // but use at least 8192 to handle small columns without extra allocs.
-          int buf_size = datalen > 4096 ? (datalen * 2 + 64) : 8192;
-          char stack_buf[8192];
-          char *buf = (buf_size <= 8192) ? stack_buf : (char *)malloc(buf_size);
-          if (!buf) {
-            snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
-            free_columns(w->columns, w->num_columns, w->num_rows + 1);
-            w->columns = NULL;
-            w->num_columns = 0;
-            w->num_rows = 0;
-            dbcancel(w->conn->dbproc);
-            w->success = 0;
-            goto done;
-          }
-
-          int convlen;
-          if (is_temporal_type(coltype)) {
-            // Date/time values are formatted here, never by dbconvert, which
-            // renders them through a locale-dependent format string that in
-            // several locales drops the seconds and milliseconds outright — see
-            // format_temporal_value. There is deliberately no fallback: falling
-            // back would reintroduce exactly the lossy, machine-dependent text
-            // this exists to remove, and the JS layer would then be handed a
-            // string it cannot parse. Failing the query says so directly.
-            convlen = datalen > 0
-                          ? format_temporal_value(w->conn->dbproc, coltype, src, buf,
-                                                  (size_t)buf_size)
-                          : -1;
-            if (convlen < 0) {
-              snprintf(w->error, sizeof(w->error),
-                       "Could not decode %s column '%s' (%d bytes) into canonical text",
-                       syb_type_name(coltype), w->columns[i].name ? w->columns[i].name : "?",
-                       datalen);
-              if (buf != stack_buf) {
-                free(buf);
-              }
-              free_columns(w->columns, w->num_columns, w->num_rows + 1);
-              w->columns = NULL;
-              w->num_columns = 0;
-              w->num_rows = 0;
-              dbcancel(w->conn->dbproc);
-              w->success = 0;
-              goto done;
-            }
-          } else {
-            convlen = dbconvert(w->conn->dbproc, coltype, src, datalen,
-                                SYBCHAR, (BYTE *)buf, buf_size - 1);
-          }
-          if (convlen >= 0) {
-            buf[convlen] = '\0';
-            // Trim trailing spaces for CHAR/NCHAR fixed-width types
-            if (coltype == SYBCHAR) {
-              while (convlen > 0 && buf[convlen - 1] == ' ') {
-                buf[--convlen] = '\0';
-              }
-            }
-            w->columns[i].values[w->num_rows] = strdup(buf);
-          } else {
-            w->columns[i].values[w->num_rows] = strdup("");
-          }
-
-          if (buf != stack_buf) {
-            free(buf);
-          }
-
-          // A NULL here would be read back as SQL NULL — silently wrong data.
-          if (!w->columns[i].values[w->num_rows]) {
-            snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
-            free_columns(w->columns, w->num_columns, w->num_rows + 1);
-            w->columns = NULL;
-            w->num_columns = 0;
-            w->num_rows = 0;
-            dbcancel(w->conn->dbproc);
-            w->success = 0;
-            goto done;
-          }
+        if (store_cell(w, i) != 0) {
+          discard_results(w);
+          dbcancel(w->conn->dbproc);
+          w->success = 0;
+          goto done;
         }
       }
       w->num_rows++;
@@ -1340,10 +1766,7 @@ static void query_execute(napi_env env, void *data) {
              "Result exceeded %d rows; pass maxRows to accept a truncated result, "
              "or narrow the query",
              DEFAULT_MAX_ROWS);
-    free_columns(w->columns, w->num_columns, w->num_rows);
-    w->columns = NULL;
-    w->num_columns = 0;
-    w->num_rows = 0;
+    discard_results(w);
     w->success = 0;
     goto done;
   }
@@ -1356,10 +1779,7 @@ static void query_execute(napi_env env, void *data) {
   // paginated select, a skipped trailing `SET ROWCOUNT 0`).
   if (w->conn->has_error) {
     snprintf(w->error, sizeof(w->error), "%s", w->conn->last_error);
-    free_columns(w->columns, w->num_columns, w->num_rows);
-    w->columns = NULL;
-    w->num_columns = 0;
-    w->num_rows = 0;
+    discard_results(w);
     w->success = 0;
     goto done;
   }
@@ -1375,10 +1795,7 @@ rows_failed:
   } else {
     snprintf(w->error, sizeof(w->error), "dbnextrow() failed");
   }
-  free_columns(w->columns, w->num_columns, w->num_rows);
-  w->columns = NULL;
-  w->num_columns = 0;
-  w->num_rows = 0;
+  discard_results(w);
   w->success = 0;
 
 done:
@@ -1389,10 +1806,7 @@ done:
     snprintf(w->error, sizeof(w->error),
              "Query exceeded hard timeout of %d ms — connection forcefully cancelled",
              w->hard_timeout_ms);
-    free_columns(w->columns, w->num_columns, w->num_rows);
-    w->columns = NULL;
-    w->num_columns = 0;
-    w->num_rows = 0;
+    discard_results(w);
     w->success = 0;
   }
 
@@ -1407,6 +1821,151 @@ done:
   // NOT touch w->conn — query_complete will run on the JS thread but only
   // reads w->error / w->wd.fired / w->success, never w->conn->dbproc.
   work_release_conn(w);
+}
+
+#define NAPI_TRY(call)                  \
+  do {                                  \
+    napi_status try_status_ = (call);   \
+    if (try_status_ != napi_ok) {       \
+      return try_status_;               \
+    }                                   \
+  } while (0)
+
+/** Upper bound on the text bytes put in one JS string; see build_text_chunks. */
+#define TEXT_CHUNK_BYTES 16384
+
+/** A typed array over a copy of `length` elements of `elem_size` bytes. */
+static napi_status copy_typed_array(napi_env env, napi_typedarray_type type, const void *data,
+                                    size_t length, size_t elem_size, napi_value *out) {
+  void *dest = NULL;
+  napi_value buffer;
+  NAPI_TRY(napi_create_arraybuffer(env, length * elem_size, &dest, &buffer));
+  if (length > 0) {
+    memcpy(dest, data, length * elem_size);
+  }
+  return napi_create_typedarray(env, type, length, buffer, 0, out);
+}
+
+/**
+ * A text column as an array of strings, each holding consecutive values joined
+ * by `\0`, for JS to split. One string per value would cost several N-API calls
+ * per cell; one string for the whole column could pass V8's string length
+ * limit. Bounding the chunks also bounds what a single kept value can hold on
+ * to, since V8 may let a value split off a string share that string's storage.
+ */
+static napi_status build_text_chunks(napi_env env, const ResultColumn *col, int num_rows,
+                                     napi_value *out) {
+  NAPI_TRY(napi_create_array(env, out));
+  uint32_t count = 0;
+  size_t start = 0;
+  for (int r = 0; r < num_rows; r++) {
+    size_t end = col->ends[r];
+    if (end - start >= TEXT_CHUNK_BYTES || r == num_rows - 1) {
+      napi_value chunk;
+      NAPI_TRY(napi_create_string_utf8(env, col->bytes + start, end - start, &chunk));
+      NAPI_TRY(napi_set_element(env, *out, count++, chunk));
+      start = end + 1;  // past the separator
+    }
+  }
+  return napi_ok;
+}
+
+/**
+ * A binary column as one Buffer holding every value back to back, and a
+ * Float64Array of the offset just past each value (exact far beyond 4 GB). JS
+ * copies each value out into a Buffer of its own: that is several times cheaper
+ * than creating a Buffer per value through N-API.
+ */
+static napi_status build_binary(napi_env env, const ResultColumn *col, int num_rows,
+                                napi_value *bytes_out, napi_value *ends_out) {
+  static const char empty[1] = {0};
+  NAPI_TRY(napi_create_buffer_copy(env, col->bytes_len, col->bytes_len > 0 ? col->bytes : empty,
+                                   NULL, bytes_out));
+  void *data = NULL;
+  napi_value buffer;
+  NAPI_TRY(napi_create_arraybuffer(env, (size_t)num_rows * sizeof(double), &data, &buffer));
+  double *ends = (double *)data;
+  for (int r = 0; r < num_rows; r++) {
+    ends[r] = (double)col->ends[r];
+  }
+  return napi_create_typedarray(env, napi_float64_array, (size_t)num_rows, buffer, 0, ends_out);
+}
+
+/** `{ kind, values, nulls }` for one column (binary adds `ends`); see ValueKind. */
+static napi_status build_column(napi_env env, const ResultColumn *col, int num_rows,
+                                napi_value *out) {
+  napi_value kind, values, nulls;
+  size_t n = (size_t)num_rows;
+  NAPI_TRY(napi_create_object(env, out));
+  NAPI_TRY(napi_create_string_utf8(env, KIND_NAMES[col->kind], NAPI_AUTO_LENGTH, &kind));
+  NAPI_TRY(napi_set_named_property(env, *out, "kind", kind));
+
+  switch (col->kind) {
+    case KIND_TEXT:
+      NAPI_TRY(build_text_chunks(env, col, num_rows, &values));
+      break;
+    case KIND_BINARY: {
+      napi_value ends;
+      NAPI_TRY(build_binary(env, col, num_rows, &values, &ends));
+      NAPI_TRY(napi_set_named_property(env, *out, "ends", ends));
+      break;
+    }
+    case KIND_INT32:
+      NAPI_TRY(copy_typed_array(env, napi_int32_array, col->fixed, n, sizeof(int32_t), &values));
+      break;
+    case KIND_FLOAT64:
+    case KIND_WALLCLOCK:
+      NAPI_TRY(copy_typed_array(env, napi_float64_array, col->fixed, n, sizeof(double), &values));
+      break;
+    case KIND_INT64:
+      NAPI_TRY(copy_typed_array(env, napi_bigint64_array, col->fixed, n, sizeof(int64_t), &values));
+      break;
+    case KIND_UINT64:
+      NAPI_TRY(
+          copy_typed_array(env, napi_biguint64_array, col->fixed, n, sizeof(uint64_t), &values));
+      break;
+    case KIND_BOOL:
+      NAPI_TRY(copy_typed_array(env, napi_uint8_array, col->fixed, n, 1, &values));
+      break;
+  }
+  NAPI_TRY(napi_set_named_property(env, *out, "values", values));
+
+  if (col->has_nulls) {
+    NAPI_TRY(copy_typed_array(env, napi_uint8_array, col->nulls, n, 1, &nulls));
+  } else {
+    NAPI_TRY(napi_get_undefined(env, &nulls));
+  }
+  return napi_set_named_property(env, *out, "nulls", nulls);
+}
+
+/** `{ columns, columnTypes, data, rowCount, affectedRows }`. */
+static napi_status build_result(napi_env env, const QueryWork *w, napi_value *out) {
+  napi_value cols_arr, col_types_arr, data_arr, row_count, affected;
+  size_t ncols = (size_t)w->num_columns;
+  NAPI_TRY(napi_create_object(env, out));
+  NAPI_TRY(napi_create_array_with_length(env, ncols, &cols_arr));
+  NAPI_TRY(napi_create_array_with_length(env, ncols, &col_types_arr));
+  NAPI_TRY(napi_create_array_with_length(env, ncols, &data_arr));
+
+  // Column names, Sybase type names and values, in column order
+  for (int i = 0; i < w->num_columns; i++) {
+    napi_value col_name, col_type, col_data;
+    NAPI_TRY(napi_create_string_utf8(env, w->columns[i].name, NAPI_AUTO_LENGTH, &col_name));
+    NAPI_TRY(napi_set_element(env, cols_arr, (uint32_t)i, col_name));
+    NAPI_TRY(napi_create_string_utf8(env, syb_type_name(w->columns[i].type), NAPI_AUTO_LENGTH,
+                                     &col_type));
+    NAPI_TRY(napi_set_element(env, col_types_arr, (uint32_t)i, col_type));
+    NAPI_TRY(build_column(env, &w->columns[i], w->num_rows, &col_data));
+    NAPI_TRY(napi_set_element(env, data_arr, (uint32_t)i, col_data));
+  }
+
+  NAPI_TRY(napi_create_int32(env, w->num_rows, &row_count));
+  NAPI_TRY(napi_create_int32(env, w->affected_rows, &affected));
+  NAPI_TRY(napi_set_named_property(env, *out, "columns", cols_arr));
+  NAPI_TRY(napi_set_named_property(env, *out, "columnTypes", col_types_arr));
+  NAPI_TRY(napi_set_named_property(env, *out, "data", data_arr));
+  NAPI_TRY(napi_set_named_property(env, *out, "rowCount", row_count));
+  return napi_set_named_property(env, *out, "affectedRows", affected);
 }
 
 static void query_complete(napi_env env, napi_status status, void *data) {
@@ -1437,103 +1996,30 @@ static void query_complete(napi_env env, napi_status status, void *data) {
 
     napi_reject_deferred(env, w->deferred, error_obj);
   } else {
-    // Build result object
-    napi_value result, rows_arr, cols_arr, col_types_arr, row_count, affected;
-
-    napi_create_object(env, &result);
-    napi_create_array_with_length(env, w->num_rows, &rows_arr);
-    napi_create_array_with_length(env, w->num_columns, &cols_arr);
-    napi_create_array_with_length(env, w->num_columns, &col_types_arr);
-
-    // Column names and Sybase type names, in column order
-    for (int i = 0; i < w->num_columns; i++) {
-      napi_value col_name, col_type;
-      napi_create_string_utf8(env, w->columns[i].name, NAPI_AUTO_LENGTH, &col_name);
-      napi_set_element(env, cols_arr, i, col_name);
-      napi_create_string_utf8(env, syb_type_name(w->columns[i].type), NAPI_AUTO_LENGTH, &col_type);
-      napi_set_element(env, col_types_arr, i, col_type);
-    }
-
-    // Row objects with type-aware conversion
-    for (int r = 0; r < w->num_rows; r++) {
-      napi_value row;
-      napi_create_object(env, &row);
-
-      for (int c = 0; c < w->num_columns; c++) {
-        napi_value key, val;
-        napi_create_string_utf8(env, w->columns[c].name, NAPI_AUTO_LENGTH, &key);
-
-        if (w->columns[c].values[r] == NULL) {
-          napi_get_null(env, &val);
-        } else if (w->columns[c].lengths) {
-          napi_create_buffer_copy(env, (size_t)w->columns[c].lengths[r],
-                                  w->columns[c].values[r], NULL, &val);
-        } else {
-          int coltype = w->columns[c].type;
-          char *strval = w->columns[c].values[r];
-
-          if (coltype == SYBINT1 || coltype == SYBINT2 || coltype == SYBINT4) {
-            int intval = atoi(strval);
-            napi_create_int32(env, intval, &val);
-          } else if (coltype == SYBINT8) {
-            // bigint is 64-bit: up to 9223372036854775807, which a double
-            // cannot hold. A double silently rounds anything past 2^53
-            // (9007199254740993 reads back as 9007199254740992), so the value
-            // is handed over as a BigInt — the only exact JS integer type.
-            // Mixing a BigInt into number arithmetic throws rather than
-            // corrupting the result, which is the behaviour we want here.
-            long long llval = atoll(strval);
-            napi_create_bigint_int64(env, llval, &val);
-          } else if (coltype == TDS_USMALLINT || coltype == TDS_UINT) {
-            // Up to 4294967295: past int32, but exact in a double.
-            napi_create_double(env, (double)strtoul(strval, NULL, 10), &val);
-          } else if (coltype == TDS_UBIGINT) {
-            // Up to 18446744073709551615 — past even int64, so a uint64 BigInt.
-            napi_create_bigint_uint64(env, (uint64_t)strtoull(strval, NULL, 10), &val);
-          } else if (coltype == SYBFLT8 || coltype == SYBREAL) {
-            double dval = atof(strval);
-            napi_create_double(env, dval, &val);
-          } else if (coltype == SYBMONEY || coltype == SYBMONEY4 ||
-                     coltype == SYBNUMERIC || coltype == SYBDECIMAL) {
-            // Money and decimal: return as string to preserve precision
-            // (JavaScript number loses precision beyond ~15 digits)
-            napi_create_string_utf8(env, strval, NAPI_AUTO_LENGTH, &val);
-          } else if (coltype == SYBBIT) {
-            int bval = atoi(strval);
-            napi_get_boolean(env, bval != 0, &val);
-          } else {
-            napi_create_string_utf8(env, strval, NAPI_AUTO_LENGTH, &val);
-          }
-        }
-
-        napi_set_property(env, row, key, val);
+    napi_value result;
+    if (build_result(env, w, &result) == napi_ok) {
+      napi_resolve_deferred(env, w->deferred, result);
+    } else {
+      // Typically V8 running out of memory for a very large result.
+      bool pending = false;
+      napi_value error_obj;
+      napi_is_exception_pending(env, &pending);
+      if (pending) {
+        napi_get_and_clear_last_exception(env, &error_obj);
+      } else {
+        napi_value error_msg;
+        napi_create_string_utf8(env, "Could not hand the query result to JavaScript",
+                                NAPI_AUTO_LENGTH, &error_msg);
+        napi_create_error(env, NULL, error_msg, &error_obj);
       }
-      napi_set_element(env, rows_arr, r, row);
+      napi_reject_deferred(env, w->deferred, error_obj);
     }
-
-    napi_create_int32(env, w->num_rows, &row_count);
-    napi_create_int32(env, w->affected_rows, &affected);
-
-    napi_value key_rows, key_cols, key_col_types, key_rc, key_aff;
-    napi_create_string_utf8(env, "rows", NAPI_AUTO_LENGTH, &key_rows);
-    napi_create_string_utf8(env, "columns", NAPI_AUTO_LENGTH, &key_cols);
-    napi_create_string_utf8(env, "columnTypes", NAPI_AUTO_LENGTH, &key_col_types);
-    napi_create_string_utf8(env, "rowCount", NAPI_AUTO_LENGTH, &key_rc);
-    napi_create_string_utf8(env, "affectedRows", NAPI_AUTO_LENGTH, &key_aff);
-
-    napi_set_property(env, result, key_rows, rows_arr);
-    napi_set_property(env, result, key_cols, cols_arr);
-    napi_set_property(env, result, key_col_types, col_types_arr);
-    napi_set_property(env, result, key_rc, row_count);
-    napi_set_property(env, result, key_aff, affected);
-
-    napi_resolve_deferred(env, w->deferred, result);
   }
 
   // Cleanup — always runs regardless of success/failure
   // A cancelled work item never ran query_execute, so its slot is still held.
   work_release_conn(w);
-  free_columns(w->columns, w->num_columns, w->num_rows);
+  free_columns(w->columns, w->num_columns);
   free(w->sql);
   napi_delete_async_work(env, w->work);
   free(w);
@@ -1544,6 +2030,11 @@ static void query_complete(napi_env env, napi_status status, void *data) {
 // options.maxRows: cap rows materialized into JS (defaults to 1,000,000).
 // options.hardTimeoutMs: hard kill threshold for stuck queries. If unset
 //   we derive it from the connection's timeout (2x timeout, min 30s).
+// options.wallClockDateTimes: hand datetime/smalldatetime over as wall-clock
+//   numbers ("wallclock" kind) instead of canonical text.
+//
+// Resolves to the result column by column — see build_result; the JS layer
+// (src/native/index.ts) turns it into rows.
 static napi_value fn_query(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value args[3];
@@ -1608,6 +2099,14 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
       napi_typeof(env, v, &vtype);
       if (vtype == napi_number) {
         napi_get_value_int32(env, v, &w->hard_timeout_ms);
+      }
+
+      napi_get_named_property(env, args[2], "wallClockDateTimes", &v);
+      napi_typeof(env, v, &vtype);
+      if (vtype == napi_boolean) {
+        bool flag = false;
+        napi_get_value_bool(env, v, &flag);
+        w->wall_clock_datetimes = flag ? 1 : 0;
       }
     }
   }

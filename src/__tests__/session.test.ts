@@ -10,11 +10,13 @@ import { eq } from "drizzle-orm";
 import { describe, it, expect } from "vitest";
 
 import { datetime, money, varchar } from "../columns/index.js";
-import type { QueryResult } from "../connection.js";
+import type { QueryResult, SybaseQueryOptions } from "../connection.js";
 import { SybaseConnection } from "../connection.js";
 import { createSybaseDrizzle } from "../db.js";
 import type { SybasePoolConfig } from "../pool.js";
 import { SybasePool } from "../pool.js";
+import { toColumnarResult, toRowResult } from "../result.js";
+import type { NativeResult } from "../result.js";
 import { SybaseSession, SybaseTransactionSession } from "../session.js";
 import { sybaseTable } from "../table.js";
 
@@ -31,14 +33,34 @@ const config = {
 
 /** The canonical text `binding.c` produces for a datetime column. */
 const STORED = "2016-06-09 09:48:46.753";
+/** The same wall clock as the number `binding.c` hands over when asked for a zone. */
+const STORED_WALL_CLOCK = Date.UTC(2016, 5, 9, 9, 48, 46, 753);
 const AS_SYDNEY = "2016-06-08T23:48:46.753Z";
 const AS_UTC = "2016-06-09T09:48:46.753Z";
 
-const result = (overrides?: Partial<QueryResult>): QueryResult => ({
-  rows: [{ dt_rec_added: STORED, title: "SOME SONG", tot_pr_royalty: "0.0000" }],
+/**
+ * What the addon answers to a query, in the form it would given these options:
+ * datetime columns arrive as wall clocks only when a zone is asked for.
+ */
+const nativeAnswer = (options?: SybaseQueryOptions): NativeResult => ({
   columns: ["dt_rec_added", "title", "tot_pr_royalty"],
   columnTypes: ["datetime", "varchar", "money"],
+  data: [
+    options?.timeZone === undefined
+      ? { kind: "text", values: [STORED], nulls: undefined }
+      : { kind: "wallclock", values: Float64Array.of(STORED_WALL_CLOCK), nulls: undefined },
+    { kind: "text", values: ["SOME SONG"], nulls: undefined },
+    { kind: "text", values: ["0.0000"], nulls: undefined }
+  ],
   rowCount: 1,
+  affectedRows: 0
+});
+
+const result = (overrides?: Partial<QueryResult>): QueryResult => ({
+  rows: [],
+  columns: [],
+  columnTypes: [],
+  rowCount: 0,
   affectedRows: 0,
   ...overrides
 });
@@ -50,7 +72,7 @@ const result = (overrides?: Partial<QueryResult>): QueryResult => ({
  */
 const serverVar = (sql: string, vars: { tc?: number; iso?: number } = {}) => {
   const one = (key: string, value: number) =>
-    result({ rows: [{ [key]: value }], columns: [key], columnTypes: ["int"] });
+    result({ rows: [{ [key]: value }], columns: [key], columnTypes: ["int"], rowCount: 1 });
   if (sql.includes("@@trancount as tc")) {
     return one("tc", vars.tc ?? 1);
   }
@@ -60,18 +82,25 @@ const serverVar = (sql: string, vars: { tc?: number; iso?: number } = {}) => {
   return undefined;
 };
 
-/** Pool stub exposing only what the session touches. */
-const fakePool = (
-  queryResult: QueryResult = result(),
-  vars: { tc?: number; iso?: number } = {}
-) => {
+/**
+ * Pool stub exposing only what the session touches. Queries are answered the
+ * way the real connection would, decoding {@link nativeAnswer} with the options
+ * the session passed — so the tests see whether the zone reaches the decoder.
+ */
+const fakePool = (vars: { tc?: number; iso?: number } = {}) => {
   const executed: string[] = [];
+  const answer = async (sql: string, options?: SybaseQueryOptions) => {
+    executed.push(sql);
+    return serverVar(sql, vars) ?? toRowResult(nativeAnswer(options), options?.timeZone);
+  };
+  const answerColumns = async (sql: string, options?: SybaseQueryOptions) => {
+    executed.push(sql);
+    return toColumnarResult(nativeAnswer(options), options?.timeZone);
+  };
   const conn = {
     isConnected: true,
-    query: async (sql: string) => {
-      executed.push(sql);
-      return serverVar(sql, vars) ?? queryResult;
-    },
+    query: answer,
+    queryColumns: answerColumns,
     resetSessionState: async () => {
       executed.push("RESET");
       return { leftOpen: false };
@@ -80,10 +109,8 @@ const fakePool = (
   } as unknown as SybaseConnection;
   const pool = {
     logger: undefined,
-    query: async (sql: string) => {
-      executed.push(sql);
-      return queryResult;
-    },
+    query: answer,
+    queryColumns: answerColumns,
     acquire: async () => conn,
     release: () => {}
   } as unknown as SybasePool;
@@ -121,6 +148,14 @@ describe("SybaseSession datetime decoding", () => {
     expect(raw.columnTypes).toEqual(["datetime", "varchar", "money"]);
   });
 
+  it("decodes on executeColumns", async () => {
+    const { pool } = fakePool();
+    const { columns } = await new SybaseSession(pool, SYDNEY).executeColumns("select 1");
+    // Epoch milliseconds: the instant the row form's Date holds.
+    expect(columns[0]!.values).toEqual(Float64Array.of(Date.parse(AS_SYDNEY)));
+    expect(columns.map(column => column.type)).toEqual(["datetime", "varchar", "money"]);
+  });
+
   it("decodes inside a transaction, with the zone the session was given", async () => {
     const { pool } = fakePool();
     const rows = await new SybaseSession(pool, SYDNEY).transaction(async tx => {
@@ -130,17 +165,23 @@ describe("SybaseSession datetime decoding", () => {
     expect((rows[0]!.dt_rec_added as Date).toISOString()).toBe(AS_SYDNEY);
   });
 
-  it("decodes on a transaction session's executeRaw", async () => {
+  it("decodes on a transaction session's executeRaw and executeColumns", async () => {
     const { conn } = fakePool();
-    const raw = await new SybaseTransactionSession(conn, undefined, SYDNEY).executeRaw("select 1");
+    const tx = new SybaseTransactionSession(conn, undefined, SYDNEY);
+    const raw = await tx.executeRaw("select 1");
     expect((raw.rows[0]!.dt_rec_added as Date).toISOString()).toBe(AS_SYDNEY);
+    const { columns } = await tx.executeColumns("select 1");
+    expect(columns[0]!.values).toEqual(Float64Array.of(Date.parse(AS_SYDNEY)));
   });
 
-  it("surfaces a value the addon should never have produced", async () => {
-    const { pool } = fakePool(result({ rows: [{ dt_rec_added: "Jun  9 2016 09:48:46:753AM" }] }));
-    await expect(new SybaseSession(pool, SYDNEY).execute("select 1")).rejects.toThrow(
-      /Could not decode datetime column/
-    );
+  it("decodes on a pinned connection", async () => {
+    const { pool } = fakePool({ tc: 0 });
+    const [rows, columns] = await new SybaseSession(pool, SYDNEY).withConnection(async conn => [
+      (await conn.execute("select 1")).rows,
+      (await conn.executeColumns("select 1")).columns
+    ]);
+    expect((rows[0]!.dt_rec_added as Date).toISOString()).toBe(AS_SYDNEY);
+    expect(columns[0]!.values).toEqual(Float64Array.of(Date.parse(AS_SYDNEY)));
   });
 
   it.each([

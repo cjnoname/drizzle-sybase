@@ -12,9 +12,10 @@ import type {
   SybaseQueryOptions
 } from "./connection.js";
 import { emitQueryLog, readServerInt } from "./connection.js";
-import { decodeDateTimeColumns, resolveTimeZone } from "./datetime.js";
+import { resolveTimeZone } from "./datetime.js";
 import { SybaseConnectionError, SybaseError } from "./errors.js";
 import type { SybasePool } from "./pool.js";
+import type { SybaseColumnarResult } from "./result.js";
 import {
   endsTransaction,
   mayChangeIdentity,
@@ -71,38 +72,23 @@ export interface SybaseSessionQueryResult<T = Record<string, unknown>> {
 }
 
 /**
- * Decode a result's datetime columns to `Date`.
- *
- * Unconditional: `timeZone` selects which wall clock the stored values are read
- * in, it does not decide whether they are decoded at all. A driver that returned
- * `Date` or `string` depending on configuration would make every consumer handle
- * a union that the schema does not describe.
+ * The options of a session query: datetime columns decode to `Date` in the
+ * session's zone, unconditionally. `timeZone` selects which wall clock the
+ * stored values are read in, it does not decide whether they are decoded at
+ * all. A driver that returned `Date` or `string` depending on configuration
+ * would make every consumer handle a union that the schema does not describe.
  */
-const decodeResult = <T extends Record<string, unknown>>(
-  result: QueryResult<T>,
-  timeZone: string
-): QueryResult<T> => ({
-  ...result,
-  rows: decodeDateTimeColumns(result.rows, result.columns, result.columnTypes, timeZone)
+const inZone = (options: SybaseQueryOptions | undefined, timeZone: string): SybaseQueryOptions => ({
+  ...options,
+  timeZone
 });
 
-/**
- * Decode a result and project it onto the narrower shape `execute` returns.
- *
- * Shared by both session classes, which differ only in how they get hold of the
- * result — through the pool, or on the single connection a transaction holds.
- */
-const executeAndDecode = async <T extends Record<string, unknown>>(
-  run: () => Promise<QueryResult<T>>,
-  timeZone: string
-): Promise<SybaseSessionQueryResult<T>> => {
-  const result = decodeResult(await run(), timeZone);
-  return {
-    rows: result.rows,
-    rowCount: result.rowCount,
-    affectedRows: result.affectedRows
-  };
-};
+/** Project a result onto the narrower shape `execute` returns. */
+const toSessionResult = <T>(result: QueryResult<T>): SybaseSessionQueryResult<T> => ({
+  rows: result.rows,
+  rowCount: result.rowCount,
+  affectedRows: result.affectedRows
+});
 
 const TRANSACTION_ABORTED =
   "Transaction was rolled back by the server after an earlier statement failed";
@@ -147,14 +133,27 @@ export class SybaseSession {
     rawSql: string,
     options?: SybaseQueryOptions
   ): Promise<SybaseSessionQueryResult<T>> {
-    return executeAndDecode<T>(() => this.pool.query<T>(rawSql, options), this.timeZone);
+    return toSessionResult(await this.pool.query<T>(rawSql, inZone(options, this.timeZone)));
   }
 
   /**
    * Execute raw SQL and return the full result (including columns).
    */
   async executeRaw(rawSql: string, options?: SybaseQueryOptions): Promise<QueryResult> {
-    return decodeResult(await this.pool.query(rawSql, options), this.timeZone);
+    return this.pool.query(rawSql, inZone(options, this.timeZone));
+  }
+
+  /**
+   * Execute raw SQL and return the result column by column — for bulk reads
+   * (exports, Arrow / DuckDB / Parquet writers), where building an object per
+   * row is most of the cost. Values decode as in {@link execute}; see
+   * `SybaseColumnValues` for the array type of each column.
+   */
+  async executeColumns(
+    rawSql: string,
+    options?: SybaseQueryOptions
+  ): Promise<SybaseColumnarResult> {
+    return this.pool.queryColumns(rawSql, inZone(options, this.timeZone));
   }
 
   /**
@@ -358,14 +357,23 @@ export class SybaseConnectionSession {
     rawSql: string,
     options?: SybaseQueryOptions
   ): Promise<SybaseSessionQueryResult<T>> {
-    return executeAndDecode<T>(
-      () => this.serialize(() => this.run<T>(rawSql, options)),
-      this.timeZone
-    );
+    return toSessionResult(await this.serialize(() => this.run<T>(rawSql, options)));
   }
 
   async executeRaw(rawSql: string, options?: SybaseQueryOptions): Promise<QueryResult> {
-    return decodeResult(await this.serialize(() => this.run(rawSql, options)), this.timeZone);
+    return this.serialize(() => this.run(rawSql, options));
+  }
+
+  /** See {@link SybaseSession.executeColumns}. */
+  async executeColumns(
+    rawSql: string,
+    options?: SybaseQueryOptions
+  ): Promise<SybaseColumnarResult> {
+    return this.serialize(() =>
+      this.runWith(rawSql, false, () =>
+        this.conn.queryColumns(rawSql, inZone(options, this.timeZone))
+      )
+    );
   }
 
   /**
@@ -375,40 +383,38 @@ export class SybaseConnectionSession {
   async executeAtomic<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string
   ): Promise<SybaseSessionQueryResult<T>> {
-    return executeAndDecode<T>(
-      () =>
-        this.serialize(async () => {
-          const { rows } = await this.run<Record<string, unknown>>(
-            "select @@trancount as tc",
-            undefined,
-            true
-          );
-          const nested = (readServerInt(rows, "tc") ?? 0) > 0;
-          const savepoint = `${ATOMIC_SAVEPOINT_PREFIX}1`;
-          await this.run(nested ? `save tran ${savepoint}` : "BEGIN TRAN", undefined, true);
-          try {
-            const result = await this.run<T>(rawSql);
-            if (!nested) {
-              await this.run(COMMIT_SQL, undefined, true);
-            }
-            return result;
-          } catch (err) {
-            if (this.conn.isConnected) {
-              try {
-                await this.conn.query(
-                  nested
-                    ? `if @@trancount > 0 rollback tran ${savepoint}`
-                    : "if @@trancount > 0 rollback tran"
-                );
-              } catch {
-                // Partial work may remain — abandon the connection.
-                this.conn.close();
-              }
-            }
-            throw err;
+    return toSessionResult(
+      await this.serialize(async () => {
+        const { rows } = await this.run<Record<string, unknown>>(
+          "select @@trancount as tc",
+          undefined,
+          true
+        );
+        const nested = (readServerInt(rows, "tc") ?? 0) > 0;
+        const savepoint = `${ATOMIC_SAVEPOINT_PREFIX}1`;
+        await this.run(nested ? `save tran ${savepoint}` : "BEGIN TRAN", undefined, true);
+        try {
+          const result = await this.run<T>(rawSql);
+          if (!nested) {
+            await this.run(COMMIT_SQL, undefined, true);
           }
-        }),
-      this.timeZone
+          return result;
+        } catch (err) {
+          if (this.conn.isConnected) {
+            try {
+              await this.conn.query(
+                nested
+                  ? `if @@trancount > 0 rollback tran ${savepoint}`
+                  : "if @@trancount > 0 rollback tran"
+              );
+            } catch {
+              // Partial work may remain — abandon the connection.
+              this.conn.close();
+            }
+          }
+          throw err;
+        }
+      })
     );
   }
 
@@ -426,6 +432,17 @@ export class SybaseConnectionSession {
     /** Issued by this class itself, so known not to leave state behind. */
     internal = false
   ): Promise<QueryResult<T>> {
+    return this.runWith(rawSql, internal, () =>
+      this.conn.query<T>(rawSql, inZone(options, this.timeZone))
+    );
+  }
+
+  /** {@link run}, with the statement executed by `execute`. */
+  private async runWith<R extends { rowCount: number }>(
+    rawSql: string,
+    internal: boolean,
+    execute: () => Promise<R>
+  ): Promise<R> {
     if (this.ended) {
       throw new SybaseError("withConnection() has ended; statements must run inside its callback");
     }
@@ -440,7 +457,7 @@ export class SybaseConnectionSession {
     }
     const startTime = Date.now();
     try {
-      const result = await this.conn.query<T>(rawSql, options);
+      const result = await execute();
       emitQueryLog(this.logger, {
         sql: rawSql,
         durationMs: Date.now() - startTime,
@@ -552,14 +569,23 @@ export class SybaseTransactionSession {
     rawSql: string,
     options?: SybaseQueryOptions
   ): Promise<SybaseSessionQueryResult<T>> {
-    return executeAndDecode<T>(
-      () => this.serialize(() => this.run<T>(rawSql, options)),
-      this.timeZone
-    );
+    return toSessionResult(await this.serialize(() => this.run<T>(rawSql, options)));
   }
 
   async executeRaw(rawSql: string, options?: SybaseQueryOptions): Promise<QueryResult> {
-    return decodeResult(await this.serialize(() => this.run(rawSql, options)), this.timeZone);
+    return this.serialize(() => this.run(rawSql, options));
+  }
+
+  /** See {@link SybaseSession.executeColumns}. */
+  async executeColumns(
+    rawSql: string,
+    options?: SybaseQueryOptions
+  ): Promise<SybaseColumnarResult> {
+    return this.serialize(() =>
+      this.runWith(rawSql, false, () =>
+        this.conn.queryColumns(rawSql, inZone(options, this.timeZone))
+      )
+    );
   }
 
   /**
@@ -575,26 +601,24 @@ export class SybaseTransactionSession {
   async executeAtomic<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string
   ): Promise<SybaseSessionQueryResult<T>> {
-    return executeAndDecode<T>(
-      () =>
-        this.serialize(async () => {
-          const savepoint = `${ATOMIC_SAVEPOINT_PREFIX}${++this.savepoints}`;
-          await this.run(`save tran ${savepoint}`, undefined, true);
-          try {
-            return await this.run<T>(rawSql);
-          } catch (err) {
-            if (!this.aborted && this.conn.isConnected) {
-              try {
-                await this.conn.query(`rollback tran ${savepoint}`);
-              } catch {
-                // Partial work may remain in the transaction — abandon it.
-                this.conn.close();
-              }
+    return toSessionResult(
+      await this.serialize(async () => {
+        const savepoint = `${ATOMIC_SAVEPOINT_PREFIX}${++this.savepoints}`;
+        await this.run(`save tran ${savepoint}`, undefined, true);
+        try {
+          return await this.run<T>(rawSql);
+        } catch (err) {
+          if (!this.aborted && this.conn.isConnected) {
+            try {
+              await this.conn.query(`rollback tran ${savepoint}`);
+            } catch {
+              // Partial work may remain in the transaction — abandon it.
+              this.conn.close();
             }
-            throw err;
           }
-        }),
-      this.timeZone
+          throw err;
+        }
+      })
     );
   }
 
@@ -616,6 +640,17 @@ export class SybaseTransactionSession {
     /** Issued by this class itself, so known not to leave state behind. */
     internal = false
   ): Promise<QueryResult<T>> {
+    return this.runWith(rawSql, internal, () =>
+      this.conn.query<T>(rawSql, inZone(options, this.timeZone))
+    );
+  }
+
+  /** {@link run}, with the statement executed by `execute`. */
+  private async runWith<R extends { rowCount: number }>(
+    rawSql: string,
+    internal: boolean,
+    execute: () => Promise<R>
+  ): Promise<R> {
     if (this.ended) {
       throw new SybaseError(
         "Transaction has already ended; statements must run inside the transaction callback"
@@ -647,9 +682,9 @@ export class SybaseTransactionSession {
     if (!internal && mayCreateTempTable(rawSql)) {
       this._mayHaveCreatedTempTables = true;
     }
-    let result: QueryResult<T>;
+    let result: R;
     try {
-      result = await this.conn.query<T>(rawSql, options);
+      result = await execute();
       emitQueryLog(this.logger, {
         sql: rawSql,
         durationMs: Date.now() - startTime,

@@ -13,6 +13,8 @@ import {
   SybaseTimeoutError
 } from "./errors.js";
 import { native } from "./native/index.js";
+import type { NativeQueryOptions } from "./native/index.js";
+import type { SybaseColumnarResult } from "./result.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -140,6 +142,12 @@ export interface SybaseQueryOptions {
   maxRows?: number;
   /** Hard timeout in ms (see {@link SybaseConnectionConfig.hardTimeoutMs}). */
   hardTimeoutMs?: number;
+  /**
+   * @internal Decode `datetime` / `smalldatetime` columns to `Date`, reading
+   * their wall clock in this zone. Sessions set it from their configured zone;
+   * without it those columns come back as canonical text.
+   */
+  timeZone?: string;
 }
 
 /**
@@ -428,18 +436,39 @@ export class SybaseConnection {
     sql: string,
     options?: SybaseQueryOptions
   ): Promise<QueryResult<T>> {
+    return this.enqueue(sql, options, (handle, nativeOptions) =>
+      native.query(handle, sql, nativeOptions)
+    ) as Promise<QueryResult<T>>;
+  }
+
+  /**
+   * Like {@link query}, but the result column by column — for bulk reads, where
+   * building an object per row is most of the cost.
+   */
+  async queryColumns(sql: string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult> {
+    return this.enqueue(sql, options, (handle, nativeOptions) =>
+      native.queryColumns(handle, sql, nativeOptions)
+    );
+  }
+
+  private enqueue<R>(
+    sql: string,
+    options: SybaseQueryOptions | undefined,
+    run: (handle: unknown, nativeOptions: NativeQueryOptions) => Promise<R>
+  ): Promise<R> {
     validateQueryOptions(options);
     // Serialize queries on this connection — db-lib DBPROCESS is not reentrant.
-    const task = this.queryQueue.then(() => this.executeQuery<T>(sql, options));
+    const task = this.queryQueue.then(() => this.executeQuery(sql, options, run));
     // Update queue head; swallow rejections so subsequent queries still run.
     this.queryQueue = task.catch(() => {});
     return task;
   }
 
-  private async executeQuery<T = Record<string, unknown>>(
+  private async executeQuery<R>(
     sql: string,
-    options?: SybaseQueryOptions
-  ): Promise<QueryResult<T>> {
+    options: SybaseQueryOptions | undefined,
+    run: (handle: unknown, nativeOptions: NativeQueryOptions) => Promise<R>
+  ): Promise<R> {
     if (!this.handle || this.closed) {
       throw new SybaseConnectionError("Connection is closed", {
         host: this.config.host,
@@ -478,20 +507,19 @@ export class SybaseConnection {
       }
     });
 
-    const nativeOptions: { maxRows?: number; hardTimeoutMs?: number } = {};
+    const nativeOptions: NativeQueryOptions = {};
     if (options?.maxRows !== undefined) {
       nativeOptions.maxRows = options.maxRows;
     }
     if (nativeHardMs !== undefined) {
       nativeOptions.hardTimeoutMs = nativeHardMs;
     }
+    if (options?.timeZone !== undefined) {
+      nativeOptions.timeZone = options.timeZone;
+    }
 
     try {
-      const result = (await Promise.race([
-        native.query(this.handle, sql, nativeOptions),
-        timeoutPromise
-      ])) as unknown as QueryResult<T>;
-      return result;
+      return await Promise.race([run(this.handle, nativeOptions), timeoutPromise]);
     } catch (err: any) {
       // Native-side hard timeout — connection is dead.
       if (err && err.hardTimeout) {

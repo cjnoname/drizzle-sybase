@@ -28,6 +28,7 @@
  */
 import type { SQL } from "drizzle-orm";
 
+import type { SybaseQueryOptions } from "./connection.js";
 import { SybaseDialect } from "./dialect.js";
 import type { SybaseDialectConfig } from "./dialect.js";
 import type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
@@ -40,6 +41,7 @@ import {
 } from "./query-builders/index.js";
 import type { SybaseSelectField } from "./query-builders/index.js";
 import type { InitialSelectState, SybaseSelectFields } from "./query-builders/select-types.js";
+import type { SybaseColumnarResult } from "./result.js";
 import { SybaseSession } from "./session.js";
 import type {
   SybaseConnectionSession,
@@ -90,6 +92,22 @@ export interface SybaseDrizzle {
   executeRaw<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string
   ): Promise<{ rows: T[]; rowCount: number }>;
+  /**
+   * Execute SQL (a `sql` template or a raw string) and return the result column
+   * by column — for bulk reads such as exports to Arrow, DuckDB or Parquet,
+   * where building an object per row is most of the cost. Each column's values
+   * come as one array (a typed array for fixed-width numbers); see
+   * `SybaseColumnValues`.
+   *
+   * @example
+   * ```ts
+   * const { columns, rowCount } = await db.executeColumns(
+   *   sql`select id, name from users where id > ${lo} and id <= ${hi}`,
+   *   { maxRows: 5_000_000 }
+   * );
+   * ```
+   */
+  executeColumns(query: SQL | string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult>;
   /**
    * Run statements in a real database transaction.
    *
@@ -168,6 +186,8 @@ export interface SybaseDrizzleTx {
   executeRaw<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string
   ): Promise<{ rows: T[]; rowCount: number }>;
+  /** See {@link SybaseDrizzle.executeColumns}. */
+  executeColumns(query: SQL | string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +253,13 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
 
     async executeRaw<T extends Record<string, unknown>>(rawSql: string) {
       return on.execute<T>(rawSql);
+    },
+
+    async executeColumns(query: SQL | string, options?: SybaseQueryOptions) {
+      return on.executeColumns(
+        typeof query === "string" ? query : dialect.sqlToQuery(query),
+        options
+      );
     }
   });
 

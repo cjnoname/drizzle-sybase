@@ -12,7 +12,9 @@
  * accepts in a literal and which the native addon produces for every temporal
  * column (see `format_temporal_value` in `binding.c`). It deliberately does NOT
  * go through db-lib's own text rendering, which is locale-dependent and, in
- * several locales, silently drops the seconds and milliseconds.
+ * several locales, silently drops the seconds and milliseconds. Sessions skip
+ * the text for `datetime` / `smalldatetime`: the addon hands those over as the
+ * same wall clock in numeric form (see {@link resolveWallClocks}).
  *
  * DST is resolved the way `Temporal`'s `compatible` disambiguation does — see
  * {@link parseSybaseDateTime}.
@@ -371,10 +373,20 @@ export const parseSybaseDateTime = (text: string, timeZone = UTC): Date | undefi
     return undefined;
   }
 
+  const instant = instantFromWallClock(wallUtcMs, timeZone);
+  return Number.isNaN(instant) ? undefined : new Date(instant);
+};
+
+/**
+ * The instant (ms since the epoch) a wall clock denotes in `timeZone`, with the
+ * wall clock given as the ms it would be in UTC. `NaN` if it cannot be resolved.
+ * See {@link parseSybaseDateTime} for how DST is resolved.
+ */
+const instantFromWallClock = (wallUtcMs: number, timeZone: string): number => {
   // UTC has no transitions, so the wall clock is the instant. Taking the general
   // path would give the same answer for three times the cost.
   if (timeZone === UTC) {
-    return new Date(wallUtcMs);
+    return wallUtcMs;
   }
 
   // Fast path for the overwhelming majority of days: if the offset is the same a
@@ -385,13 +397,13 @@ export const parseSybaseDateTime = (text: string, timeZone = UTC): Date | undefi
   // window — which is what would make this unsound — does not occur in tzdata.
   const [dayBefore, dayAfter] = bracketsForDay(wallUtcMs, timeZone);
   if (dayBefore === dayAfter) {
-    return new Date(wallUtcMs - dayBefore * MS_PER_MINUTE);
+    return wallUtcMs - dayBefore * MS_PER_MINUTE;
   }
 
   const exact = possibleInstants(wallUtcMs, timeZone);
   if (exact.length > 0) {
     // Ambiguous wall clocks resolve to the earlier instant.
-    return new Date(exact[0]!);
+    return exact[0]!;
   }
 
   // In a gap. Advancing the wall clock by the size of the jump lands on the
@@ -400,8 +412,56 @@ export const parseSybaseDateTime = (text: string, timeZone = UTC): Date | undefi
   const [before, after] = bracketingOffsets(wallUtcMs, timeZone);
   const shifted = wallUtcMs + (after - before) * MS_PER_MINUTE;
   const resolved = possibleInstants(shifted, timeZone);
-  const instant = new Date(resolved.at(-1) ?? shifted - after * MS_PER_MINUTE);
-  return Number.isNaN(instant.getTime()) ? undefined : instant;
+  return new Date(resolved.at(-1) ?? shifted - after * MS_PER_MINUTE).getTime();
+};
+
+/**
+ * {@link instantFromWallClock} over a whole column of wall clocks, as the native
+ * addon hands datetime columns over, overwriting each with its instant (ms since
+ * the epoch). Slots marked in `nulls` are left as they are.
+ *
+ * Returns the index of the first wall clock that cannot be resolved — left as
+ * it was, so the caller can report it — or -1 when every one resolved.
+ *
+ * Consecutive values usually share a calendar day, so the day's offsets are
+ * looked up once per run of them rather than once per value.
+ *
+ * @internal
+ */
+export const resolveWallClocks = (
+  values: Float64Array,
+  nulls: Uint8Array | undefined,
+  timeZone: string
+): number => {
+  if (timeZone === UTC) {
+    return -1;
+  }
+  let day = Number.NaN;
+  let brackets: readonly [number, number] = [0, 0];
+  let failed = -1;
+  for (let i = 0; i < values.length; i++) {
+    if (nulls !== undefined && nulls[i] === 1) {
+      continue;
+    }
+    const wallUtcMs = values[i]!;
+    const valueDay = Math.floor(wallUtcMs / MS_PER_DAY);
+    if (valueDay !== day) {
+      day = valueDay;
+      brackets = bracketsForDay(wallUtcMs, timeZone);
+    }
+    const instant =
+      brackets[0] === brackets[1]
+        ? wallUtcMs - brackets[0] * MS_PER_MINUTE
+        : instantFromWallClock(wallUtcMs, timeZone);
+    if (Number.isNaN(instant)) {
+      if (failed < 0) {
+        failed = i;
+      }
+      continue;
+    }
+    values[i] = instant;
+  }
+  return failed;
 };
 
 /**
