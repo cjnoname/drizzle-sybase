@@ -141,6 +141,64 @@ Row results are built from the same column data, so `execute()` and
 `select()` are fast too; the column form saves building the row objects and
 hands numbers over without boxing them.
 
+### Straight to a file (CSV → DuckDB / Parquet)
+
+To land a large result rather than process it in JS, `db.executeToFile()`
+writes the rows to a CSV file as they arrive, on the native worker thread: one
+row is held at a time and no JS value is created, so memory does not grow with
+the number of rows (only with the largest single value) and the event loop
+stays free. The file is written beside `path` and renamed into place when the
+query succeeds: a failed query leaves an existing file untouched and no partial
+one behind, and a query whose connection was closed before it finished (as on a
+hard timeout) publishes nothing. The file is not fsynced: it is meant to be read
+right away (by DuckDB, or an upload), not to survive a crash of the machine.
+
+```ts
+const file = await db.executeToFile(sql`select id, name, created_at from users`, {
+  path: "/tmp/users.csv"
+});
+// { columns, columnTypes, rowCount, affectedRows, bytes }
+
+// DuckDB then turns it into Parquet:
+const types = {
+  int: "INTEGER",
+  smallint: "SMALLINT",
+  tinyint: "UTINYINT",
+  bigint: "BIGINT",
+  float: "DOUBLE",
+  real: "DOUBLE",
+  bit: "BOOLEAN",
+  datetime: "TIMESTAMP"
+};
+const columns = file.columns
+  .map((name, i) => `'${name}': '${types[file.columnTypes[i]] ?? "VARCHAR"}'`)
+  .join(", ");
+await duck.run(`copy (select * from read_csv('/tmp/users.csv', header = true, quote = '"', escape = '"',
+  nullstr = '', allow_quoted_nulls = false, auto_detect = false, columns = {${columns}}))
+  to '/tmp/users.parquet' (format parquet)`);
+```
+
+- **Format:** RFC 4180 CSV in UTF-8 with a header row. **NULL is an empty
+  unquoted field and the empty string is `""`**, so the two stay distinct with
+  `nullstr = ''` and `allow_quoted_nulls = false`.
+- **Values** are what a row result holds, as text: floats in the fewest
+  significant digits (15–17) that read back as exactly the same double, `bit` as `true`/`false`, `money` and `numeric`
+  exactly, datetime types as their stored wall clock (not converted to any
+  zone), binary as lowercase hex (empty bytes as `""`, like an empty string). Text that is not valid UTF-8 gets the same
+  U+FFFD replacement a JS string would.
+- **No default row cap** (rows are not accumulated); `maxRows` still truncates
+  if given. The query's `hardTimeoutMs` (default: twice the connection
+  `timeout`, at least 30 s) covers the whole export — set it for long ones.
+- Only the first result set is written. A batch with none (DML only) writes an
+  empty file, with `columns: []`.
+- It is also on `tx`, `withConnection`'s handle, `SybaseSession`
+  (`executeToFile`), `SybasePool` and `SybaseConnection` (`queryToFile`).
+
+Measured in AWS Lambda against ASE 16, 1M rows to Parquet: about 1.8 s via the
+file (main thread busy ~20 ms, peak RSS ~0.4 GB) against about 4.7 s via
+`executeColumns` and the DuckDB appender (main thread busy ~3 s, peak RSS
+1.1–1.6 GB).
+
 ## Why not `child_process` + `tsql`?
 
 |                | Old (tsql child_process)    | New (native db-lib)            |
@@ -219,10 +277,11 @@ This will:
 - **Raw multi-statement batches are not atomic**: after a statement-level error (e.g. a duplicate key) ASE carries on with the rest of the batch, so earlier and later statements may already be applied when the error is reported. Run such batches inside `db.transaction()` if they must be all-or-nothing
 - **Session state does not leak between pool users**: a connection always returns to the pool with no open transaction, `ROWCOUNT 0`, chained mode off, its original isolation level and the configured database. A raw statement outside `db.transaction()` that leaves a transaction open is rolled back and reported as an error — use `db.transaction()` instead. A connection that ran `setuser` is discarded rather than reused, since its original identity cannot be restored reliably. Other `SET` options (`dateformat`, `textsize`, ...) are not reset
 - **Inside `db.transaction()`, the callback must not end the transaction itself**: a batch containing `COMMIT` or a `ROLLBACK` without a savepoint name is refused before it is sent — once it ran, the rest of its batch would run in autocommit. A procedure that commits or rolls back cannot be seen in the SQL: the driver detects it after the call and refuses every later statement (what the procedure committed stays committed). Savepoints (`save tran x` / `rollback tran x`) are fine
-- **Results are capped at 1,000,000 rows**: a larger result fails rather than being silently cut short. Pass `maxRows` to accept a truncated result
+- **Results are capped at 1,000,000 rows**: a larger result fails rather than being silently cut short. Pass `maxRows` (`db.execute(query, { maxRows })`, also on `exec`, `executeRaw` and `executeColumns`) to raise the cap or accept a truncated result. `executeToFile` holds no rows and has no cap
 - **Packet size**: `packetSize` defaults to 2048, ASE's out-of-the-box `max network packet size`. A server whose limit was raised (e.g. to 4096) can take a larger value for fewer round-trips on big results; one whose limit was lowered (it can go down to 512) needs a smaller one. A request above the server's limit is refused with the same "Login failed" (Msg 4002) as a wrong password — the error message points this out
 - **Temporary tables do not outlive their query or transaction**: a `#temp` table created by a pool query is dropped when that query finishes (the next one may run on another connection), and one created inside `db.transaction()` is dropped when the transaction ends. To use one across several statements, run them in `db.withConnection(async conn => ...)`: one connection, no transaction, and its `#temp` tables are dropped when the callback returns. (Inside `db.transaction()` ASE only allows creating them when `ddl in tran` is enabled.)
 - **Identifiers**: Quoted with `[brackets]`
+- **Character sets**: on a server whose character set is `iso_1`, `char`/`varchar`/`text` hold Latin-1 bytes and are read and written as such — one byte per character, `é` as `0xE9` — so text written by other clients reads correctly and other clients read what the driver writes. A character past U+00FF cannot be held in those columns: string values containing one are sent as `U&'…'` literals, which store exactly into `unichar`/`univarchar`/`unitext` and which a `char`/`varchar` column refuses (Msg 2402) rather than storing garbled. Raw SQL text containing such a character (outside a `U&` literal) is refused before it is sent. `unichar`/`univarchar` are always read as Unicode. On a `utf8` server text is UTF-8 throughout; any other server character set is passed through unconverted, with a `DRIZZLE_SYBASE_CHARSET` warning. The character set is read when a connection opens (from `master..syscharsets`); if it cannot be read the connection fails rather than guess
 - **Date format**: `'YYYY-MM-DD HH:MM:SS.mmm'` (no T separator)
 
 ## Exact Numeric Types

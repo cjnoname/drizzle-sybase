@@ -591,8 +591,9 @@ describe("serializeValue edge cases", () => {
     expect(escapeString("")).toBe("''");
   });
 
+  // Past Latin-1, so a U& literal: an iso_1 server cannot take the text itself.
   it("handles unicode strings", () => {
-    expect(escapeString("你好世界")).toBe("'你好世界'");
+    expect(escapeString("你好世界")).toBe("U&'\\4f60\\597d\\4e16\\754c'");
   });
 
   it("handles strings with multiple special chars", () => {

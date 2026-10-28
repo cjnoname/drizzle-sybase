@@ -57,6 +57,10 @@ export const escapeTableName = (table: any): string => {
   return owner === undefined ? name : `${escapeName(owner)}.${name}`;
 };
 
+/** A character a Latin-1 SQL text cannot carry (see {@link escapeString}). */
+// eslint-disable-next-line no-control-regex
+const NON_LATIN1 = /[^\u0000-\u00ff]/;
+
 /**
  * Escape a string value for inline SQL (single-quote wrapping + escaping).
  *
@@ -64,13 +68,44 @@ export const escapeTableName = (table: any): string => {
  * - Single quotes (doubled)
  * - Null bytes (removed — Sybase db-lib cannot handle \0 in strings)
  * - Backslashes (kept as-is — Sybase does not use C-style escaping)
+ * - Characters past U+00FF: the string is written as a `U&'...'` literal with
+ *   those characters as `\XXXX` / `\+XXXXXX` escapes. A server whose character
+ *   set is iso_1 cannot take them in the SQL text itself, and would otherwise
+ *   receive each as several unrelated characters. The literal is unichar: it
+ *   stores exactly into unichar/univarchar/unitext, and a char/varchar column
+ *   that cannot hold the character makes the server refuse it (Msg 2402).
  */
 export const escapeString = (str: string): string => {
   // Remove null bytes which can cause truncation in db-lib
   // eslint-disable-next-line no-control-regex
   const sanitized = str.replace(/\u0000/g, "");
-  // Double single quotes for SQL escaping
-  return `'${sanitized.replace(/'/g, "''")}'`;
+  if (!NON_LATIN1.test(sanitized)) {
+    // Double single quotes for SQL escaping
+    return `'${sanitized.replace(/'/g, "''")}'`;
+  }
+  let body = "";
+  for (const char of sanitized) {
+    const code = char.codePointAt(0)!;
+    if (code >= 0xd800 && code <= 0xdfff) {
+      throw new Error(
+        `Cannot send a string holding an unpaired surrogate (U+${code.toString(16).toUpperCase()}) ` +
+          "to Sybase: it is not a character."
+      );
+    }
+    if (code > 0xffff) {
+      body += `\\+${code.toString(16).padStart(6, "0")}`;
+    } else if (code > 0xff) {
+      body += `\\${code.toString(16).padStart(4, "0")}`;
+    } else if (char === "\\") {
+      // The escape character of a U& literal.
+      body += "\\\\";
+    } else if (char === "'") {
+      body += "''";
+    } else {
+      body += char;
+    }
+  }
+  return `U&'${body}'`;
 };
 
 /**

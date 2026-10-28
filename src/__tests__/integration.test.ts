@@ -7,6 +7,9 @@
  * Or create a .env.test file (not committed to git).
  */
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { and, eq, sql } from "drizzle-orm";
@@ -44,8 +47,10 @@ import {
   varbinary,
   varchar
 } from "../columns/index.js";
+import { SybaseConnection } from "../connection.js";
 import { describeTimeZoneMismatch } from "../datetime.js";
 import { createSybaseDrizzle } from "../db.js";
+import { serializeValue } from "../dialect.js";
 import { SYBASE_TYPE_MAP, type ValueKind } from "../introspect/type-map.js";
 import { native } from "../native/index.js";
 import { SybasePool } from "../pool.js";
@@ -668,6 +673,346 @@ describe.skipIf(!hasConfig)("decoded value types match the type registry", () =>
 });
 
 /**
+ * Rows streamed to a CSV file: the file must hold exactly what the column path
+ * returns, in RFC 4180 form, with NULL and the empty string kept apart.
+ */
+describe.skipIf(!hasConfig)("rows streamed to a CSV file (live)", () => {
+  /** Strict RFC 4180: rows of fields, `null` for an empty unquoted field. */
+  const parseCsv = (text: string): (string | null)[][] => {
+    const rows: (string | null)[][] = [];
+    let row: (string | null)[] = [];
+    let i = 0;
+    while (i < text.length) {
+      let field: string | null;
+      if (text[i] === '"') {
+        let value = "";
+        i++;
+        for (;;) {
+          const close = text.indexOf('"', i);
+          if (close < 0) {
+            throw new Error("unterminated quoted field");
+          }
+          value += text.slice(i, close);
+          if (text[close + 1] === '"') {
+            value += '"';
+            i = close + 2;
+          } else {
+            i = close + 1;
+            break;
+          }
+        }
+        field = value;
+      } else {
+        let end = i;
+        while (end < text.length && text[end] !== "," && text[end] !== "\n") {
+          end++;
+        }
+        const raw = text.slice(i, end);
+        if (raw.includes('"') || raw.includes("\r")) {
+          throw new Error(`unquoted field holds a quote or CR: ${JSON.stringify(raw)}`);
+        }
+        field = raw === "" ? null : raw;
+        i = end;
+      }
+      row.push(field);
+      if (text[i] === ",") {
+        i++;
+      } else if (text[i] === "\n") {
+        rows.push(row);
+        row = [];
+        i++;
+      } else if (i < text.length) {
+        throw new Error(`unexpected ${JSON.stringify(text[i])} after a field`);
+      }
+    }
+    if (row.length > 0) {
+      throw new Error("last row has no line end");
+    }
+    return rows;
+  };
+
+  const EXPRS: [string, string][] = [
+    ["s", "'plain'"],
+    ["s_empty", "convert(varchar(5), '')"],
+    ["s_comma", "'a,b'"],
+    ["s_quote", "'say \"hi\"'"],
+    ["s_lf", "'line1' + char(10) + 'line2'"],
+    ["s_crlf", "'cr' + char(13) + char(10) + 'lf'"],
+    ["s_lead", "' lead'"],
+    ["s_trail", "'trail '"],
+    ["s_tab", "char(9) + 'tab'"],
+    ["s_onlyquote", "'\"'"],
+    ["s_nul", "'a' + char(0) + 'b'"],
+    // Bytes that are not UTF-8: the file carries the same U+FFFD a JS string gets.
+    ["s_latin", "'caf' + char(233)"],
+    [
+      "s_bad",
+      "'a' + char(226) + char(130) + 'b' + char(255) + char(240) + char(159) + char(152) + char(128) + char(237) + char(160) + char(128)"
+    ],
+    ["c_pad", "convert(char(6), 'ab')"],
+    ["ti", "convert(tinyint, 255)"],
+    ["si", "convert(smallint, -32768)"],
+    ["i", "convert(int, -2147483648)"],
+    ["bi", "convert(bigint, -9223372036854775808)"],
+    ["ubi", "convert(unsigned bigint, 18446744073709551615)"],
+    ["ui", "convert(unsigned int, 4294967295)"],
+    ["f", "convert(float, 0.1) + convert(float, 0.2)"],
+    ["f_small", "convert(float, 0.00001)"],
+    ["r", "convert(real, 3.14)"],
+    ["m", "convert(money, -922337203685477.5808)"],
+    ["n", "convert(numeric(38,10), -1234567890123456789012345678.0123456789)"],
+    ["dt", "convert(datetime, '2016-06-09 09:48:46.753')"],
+    ["sdt", "convert(smalldatetime, '2079-06-06 23:59')"],
+    ["d", "convert(date, '2016-06-09')"],
+    ["t", "convert(time, '23:59:59.997')"],
+    ["bdt", "convert(bigdatetime, '2016-06-09 09:48:46.123456')"],
+    ["vb", "convert(varbinary(4), 0xde2cad22)"]
+  ];
+  // Row 1 holds every value, row 2 a NULL in every column (bit cannot be NULL).
+  const EDGE_SQL = [
+    `select 1 as id, ${EXPRS.map(([n, e]) => `${e} as ${n}`).join(", ")}, convert(bit, 1) as b1, convert(bit, 0) as b0`,
+    `select 2, ${EXPRS.map(([, e]) => `case when 1 = 0 then ${e} end`).join(", ")}, convert(bit, 0), convert(bit, 1)`
+  ].join(" union all ");
+
+  let pool: SybasePool;
+  let dir: string;
+
+  beforeAll(() => {
+    pool = new SybasePool({ ...config, max: 1 });
+    dir = mkdtempSync(join(tmpdir(), "drizzle-sybase-csv-"));
+  });
+
+  afterAll(async () => {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The text the file must hold for a column-path value. */
+  const asText = (value: unknown): string | null =>
+    value === null ? null : Buffer.isBuffer(value) ? value.toString("hex") : String(value);
+
+  it("holds exactly what the column path returns", async () => {
+    const path = join(dir, "edge.csv");
+    const file = await pool.queryToFile(`${EDGE_SQL} order by 1`, { path });
+    const columnar = await pool.queryColumns(`${EDGE_SQL} order by 1`);
+    const text = readFileSync(path, "utf8");
+    expect(file.bytes).toBe(Buffer.byteLength(text));
+    expect(file.rowCount).toBe(2);
+    const [header, ...rows] = parseCsv(text);
+    expect(header).toEqual(columnar.columns.map(c => c.name));
+    expect(file.columnTypes).toEqual(columnar.columns.map(c => c.type));
+    for (let r = 0; r < rows.length; r++) {
+      columnar.columns.forEach((c, k) => {
+        const expected = c.nulls?.[r] === 1 ? null : c.values[r];
+        const got = rows[r]![k]!;
+        if (typeof expected === "number" && c.type !== "int") {
+          // Same double, not necessarily the same spelling (1e-05 vs 0.00001).
+          expect(Number(got), c.name).toBe(expected);
+        } else {
+          expect(got, `${c.name} row ${r}`).toBe(asText(expected));
+        }
+      });
+    }
+    // NULL and the empty string stay apart.
+    expect(rows[0]![header!.indexOf("s_empty")]).toBe("");
+    expect(rows[1]![header!.indexOf("s_empty")]).toBeNull();
+  });
+
+  it("streams a result far larger than its write buffer", async () => {
+    const path = join(dir, "big.csv");
+    const sql =
+      "select a.number * 2048 + b.number as id, replicate('x', b.number % 50) + ',\"' as s " +
+      "from master..spt_values a, master..spt_values b " +
+      "where a.type = 'P' and b.type = 'P' and a.number < 100";
+    const file = await pool.queryToFile(sql, { path });
+    const rows = parseCsv(readFileSync(path, "utf8")).slice(1);
+    expect(rows).toHaveLength(file.rowCount);
+    expect(file.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    const { rows: expected } = await pool.query<{ n: number; s: number }>(
+      `select count(*) as n, sum(convert(numeric(20,0), x.id)) as s from (${sql}) x`
+    );
+    expect(file.rowCount).toBe(expected[0]!.n);
+    expect(String(rows.reduce((acc, row) => acc + BigInt(row[0]!), 0n))).toBe(
+      String(expected[0]!.s)
+    );
+    expect(rows.every(row => row[1]!.endsWith(',"'))).toBe(true);
+  });
+
+  it("caps the rows only at an explicit maxRows", async () => {
+    const path = join(dir, "capped.csv");
+    const file = await pool.queryToFile("select name from sysobjects", { path, maxRows: 3 });
+    expect(file.rowCount).toBe(3);
+    expect(parseCsv(readFileSync(path, "utf8"))).toHaveLength(4);
+  });
+
+  /** Files in the directory other than the ones named, i.e. leftover temporaries. */
+  const strays = (...expected: string[]) =>
+    readdirSync(dir).filter(name => !expected.includes(name) && name.includes(".csv."));
+
+  it("leaves no file behind when the query fails", async () => {
+    const path = join(dir, "failed.csv");
+    await expect(
+      pool.queryToFile("select convert(int, name) as v from sysobjects", { path })
+    ).rejects.toThrow();
+    expect(existsSync(path)).toBe(false);
+    expect(strays()).toEqual([]);
+  });
+
+  // The file is written beside the target and renamed into place: a failed
+  // attempt (a retry, say) must not destroy the result of an earlier one.
+  it("keeps an existing file when a query fails, and replaces it only on success", async () => {
+    const path = join(dir, "kept.csv");
+    writeFileSync(path, "earlier result\n");
+    await expect(pool.queryToFile("select 1/0 as v", { path })).rejects.toThrow(/Msg 3607/);
+    expect(readFileSync(path, "utf8")).toBe("earlier result\n");
+    await pool.queryToFile("select 7 as v", { path });
+    expect(readFileSync(path, "utf8")).toBe("v\n7\n");
+    expect(strays("kept.csv")).toEqual([]);
+  });
+
+  // A connection closed mid-export is how the JS layer gives up on a query;
+  // the export must not appear afterwards as if it had succeeded.
+  it("publishes nothing once the connection is closed mid-export", async () => {
+    const path = join(dir, "abandoned.csv");
+    const conn = new SybaseConnection({ ...config });
+    await conn.connect();
+    const pending = conn.queryToFile("waitfor delay '00:00:02'\nselect 1 as v", { path });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    conn.close();
+    await expect(pending).rejects.toThrow();
+    // The native worker finishes its waitfor after the rejection; give it time.
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    expect(existsSync(path)).toBe(false);
+    expect(strays()).toEqual([]);
+  }, 20_000);
+
+  // An empty unquoted field is NULL, so empty bytes have to be quoted.
+  it("keeps empty binary apart from NULL", async () => {
+    const path = join(dir, "binary.csv");
+    // convert(image, null) reaches db-lib as empty bytes, not NULL; a NULL
+    // varbinary is a real NULL.
+    const sql =
+      "select convert(image, 0x01) as b, convert(varbinary(4), null) as n " +
+      "union all select convert(image, null), convert(varbinary(4), null)";
+    await pool.queryToFile(sql, { path });
+    const columnar = await pool.queryColumns(sql);
+    expect(columnar.columns[0]!.values).toEqual([Buffer.from([1]), Buffer.alloc(0)]);
+    expect(readFileSync(path, "utf8")).toBe('b,n\n01,\n"",\n');
+    expect(parseCsv(readFileSync(path, "utf8")).slice(1)).toEqual([
+      ["01", null],
+      ["", null]
+    ]);
+  });
+
+  it("rejects a path it cannot write", async () => {
+    await expect(
+      pool.queryToFile("select 1 as v", { path: join(dir, "missing-dir", "x.csv") })
+    ).rejects.toThrow(/Could not create/);
+  });
+
+  it.each([[""], ["a\0b.csv"]])("rejects the path %j before running anything", async path => {
+    await expect(pool.queryToFile("select 1 as v", { path })).rejects.toThrow(TypeError);
+  });
+});
+
+/**
+ * Text against a server whose character set is iso_1: single-byte text is
+ * Latin-1, one byte to one code point in both directions, and a character past
+ * U+00FF travels only as a U& literal.
+ */
+describe.skipIf(!hasConfig)("text encoding on an iso_1 server (live)", () => {
+  let pool: SybasePool;
+  let iso1 = false;
+
+  beforeAll(async () => {
+    pool = new SybasePool({ ...config, max: 1 });
+    const { rows } = await pool.query<{ cs: string }>(
+      "select name as cs from master..syscharsets where id = " +
+        "(select value from master..sysconfigures where config = 131)"
+    );
+    iso1 = rows[0]?.cs === "iso_1";
+  });
+
+  afterAll(async () => {
+    await pool.close();
+  });
+
+  const LATIN1_SQL =
+    "select 'caf' + char(233) as a, char(146) as b, char(255) as c, convert(char(4), char(233)) as d";
+
+  it("reads Latin-1 bytes as their code points, on every path", async ctx => {
+    if (!iso1) {
+      ctx.skip();
+    }
+    const expected = { a: "café", b: "\u0092", c: "ÿ", d: "é" };
+    expect((await pool.query(LATIN1_SQL)).rows).toEqual([expected]);
+    const columnar = await pool.queryColumns(LATIN1_SQL);
+    expect(Object.fromEntries(columnar.columns.map(c => [c.name, c.values[0]]))).toEqual(expected);
+    const dir = mkdtempSync(join(tmpdir(), "drizzle-sybase-enc-"));
+    try {
+      await pool.queryToFile(LATIN1_SQL, { path: join(dir, "a.csv") });
+      expect(readFileSync(join(dir, "a.csv"), "utf8")).toBe(`a,b,c,d\ncafé,\u0092,ÿ,é\n`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes Latin-1 as one byte per character and unichar text exactly", async ctx => {
+    if (!iso1) {
+      ctx.skip();
+    }
+    const session = new SybaseSession(pool);
+    await session.withConnection(async c => {
+      await c.execute("create table #enc (v varchar(20) null, u univarchar(20) null)");
+      await c.execute(
+        `insert into #enc values (${serializeValue("café ÿ")}, ${serializeValue("日本 😀 é")})`
+      );
+      const { rows } = await c.execute(
+        "select v, u, convert(varbinary(20), v) as vb, convert(varbinary(40), u) as ub from #enc"
+      );
+      expect(rows[0]!.v).toBe("café ÿ");
+      expect(rows[0]!.u).toBe("日本 😀 é");
+      expect((rows[0]!.vb as Buffer).toString("hex")).toBe(
+        Buffer.from("café ÿ", "latin1").toString("hex")
+      );
+      // univarchar is UTF-16 on the server, in its byte order.
+      const ub = rows[0]!.ub as Buffer;
+      expect([ub.toString("utf16le"), Buffer.from(ub).swap16().toString("utf16le")]).toContain(
+        "日本 😀 é"
+      );
+    });
+  });
+
+  it("refuses text a char column cannot hold, server side", async ctx => {
+    if (!iso1) {
+      ctx.skip();
+    }
+    const session = new SybaseSession(pool);
+    await session.withConnection(async c => {
+      await c.execute("create table #enc2 (v varchar(20) null)");
+      await expect(
+        c.execute(`insert into #enc2 values (${serializeValue("日本")})`)
+      ).rejects.toThrow(/Msg 2402/);
+    });
+  });
+
+  it("refuses raw SQL text that iso_1 cannot carry, before sending it", async ctx => {
+    if (!iso1) {
+      ctx.skip();
+    }
+    await expect(pool.query("select '日' as v")).rejects.toThrow(/U\+65E5 .*U&'\\65e5'/);
+  });
+
+  it("decodes column aliases and server messages too", async ctx => {
+    if (!iso1) {
+      ctx.skip();
+    }
+    expect((await pool.query("select 1 as [café]")).rows).toEqual([{ café: 1 }]);
+    await expect(pool.query("raiserror 20001 'bad café'")).rejects.toThrow(/bad café/);
+  });
+});
+
+/**
  * The column-by-column path end to end: the same values as the row path, typed
  * arrays where the type allows, and text runs split back correctly.
  */
@@ -746,6 +1091,19 @@ describe.skipIf(!hasConfig)("column-by-column results (live)", () => {
     }
   });
 
+  // Empty strings and NULLs spread across the addon's 16 KB runs, with long
+  // values pushing run boundaries between them.
+  it("cuts empty values and NULLs across run boundaries", async () => {
+    const sql =
+      "select number as n, case number % 4 when 0 then '' when 1 then null " +
+      "when 2 then replicate('y', 300) else 'é' + char(0) end as s " +
+      "from master..spt_values where type = 'P' order by number";
+    const { rows } = await pool.query<{ n: number; s: string | null }>(sql);
+    expect(rows.length).toBeGreaterThan(1000);
+    const expected = ["", null, "y".repeat(300), "é\u0000"];
+    expect(rows.every(({ n, s }) => s === expected[n % 4])).toBe(true);
+  });
+
   it("splits long text that spans many runs", async () => {
     // ~400 KB of text: many of the addon's 16 KB runs.
     const { rows } = await pool.query<{ n: number; s: string }>(
@@ -758,12 +1116,13 @@ describe.skipIf(!hasConfig)("column-by-column results (live)", () => {
     }
   });
 
-  it("decodes values as the row path always has", async () => {
+  it("decodes values exactly", async () => {
     const { rows } = await pool.query(
       "select convert(real, 3.14) as r, convert(char(5), 'ab') as c, " +
         "convert(text, null) as t, 'a' + char(0) + 'b' as nul"
     );
-    expect(rows).toEqual([{ r: 3.1400001, c: "ab", t: "", nul: "a" }]);
+    // A NUL is an ordinary character: the value is not cut short at it.
+    expect(rows).toEqual([{ r: 3.1400001, c: "ab", t: "", nul: "a\u0000b" }]);
   });
 });
 
@@ -1067,6 +1426,17 @@ describe.skipIf(!hasConfig)("drizzle API", () => {
       sql`SELECT COUNT(*) AS cnt FROM sysobjects WHERE type = ${"S"}`
     );
     expect(result.rows[0].cnt).toBeGreaterThan(0);
+  });
+
+  // The default 1,000,000-row cap can only be lifted (or lowered) per query.
+  it("passes query options through execute, exec and executeRaw", async () => {
+    const query = "SELECT name FROM sysobjects";
+    expect((await db.executeRaw(query, { maxRows: 2 })).rows).toHaveLength(2);
+    expect((await db.execute(sql.raw(query), { maxRows: 3 })).rows).toHaveLength(3);
+    expect((await db.exec(sql.raw(query), { maxRows: 1 })).rows).toHaveLength(1);
+    await db.transaction(async tx => {
+      expect((await tx.executeRaw(query, { maxRows: 2 })).rows).toHaveLength(2);
+    });
   });
 
   it("transaction works", async () => {

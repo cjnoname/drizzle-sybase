@@ -23,6 +23,17 @@ describe("native binding", () => {
     expect(typeof native.isAlive).toBe("function");
   });
 
+  it("exposes serverCharset function", () => {
+    expect(typeof native.serverCharset).toBe("function");
+  });
+
+  // A NUL would cut the path short in C and write somewhere else.
+  it.each([[undefined], [""], ["a\0b.csv"]])("rejects the file path %j before any query", path => {
+    expect(() => native.queryToFile({}, "select 1", { path } as { path: string })).toThrow(
+      TypeError
+    );
+  });
+
   it("returns FreeTDS version string", () => {
     const version = native.getVersion();
     expect(version).toContain("FreeTDS");
@@ -33,6 +44,11 @@ describe("native binding", () => {
   it.each([[{}], [42], [null], ["handle"]])("rejects %j as a connection handle", handle => {
     expect(() => native.close(handle)).toThrow(TypeError);
     expect(() => native.isAlive(handle)).toThrow(TypeError);
+    expect(() => native.serverCharset(handle)).toThrow(TypeError);
     expect(() => native.query(handle, "select 1")).toThrow(TypeError);
+    expect(() => native.queryColumns(handle, "select 1")).toThrow(TypeError);
+    expect(() => native.queryToFile(handle, "select 1", { path: "/tmp/never.csv" })).toThrow(
+      TypeError
+    );
   });
 });

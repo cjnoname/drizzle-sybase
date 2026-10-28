@@ -8,6 +8,7 @@
 import type {
   SybaseConnection,
   QueryResult,
+  SybaseFileQueryOptions,
   SybaseLogger,
   SybaseQueryOptions
 } from "./connection.js";
@@ -15,7 +16,7 @@ import { emitQueryLog, readServerInt } from "./connection.js";
 import { resolveTimeZone } from "./datetime.js";
 import { SybaseConnectionError, SybaseError } from "./errors.js";
 import type { SybasePool } from "./pool.js";
-import type { SybaseColumnarResult } from "./result.js";
+import type { SybaseColumnarResult, SybaseFileResult } from "./result.js";
 import {
   endsTransaction,
   mayChangeIdentity,
@@ -154,6 +155,17 @@ export class SybaseSession {
     options?: SybaseQueryOptions
   ): Promise<SybaseColumnarResult> {
     return this.pool.queryColumns(rawSql, inZone(options, this.timeZone));
+  }
+
+  /**
+   * Execute raw SQL and write the rows to a CSV file as they arrive — the
+   * cheapest way to land a large result, e.g. for DuckDB to turn into Parquet.
+   * Rows are not accumulated or turned into JS values. Datetimes are written as
+   * their stored wall clock, not converted to the session's zone. See
+   * `SybaseFileResult` for the format.
+   */
+  async executeToFile(rawSql: string, options: SybaseFileQueryOptions): Promise<SybaseFileResult> {
+    return this.pool.queryToFile(rawSql, options);
   }
 
   /**
@@ -376,6 +388,13 @@ export class SybaseConnectionSession {
     );
   }
 
+  /** See {@link SybaseSession.executeToFile}. */
+  async executeToFile(rawSql: string, options: SybaseFileQueryOptions): Promise<SybaseFileResult> {
+    return this.serialize(() =>
+      this.runWith(rawSql, false, () => this.conn.queryToFile(rawSql, options))
+    );
+  }
+
   /**
    * Execute a multi-statement batch all-or-nothing: in a transaction of its
    * own, or under a savepoint if the caller has opened one with raw SQL.
@@ -585,6 +604,13 @@ export class SybaseTransactionSession {
       this.runWith(rawSql, false, () =>
         this.conn.queryColumns(rawSql, inZone(options, this.timeZone))
       )
+    );
+  }
+
+  /** See {@link SybaseSession.executeToFile}. */
+  async executeToFile(rawSql: string, options: SybaseFileQueryOptions): Promise<SybaseFileResult> {
+    return this.serialize(() =>
+      this.runWith(rawSql, false, () => this.conn.queryToFile(rawSql, options))
     );
   }
 

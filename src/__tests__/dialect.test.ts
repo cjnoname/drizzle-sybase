@@ -34,6 +34,23 @@ describe("escapeString", () => {
     expect(escapeString("it's")).toBe("'it''s'");
     expect(escapeString("a'b'c")).toBe("'a''b''c'");
   });
+
+  // Latin-1 travels as itself; an iso_1 server takes it in the SQL text.
+  it("keeps Latin-1 text as a plain literal", () => {
+    expect(escapeString("café ÿ\u0092")).toBe("'café ÿ\u0092'");
+  });
+
+  // Anything past U+00FF would reach an iso_1 server as unrelated characters.
+  it("writes text past Latin-1 as a U& literal with escapes", () => {
+    expect(escapeString("日本")).toBe("U&'\\65e5\\672c'");
+    expect(escapeString("a😀b")).toBe("U&'a\\+01f600b'");
+    // Inside U&, the backslash is the escape character and quotes still double.
+    expect(escapeString("€ it's a\\b é")).toBe("U&'\\20ac it''s a\\\\b é'");
+  });
+
+  it("refuses an unpaired surrogate, which is not a character", () => {
+    expect(() => escapeString("a\ud83d")).toThrow(/unpaired surrogate/);
+  });
 });
 
 describe("serializeValue", () => {

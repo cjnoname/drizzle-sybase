@@ -4,7 +4,7 @@
  * ({@link SybaseColumnarResult}) or row objects.
  *
  * The addon does as little as possible on the JS thread: fixed-width values
- * arrive as one typed array per column and text as a few `\0`-joined strings
+ * arrive as one typed array per column and text as a few strings, cut by length,
  * per column (see `build_result` in `binding.c`). Rows are then built here by a
  * function compiled for the result's column list, which V8 turns into
  * straight-line object-literal allocation.
@@ -28,8 +28,11 @@ interface NativeColumnOf<K extends string, V> {
  * @internal
  */
 export type NativeColumn =
-  /** `values` holds runs of consecutive values joined by `\0`. */
-  | NativeColumnOf<"text", string[]>
+  /**
+   * `values` holds runs of consecutive values back to back; `units` each value's
+   * length in UTF-16 code units, by which the runs are cut.
+   */
+  | (NativeColumnOf<"text", string[]> & { units: Uint32Array })
   /** `values` holds every value back to back; `ends` the offset just past each. */
   | (NativeColumnOf<"binary", Buffer> & { ends: Float64Array })
   | NativeColumnOf<"int32", Int32Array>
@@ -109,35 +112,74 @@ export interface SybaseColumnarResult {
   affectedRows: number;
 }
 
+/**
+ * A result written to a CSV file rather than returned (`queryToFile` /
+ * `executeToFile`).
+ *
+ * The file is RFC 4180 CSV in UTF-8: a header row of column names, `,` between
+ * fields, `\n` after each row, a field quoted with `"` when it holds a comma,
+ * quote, line break or NUL, is empty, or starts or ends with a blank, and `"` doubled
+ * inside quotes. **NULL is an empty unquoted field; an empty string is `""`.**
+ * Values are what a row result holds, as text: numbers in decimal (floats in
+ * the fewest significant digits, 15–17, that read back as the same double),
+ * `bit` as `true`/`false`, `money` and `numeric` exactly, datetime types as
+ * their canonical text — the stored wall clock, not converted to any zone — and
+ * binary as lowercase hex, empty bytes as `""`.
+ *
+ * The file is written beside the target and renamed into place on success: a
+ * failed query leaves an existing file as it was and no partial one behind.
+ *
+ * DuckDB reads it with
+ * `read_csv(path, header = true, quote = '"', escape = '"', nullstr = '',
+ * allow_quoted_nulls = false, auto_detect = false, columns = {...})`, the column
+ * types chosen from {@link columnTypes}.
+ */
+export interface SybaseFileResult {
+  /** Column names, in file order. */
+  columns: string[];
+  /** Sybase system type name per column, in column order. */
+  columnTypes: string[];
+  /** Rows written (a number: may pass 2^31). */
+  rowCount: number;
+  affectedRows: number;
+  /** Bytes written. */
+  bytes: number;
+}
+
 /** A NULL marker that is set, read the way the addon writes it. */
 const isNull = (nulls: Uint8Array | undefined, row: number): boolean =>
   nulls !== undefined && nulls[row] === 1;
 
-/** Split a text column's `\0`-joined runs back into one value per row. */
-const splitText = (
+/** Cut a text column's runs back into one value per row, by each value's UTF-16 length. */
+const cutText = (
   name: string,
   runs: string[],
+  units: Uint32Array,
   nulls: Uint8Array | undefined,
   rowCount: number
 ): (string | null)[] => {
-  let values: (string | null)[];
-  if (runs.length === 1) {
-    values = runs[0]!.split("\0");
-  } else {
-    values = new Array<string | null>(rowCount);
-    let next = 0;
-    for (const run of runs) {
-      for (const value of run.split("\0")) {
-        values[next++] = value;
-      }
+  const values = new Array<string | null>(rowCount);
+  let row = 0;
+  for (const run of runs) {
+    let start = 0;
+    while (start < run.length && row < rowCount) {
+      const end = start + units[row]!;
+      values[row++] = run.slice(start, end);
+      start = end;
     }
-    values.length = next;
+    if (start !== run.length) {
+      row = -1;
+      break;
+    }
   }
-  // `"".split()` is `[""]`, so an empty result arrives as no runs at all.
-  if (values.length !== rowCount) {
+  // Empty values after the last non-empty one end no run.
+  while (row >= 0 && row < rowCount && units[row] === 0) {
+    values[row++] = "";
+  }
+  if (row !== rowCount) {
     throw new Error(
-      `drizzle-sybase: column ${JSON.stringify(name)} decoded to ${values.length} values for ` +
-        `${rowCount} rows. The native addon and the JS layer are out of sync — reinstall drizzle-sybase.`
+      `drizzle-sybase: column ${JSON.stringify(name)} does not cut into ${rowCount} values. ` +
+        "The native addon and the JS layer are out of sync — reinstall drizzle-sybase."
     );
   }
   if (nulls !== undefined) {
@@ -208,7 +250,14 @@ const decodeValues = (
 ): SybaseColumnValues => {
   switch (column.kind) {
     case "text":
-      return splitText(name, column.values, column.nulls, rowCount);
+      // An addon from an older build hands over \0-joined runs and no lengths.
+      if (!(column.units instanceof Uint32Array)) {
+        throw new Error(
+          "drizzle-sybase: the loaded native addon predates the JS layer (no text lengths in its " +
+            "result). Reinstall drizzle-sybase so the bundled addon matches."
+        );
+      }
+      return cutText(name, column.values, column.units, column.nulls, rowCount);
     case "binary":
       return splitBinary(column.values, column.ends, column.nulls);
     case "bool":

@@ -10,11 +10,13 @@ import {
   MAX_INT32,
   SybaseConnection,
   validateConnectionConfig,
+  validateFileQueryOptions,
   validateQueryOptions
 } from "./connection.js";
 import type {
   QueryResult,
   SybaseConnectionConfig,
+  SybaseFileQueryOptions,
   SybaseLogger,
   SybaseQueryOptions
 } from "./connection.js";
@@ -24,7 +26,7 @@ import {
   SybaseTimeoutError,
   SybasePoolError
 } from "./errors.js";
-import type { SybaseColumnarResult } from "./result.js";
+import type { SybaseColumnarResult, SybaseFileResult } from "./result.js";
 import {
   isReadOnlySql,
   mayChangeIdentity,
@@ -439,6 +441,15 @@ export class SybasePool {
    */
   async queryColumns(sql: string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult> {
     return this.run(sql, options, conn => conn.queryColumns(sql, options));
+  }
+
+  /**
+   * Like {@link query}, but the rows are written to a CSV file as they arrive
+   * (see {@link SybaseConnection.queryToFile}).
+   */
+  async queryToFile(sql: string, options: SybaseFileQueryOptions): Promise<SybaseFileResult> {
+    validateFileQueryOptions(options);
+    return this.run(sql, options, conn => conn.queryToFile(sql, options));
   }
 
   private async run<R extends { rowCount: number }>(

@@ -1,9 +1,12 @@
 /*
  * Differential check of format_exact_numeric (binding.c) against db-lib's own
  * dbconvert: every money, smallmoney and numeric value must render byte for
- * byte the same. Built and run by exact-numeric-format.test.ts.
+ * byte the same. Also checks that format_double writes `.` as the decimal point
+ * under a locale with a decimal comma. Built and run by exact-numeric-format.test.ts.
  */
 #include "binding.c"
+
+#include <locale.h>
 
 static uint64_t rng_state = 0x9e3779b97f4a7c15ULL;
 static uint64_t rnd(void) {
@@ -75,6 +78,29 @@ int main(void) {
         check(SYBDECIMAL, &num, sizeof(num), "decimal");
         n += 2;
       }
+    }
+  }
+  // A decimal-comma locale, where one is installed: the CSV writer must not
+  // emit "0,5", which reads as two fields.
+  const char *comma_locales[] = {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "fr_FR.utf8", "de_DE"};
+  for (size_t i = 0; i < sizeof(comma_locales) / sizeof(comma_locales[0]); i++) {
+    if (setlocale(LC_NUMERIC, comma_locales[i]) && localeconv()->decimal_point[0] == ',') {
+      double samples[] = {0.5, -1.25, 0.1 + 0.2, 1e-300, 123456.789};
+      for (size_t k = 0; k < sizeof(samples) / sizeof(samples[0]); k++) {
+        char buf[40];
+        int len = format_double(samples[k], buf, sizeof(buf));
+        setlocale(LC_NUMERIC, "C");
+        if (memchr(buf, ',', (size_t)len) || strtod(buf, NULL) != samples[k]) {
+          if (failures++ < 20) {
+            fprintf(stderr, "format_double under %s wrote [%.*s]\n", comma_locales[i], len, buf);
+          }
+        }
+        setlocale(LC_NUMERIC, comma_locales[i]);
+        n++;
+      }
+      setlocale(LC_NUMERIC, "C");
+      printf("decimal-comma locale %s checked\n", comma_locales[i]);
+      break;
     }
   }
   printf("checked %ld values, %ld mismatches\n", n, failures);

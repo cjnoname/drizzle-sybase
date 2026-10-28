@@ -20,9 +20,13 @@ const native = (columns: [name: string, type: string, column: NativeColumn][], r
 const mask = (...bits: number[]) => Uint8Array.from(bits);
 
 describe("text columns", () => {
-  it("splits runs back into one value per row, with NULLs in place", () => {
+  /** A text column as the addon hands it over: runs of values, cut by UTF-16 length. */
+  const text = (runs: string[], units: number[], nulls?: Uint8Array) =>
+    ({ kind: "text", values: runs, units: Uint32Array.from(units), nulls }) as const;
+
+  it("cuts runs back into one value per row, with NULLs in place", () => {
     const raw = native(
-      [["s", "varchar", { kind: "text", values: ["a\0\0c", "d\0"], nulls: mask(0, 0, 0, 0, 1) }]],
+      [["s", "varchar", text(["ac", "d"], [1, 0, 1, 1, 0], mask(0, 0, 0, 0, 1))]],
       5
     );
     expect(toColumnarResult(raw).columns[0]!.values).toEqual(["a", "", "c", "d", null]);
@@ -35,15 +39,48 @@ describe("text columns", () => {
     ]);
   });
 
+  // NUL is an ordinary character: nothing is cut at it.
+  it("keeps NULs and characters outside the BMP", () => {
+    const raw = native([["s", "varchar", text(["a\0b😀é"], [3, 2, 1])]], 3);
+    expect(toColumnarResult(raw).columns[0]!.values).toEqual(["a\0b", "😀", "é"]);
+  });
+
+  it.each([
+    ["only empty strings", [""], [0, 0, 0], undefined, ["", "", ""]],
+    ["only NULLs", [""], [0, 0], mask(1, 1), [null, null]],
+    // Empty values at the end of one run belong to no run in particular.
+    [
+      "empties around a run boundary",
+      ["ab", "c"],
+      [2, 0, 0, 1, 0],
+      mask(0, 0, 1, 0, 0),
+      ["ab", "", null, "c", ""]
+    ]
+  ])("cuts %s", (_name, runs, units, nulls, expected) => {
+    const raw = native(
+      [["s", "varchar", text(runs as string[], units as number[], nulls)]],
+      expected.length
+    );
+    expect(toColumnarResult(raw).columns[0]!.values).toEqual(expected);
+  });
+
+  it("refuses an addon that hands over no text lengths", () => {
+    const raw = native(
+      [["s", "varchar", { kind: "text", values: ["a\0b"], nulls: undefined } as never]],
+      2
+    );
+    expect(() => toRowResult(raw)).toThrow(/predates the JS layer/);
+  });
+
   it("decodes an empty result, which arrives as no runs at all", () => {
-    const raw = native([["s", "varchar", { kind: "text", values: [], nulls: undefined }]], 0);
+    const raw = native([["s", "varchar", text([], [])]], 0);
     expect(toColumnarResult(raw).columns[0]!.values).toEqual([]);
     expect(toRowResult(raw).rows).toEqual([]);
   });
 
-  it("refuses a column that does not split into one value per row", () => {
-    const raw = native([["s", "varchar", { kind: "text", values: ["a\0b"], nulls: undefined }]], 3);
-    expect(() => toRowResult(raw)).toThrow(/decoded to 2 values for 3 rows/);
+  it("refuses a column whose lengths do not match its runs", () => {
+    const raw = native([["s", "varchar", text(["ab"], [1, 2])]], 2);
+    expect(() => toRowResult(raw)).toThrow(/does not cut into 2 values/);
   });
 });
 
@@ -211,7 +248,13 @@ describe("rows", () => {
 
   it("keeps a column named __proto__ as a field, not the prototype", () => {
     const raw = native(
-      [["__proto__", "varchar", { kind: "text", values: ["x"], nulls: undefined }]],
+      [
+        [
+          "__proto__",
+          "varchar",
+          { kind: "text", values: ["x"], units: Uint32Array.of("x".length), nulls: undefined }
+        ]
+      ],
       1
     );
     const [row] = toRowResult(raw).rows;
@@ -221,7 +264,16 @@ describe("rows", () => {
 
   it("embeds any column name safely", () => {
     const name = `"]: 1 }; throw new Error("injected"); //\u2028\\`;
-    const raw = native([[name, "varchar", { kind: "text", values: ["v"], nulls: undefined }]], 1);
+    const raw = native(
+      [
+        [
+          name,
+          "varchar",
+          { kind: "text", values: ["v"], units: Uint32Array.of("v".length), nulls: undefined }
+        ]
+      ],
+      1
+    );
     expect(toRowResult(raw).rows[0]![name]).toBe("v");
   });
 });
@@ -244,8 +296,16 @@ describe("without code generation", () => {
     const raw = native(
       [
         ["n", "int", { kind: "int32", values: Int32Array.of(7, 0), nulls: mask(0, 1) }],
-        ["__proto__", "varchar", { kind: "text", values: ["x\0y"], nulls: undefined }],
-        ["generic_only", "varchar", { kind: "text", values: ["p\0q"], nulls: undefined }],
+        [
+          "__proto__",
+          "varchar",
+          { kind: "text", values: ["xy"], units: Uint32Array.of(1, 1), nulls: undefined }
+        ],
+        [
+          "generic_only",
+          "varchar",
+          { kind: "text", values: ["pq"], units: Uint32Array.of(1, 1), nulls: undefined }
+        ],
         ["dt", "datetime", { kind: "wallclock", values: Float64Array.of(0, 5), nulls: mask(1, 0) }]
       ],
       2

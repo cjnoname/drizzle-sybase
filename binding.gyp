@@ -17,7 +17,8 @@
         }],
         ["OS=='mac'", {
           "libraries": [
-            "<(module_root_dir)/deps/freetds/lib/libsybdb.a"
+            "<(module_root_dir)/deps/freetds/lib/libsybdb.a",
+            "-liconv"
           ],
           "xcode_settings": {
             "OTHER_LDFLAGS": [

@@ -28,7 +28,7 @@
  */
 import type { SQL } from "drizzle-orm";
 
-import type { SybaseQueryOptions } from "./connection.js";
+import type { SybaseFileQueryOptions, SybaseQueryOptions } from "./connection.js";
 import { SybaseDialect } from "./dialect.js";
 import type { SybaseDialectConfig } from "./dialect.js";
 import type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
@@ -41,7 +41,7 @@ import {
 } from "./query-builders/index.js";
 import type { SybaseSelectField } from "./query-builders/index.js";
 import type { InitialSelectState, SybaseSelectFields } from "./query-builders/select-types.js";
-import type { SybaseColumnarResult } from "./result.js";
+import type { SybaseColumnarResult, SybaseFileResult } from "./result.js";
 import { SybaseSession } from "./session.js";
 import type {
   SybaseConnectionSession,
@@ -80,17 +80,23 @@ export interface SybaseDrizzle {
   update<TTable extends AnySybaseTable>(table: TTable): SybaseUpdateBuilder<TTable>;
   /** Start a DELETE query. */
   delete<TTable extends AnySybaseTable>(table: TTable): SybaseDeleteBuilder<TTable>;
-  /** Execute raw SQL using Drizzle's `sql` template tag. */
+  /**
+   * Execute raw SQL using Drizzle's `sql` template tag. `options.maxRows` lets a
+   * result pass the default 1,000,000-row cap (or truncates it below that).
+   */
   execute<T extends Record<string, unknown> = Record<string, unknown>>(
-    query: SQL
+    query: SQL,
+    options?: SybaseQueryOptions
   ): Promise<{ rows: T[]; rowCount: number }>;
   /** Execute a stored procedure or raw SQL. */
   exec<T extends Record<string, unknown> = Record<string, unknown>>(
-    query: SQL
+    query: SQL,
+    options?: SybaseQueryOptions
   ): Promise<{ rows: T[]; rowCount: number }>;
   /** Execute a raw SQL string directly. */
   executeRaw<T extends Record<string, unknown> = Record<string, unknown>>(
-    rawSql: string
+    rawSql: string,
+    options?: SybaseQueryOptions
   ): Promise<{ rows: T[]; rowCount: number }>;
   /**
    * Execute SQL (a `sql` template or a raw string) and return the result column
@@ -108,6 +114,21 @@ export interface SybaseDrizzle {
    * ```
    */
   executeColumns(query: SQL | string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult>;
+  /**
+   * Execute SQL and write the rows to a CSV file as they arrive, without holding
+   * them or turning them into JS values — the cheapest way to land a large
+   * result, e.g. for DuckDB to convert to Parquet. See `SybaseFileResult` for the
+   * format; a failed query leaves no file.
+   *
+   * @example
+   * ```ts
+   * const { columns, columnTypes, rowCount } = await db.executeToFile(
+   *   sql`select id, name from users where id > ${lo} and id <= ${hi}`,
+   *   { path: "/tmp/users-0001.csv" }
+   * );
+   * ```
+   */
+  executeToFile(query: SQL | string, options: SybaseFileQueryOptions): Promise<SybaseFileResult>;
   /**
    * Run statements in a real database transaction.
    *
@@ -178,16 +199,21 @@ export interface SybaseDrizzleTx {
   update<TTable extends AnySybaseTable>(table: TTable): SybaseUpdateBuilder<TTable>;
   delete<TTable extends AnySybaseTable>(table: TTable): SybaseDeleteBuilder<TTable>;
   execute<T extends Record<string, unknown> = Record<string, unknown>>(
-    query: SQL
+    query: SQL,
+    options?: SybaseQueryOptions
   ): Promise<{ rows: T[]; rowCount: number }>;
   exec<T extends Record<string, unknown> = Record<string, unknown>>(
-    query: SQL
+    query: SQL,
+    options?: SybaseQueryOptions
   ): Promise<{ rows: T[]; rowCount: number }>;
   executeRaw<T extends Record<string, unknown> = Record<string, unknown>>(
-    rawSql: string
+    rawSql: string,
+    options?: SybaseQueryOptions
   ): Promise<{ rows: T[]; rowCount: number }>;
   /** See {@link SybaseDrizzle.executeColumns}. */
   executeColumns(query: SQL | string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult>;
+  /** See {@link SybaseDrizzle.executeToFile}. */
+  executeToFile(query: SQL | string, options: SybaseFileQueryOptions): Promise<SybaseFileResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,20 +269,30 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
       return new SybaseDeleteBuilder(table, dialect, on);
     },
 
-    async execute<T extends Record<string, unknown>>(query: SQL) {
-      return on.execute<T>(dialect.sqlToQuery(query));
+    async execute<T extends Record<string, unknown>>(query: SQL, options?: SybaseQueryOptions) {
+      return on.execute<T>(dialect.sqlToQuery(query), options);
     },
 
-    async exec<T extends Record<string, unknown>>(query: SQL) {
-      return on.execute<T>(dialect.sqlToQuery(query));
+    async exec<T extends Record<string, unknown>>(query: SQL, options?: SybaseQueryOptions) {
+      return on.execute<T>(dialect.sqlToQuery(query), options);
     },
 
-    async executeRaw<T extends Record<string, unknown>>(rawSql: string) {
-      return on.execute<T>(rawSql);
+    async executeRaw<T extends Record<string, unknown>>(
+      rawSql: string,
+      options?: SybaseQueryOptions
+    ) {
+      return on.execute<T>(rawSql, options);
     },
 
     async executeColumns(query: SQL | string, options?: SybaseQueryOptions) {
       return on.executeColumns(
+        typeof query === "string" ? query : dialect.sqlToQuery(query),
+        options
+      );
+    },
+
+    async executeToFile(query: SQL | string, options: SybaseFileQueryOptions) {
+      return on.executeToFile(
         typeof query === "string" ? query : dialect.sqlToQuery(query),
         options
       );

@@ -14,7 +14,7 @@ import {
 } from "./errors.js";
 import { native } from "./native/index.js";
 import type { NativeQueryOptions } from "./native/index.js";
-import type { SybaseColumnarResult } from "./result.js";
+import type { SybaseColumnarResult, SybaseFileResult } from "./result.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +150,12 @@ export interface SybaseQueryOptions {
   timeZone?: string;
 }
 
+/** Options for a query whose rows are written to a file (see {@link SybaseFileResult}). */
+export interface SybaseFileQueryOptions extends Omit<SybaseQueryOptions, "timeZone"> {
+  /** File to write; replaced only once the query has succeeded. */
+  path: string;
+}
+
 /**
  * A single integer server variable from a one-row result, or `undefined` if
  * the result is not shaped that way. `Number(null)` and `Number("")` are 0, so
@@ -221,6 +227,40 @@ export const validateConnectionConfig = (config: SybaseConnectionConfig): void =
 export const validateQueryOptions = (options: SybaseQueryOptions | undefined): void => {
   checkInteger("maxRows", options?.maxRows, 1, MAX_INT32);
   checkInteger("hardTimeoutMs", options?.hardTimeoutMs, 1, MAX_INT32);
+};
+
+/** Validate the options of a query written to a file. */
+/** @internal */
+export const validateFileQueryOptions = (options: SybaseFileQueryOptions | undefined): void => {
+  validateQueryOptions(options);
+  const path = (options as Partial<SybaseFileQueryOptions> | undefined)?.path;
+  if (typeof path !== "string" || path === "" || path.includes("\0")) {
+    throw new TypeError("path must be a non-empty string without NUL characters");
+  }
+};
+
+/** Character sets whose text is converted; any other is passed through (see `serverCharset`). */
+const CONVERTED_CHARSETS: ReadonlySet<string> = new Set(["iso_1", "utf8"]);
+
+/** Servers already warned about an unconverted character set. */
+const charsetWarned = new Set<string>();
+
+/**
+ * Warn — once per server — when its character set is one the driver does not
+ * convert: non-ASCII text then passes through as the server's raw bytes, which
+ * reads as U+FFFD and writes as the wrong characters.
+ */
+const warnOnUnconvertedCharset = (config: SybaseConnectionConfig, charset: string): void => {
+  const key = `${config.host}:${config.port}`;
+  if (CONVERTED_CHARSETS.has(charset) || charsetWarned.has(key)) {
+    return;
+  }
+  charsetWarned.add(key);
+  process.emitWarning(
+    `${key}: the server's character set is ${charset}, which drizzle-sybase does not convert ` +
+      "(only iso_1 and utf8): non-ASCII char/varchar/text values pass through as raw bytes.",
+    { code: "DRIZZLE_SYBASE_CHARSET" }
+  );
 };
 
 /** Servers already warned about, so a pool does not warn once per connection. */
@@ -368,6 +408,7 @@ export class SybaseConnection {
     }
     this.baseline = isolation;
     this.handle = handle;
+    warnOnUnconvertedCharset(this.config, native.serverCharset(handle));
     if (serverOffset !== undefined && this.config.warnOnTimeZoneMismatch !== false) {
       warnOnTimeZoneMismatch(this.config, serverOffset);
     }
@@ -451,6 +492,22 @@ export class SybaseConnection {
     );
   }
 
+  /**
+   * Like {@link query}, but the rows are written to a CSV file as they arrive
+   * — one row held at a time, never turned into JS values. See
+   * {@link SybaseFileResult} for the format. A failed query leaves no file.
+   */
+  async queryToFile(sql: string, options: SybaseFileQueryOptions): Promise<SybaseFileResult> {
+    validateFileQueryOptions(options);
+    return this.enqueue(sql, options, (handle, nativeOptions) =>
+      native.queryToFile(handle, sql, {
+        maxRows: nativeOptions.maxRows,
+        hardTimeoutMs: nativeOptions.hardTimeoutMs,
+        path: options.path
+      })
+    );
+  }
+
   private enqueue<R>(
     sql: string,
     options: SybaseQueryOptions | undefined,
@@ -490,8 +547,11 @@ export class SybaseConnection {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        // Mark dead so the pool will discard this connection on release.
-        this.closed = true;
+        // Close now rather than leave it to the pool: the native side then
+        // knows the caller has given up, and does not publish an export that
+        // finishes after this rejection (see queryToFile). The close is
+        // deferred natively until the stuck worker returns.
+        this.close();
         reject(
           new SybaseTimeoutError(
             `Query exceeded JS-side hard timeout of ${jsHardMs}ms; ` +

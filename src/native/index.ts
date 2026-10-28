@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import { resolveTimeZone } from "../datetime.js";
 import { toColumnarResult, toRowResult } from "../result.js";
-import type { NativeResult, SybaseColumnarResult } from "../result.js";
+import type { NativeResult, SybaseColumnarResult, SybaseFileResult } from "../result.js";
 
 export interface NativeQueryOptions {
   maxRows?: number;
@@ -69,18 +69,46 @@ export interface NativeBinding {
     sql: string,
     options?: NativeQueryOptions
   ): Promise<SybaseColumnarResult>;
+  /**
+   * Like {@link query}, but the rows are written to a CSV file as they arrive
+   * instead of being returned — see {@link SybaseFileResult} for the format.
+   * Rows are not accumulated, so only an explicit `maxRows` caps them.
+   * A failed query leaves no file behind.
+   */
+  queryToFile(
+    conn: unknown,
+    sql: string,
+    options: NativeFileQueryOptions
+  ): Promise<SybaseFileResult>;
   close(conn: unknown): void;
   isAlive(conn: unknown): boolean;
+  /**
+   * @internal The server's default character set (`iso_1`, `utf8`, ...), read
+   * when the connection opened; `""` for a closed handle. Text is converted for
+   * iso_1 and utf8, and passed through unconverted for any other.
+   */
+  serverCharset(conn: unknown): string;
   getVersion(): string;
 }
 
+/** Options of {@link NativeBinding.queryToFile}. */
+export interface NativeFileQueryOptions extends Omit<NativeQueryOptions, "timeZone"> {
+  /** File to write; replaced only once the query has succeeded. */
+  path: string;
+}
+
 /** The addon's own exports. Its `query` resolves to the result column by column. */
-interface NativeAddon extends Omit<NativeBinding, "query" | "queryColumns"> {
+interface NativeAddon extends Omit<NativeBinding, "query" | "queryColumns" | "queryToFile"> {
   query(
     conn: unknown,
     sql: string,
-    options: { maxRows?: number; hardTimeoutMs?: number; wallClockDateTimes: boolean }
-  ): Promise<NativeResult>;
+    options: {
+      maxRows?: number;
+      hardTimeoutMs?: number;
+      wallClockDateTimes?: boolean;
+      outputPath?: string;
+    }
+  ): Promise<NativeResult | SybaseFileResult>;
 }
 
 /**
@@ -93,22 +121,20 @@ const wrapAddon = (addon: NativeAddon): NativeBinding => {
   const run = (conn: unknown, sql: string, options: NativeQueryOptions | undefined) => {
     const timeZone =
       options?.timeZone === undefined ? undefined : resolveTimeZone(options.timeZone);
-    const pending = addon
-      .query(conn, sql, {
-        maxRows: options?.maxRows,
-        hardTimeoutMs: options?.hardTimeoutMs,
-        wallClockDateTimes: timeZone !== undefined
-      })
-      .then(raw => {
-        // An addon from an older build hands over rows instead.
-        if (!Array.isArray(raw.data)) {
-          throw new Error(
-            "drizzle-sybase: the loaded native addon predates the JS layer (no column data in " +
-              "its result). Reinstall drizzle-sybase so the bundled addon matches."
-          );
-        }
-        return raw;
-      });
+    const pending = (addon.query as (...args: unknown[]) => Promise<NativeResult>)(conn, sql, {
+      maxRows: options?.maxRows,
+      hardTimeoutMs: options?.hardTimeoutMs,
+      wallClockDateTimes: timeZone !== undefined
+    }).then(raw => {
+      // An addon from an older build hands over rows instead.
+      if (!Array.isArray(raw.data)) {
+        throw new Error(
+          "drizzle-sybase: the loaded native addon predates the JS layer (no column data in " +
+            "its result). Reinstall drizzle-sybase so the bundled addon matches."
+        );
+      }
+      return raw;
+    });
     return { pending, timeZone };
   };
   return {
@@ -121,8 +147,31 @@ const wrapAddon = (addon: NativeAddon): NativeBinding => {
       const { pending, timeZone } = run(conn, sql, options);
       return pending.then(raw => toColumnarResult(raw, timeZone));
     },
+    queryToFile: (conn, sql, options) => {
+      // Checked here, before anything runs: a NUL would cut the path short in C.
+      const path = (options as Partial<NativeFileQueryOptions> | undefined)?.path;
+      if (typeof path !== "string" || path === "" || path.includes("\0")) {
+        throw new TypeError("queryToFile: path must be a non-empty string without NUL characters");
+      }
+      return (
+        addon.query(conn, sql, {
+          maxRows: options.maxRows,
+          hardTimeoutMs: options.hardTimeoutMs,
+          outputPath: options.path
+        }) as Promise<SybaseFileResult>
+      ).then(result => {
+        if (typeof (result as Partial<SybaseFileResult>).bytes !== "number") {
+          throw new Error(
+            "drizzle-sybase: the loaded native addon predates queryToFile. Reinstall drizzle-sybase " +
+              "so the bundled addon matches."
+          );
+        }
+        return result;
+      });
+    },
     close: conn => addon.close(conn),
     isAlive: conn => addon.isAlive(conn),
+    serverCharset: conn => addon.serverCharset(conn),
     getVersion: () => addon.getVersion()
   };
 };

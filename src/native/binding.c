@@ -45,12 +45,16 @@
 #include <sybfront.h>
 #include <sybdb.h>
 #include <uv.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -149,6 +153,12 @@ typedef struct {
   uv_mutex_t lock;
   int in_flight;        // # of queries pinning this connection, from enqueue to completion
   int pending_close;    // 1 if fn_close was called while in_flight > 0
+  // 1 when the server's character set is iso_1: its single-byte
+  // text is Latin-1, decoded to UTF-8 on the way in and encoded on the way out.
+  // Fixed once the connection is open; see detect_server_charset.
+  int latin1;
+  // The server's default character set name, as syscharsets spells it.
+  char charset[32];
 } SybaseConnection;
 
 // Forward declarations.
@@ -288,6 +298,37 @@ static ConnHandle *get_conn_handle(napi_env env, napi_value value) {
 // state via dbgetuserdata().
 // ---------------------------------------------------------------------------
 
+/**
+ * Latin-1 bytes as UTF-8: one code point per byte, so it cannot fail and loses
+ * nothing. `out` needs room for 2 bytes per input byte. Returns the length.
+ */
+static size_t latin1_to_utf8(const unsigned char *in, size_t n, unsigned char *out) {
+  size_t len = 0;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char b = in[i];
+    if (b < 0x80) {
+      out[len++] = b;
+    } else {
+      out[len++] = (unsigned char)(0xC0 | (b >> 6));
+      out[len++] = (unsigned char)(0x80 | (b & 0x3F));
+    }
+  }
+  return len;
+}
+
+/** `text` as a new NUL-terminated string, decoded from Latin-1 when `latin1` is set. */
+static char *dup_text(const char *text, int latin1) {
+  if (!latin1) {
+    return strdup(text);
+  }
+  size_t n = strlen(text);
+  char *out = (char *)malloc(n * 2 + 1);
+  if (out) {
+    out[latin1_to_utf8((const unsigned char *)text, n, (unsigned char *)out)] = '\0';
+  }
+  return out;
+}
+
 static int err_handler(DBPROCESS *dbproc, int severity, int dberr,
                        int oserr, char *dberrstr, char *oserrstr) {
   (void)oserr;
@@ -354,9 +395,12 @@ static int msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate,
   if (conn) {
     size_t cur_len = strlen(conn->last_error);
     if (cur_len < ERR_BUF_SIZE - 200) {
+      // Server messages quote names and values in the server's character set.
+      char *text = dup_text(msgtext ? msgtext : "", conn->latin1);
       snprintf(conn->last_error + cur_len, ERR_BUF_SIZE - cur_len,
                "Msg %ld, Level %d, State %d: %s\n",
-               (long)msgno, severity, msgstate, msgtext);
+               (long)msgno, severity, msgstate, text ? text : msgtext);
+      free(text);
     }
     conn->has_error = 1;
   }
@@ -421,18 +465,22 @@ typedef struct {
   char *name;
   int type;
   ValueKind kind;
+  // Single-byte text in the server's Latin-1, to decode (see SybaseConnection.latin1).
+  int latin1;
   // One byte per row, 1 where the value is NULL.
   unsigned char *nulls;
   int has_nulls;
   // Fixed-width kinds: one value per row (0 where NULL).
   unsigned char *fixed;
   // Text and binary: the values back to back, and the offset just past each
-  // one. A text value is followed by a NUL, so a run of text values is already
-  // the `\0`-joined string JS splits.
+  // one. Text is always valid UTF-8 here (see store_text), and may hold NULs.
   char *bytes;
   size_t bytes_len;
   size_t bytes_cap;
   size_t *ends;
+  // Text: each value's length in UTF-16 code units, which is how JS cuts a run
+  // of values back into one string per value.
+  uint32_t *units;
 } ResultColumn;
 
 /** Whether a column carries raw bytes, handed to JS as a Buffer. */
@@ -659,6 +707,7 @@ static void free_columns(ResultColumn *columns, int num_columns) {
     free(columns[i].fixed);
     free(columns[i].bytes);
     free(columns[i].ends);
+    free(columns[i].units);
     free(columns[i].name);
   }
   free(columns);
@@ -682,6 +731,62 @@ typedef struct {
   char error[ERR_BUF_SIZE];
   int success;
 } ConnectWork;
+
+/**
+ * Learn the server's default character set and set `conn->latin1` from it.
+ *
+ * Single-byte text (char, varchar, text) reaches the client as the server's own
+ * bytes: ASE converts only to a character set it has installed, and FreeTDS only
+ * when the server announces one, which ASE does not do here. So the bytes have
+ * to be decoded knowing what they are. iso_1 bytes are Latin-1,
+ * decoded one byte to one code point — losslessly, and the way other readers of
+ * the same data (e.g. a Postgres replica loaded from it) decode them. A utf8
+ * server's bytes are already UTF-8. Any other character set is passed through
+ * as it always was; the JS layer warns about it (see `serverCharset`).
+ *
+ * Returns -1 (with `error` set) when the character set cannot be read: decoding
+ * text without knowing it would silently garble every non-ASCII value.
+ */
+static int detect_server_charset(SybaseConnection *conn, char *error, size_t error_size) {
+  conn->latin1 = 0;
+  conn->charset[0] = '\0';
+  clear_error(conn);
+  int ok = dbcmd(conn->dbproc,
+                 "select name from master..syscharsets where id = "
+                 "(select value from master..sysconfigures where config = 131)") != FAIL &&
+           dbsqlexec(conn->dbproc) != FAIL;
+  RETCODE rc = SUCCEED;
+  while (ok && (rc = dbresults(conn->dbproc)) != NO_MORE_RESULTS) {
+    if (rc == FAIL) {
+      ok = 0;
+      break;
+    }
+    RETCODE row;
+    while ((row = dbnextrow(conn->dbproc)) == REG_ROW) {
+      int len = dbdatlen(conn->dbproc, 1);
+      const char *name = (const char *)dbdata(conn->dbproc, 1);
+      if (name && len > 0 && (size_t)len < sizeof(conn->charset)) {
+        memcpy(conn->charset, name, (size_t)len);
+        conn->charset[len] = '\0';
+      }
+    }
+    if (row == FAIL) {
+      ok = 0;
+    }
+  }
+  if (!ok || conn->has_error || conn->charset[0] == '\0') {
+    // Bounded: the server's message may fill the whole buffer on its own.
+    snprintf(error, error_size, "Could not read the server's character set: %.3000s",
+             conn->has_error ? conn->last_error : "no name in master..syscharsets");
+    if (!DBDEAD(conn->dbproc)) {
+      dbcancel(conn->dbproc);
+    }
+    return -1;
+  }
+  conn->latin1 = strcmp(conn->charset, "iso_1") == 0;
+  clear_error(conn);
+  return 0;
+}
 
 static void connect_execute(napi_env env, void *data) {
   (void)env;
@@ -715,6 +820,10 @@ static void connect_execute(napi_env env, void *data) {
   DBSETLUSER(w->conn->login, w->username);
   DBSETLPWD(w->conn->login, w->password);
   DBSETLAPP(w->conn->login, "drizzle-sybase");
+  // unichar/univarchar arrive as UTF-16 and FreeTDS converts them to this. Set
+  // explicitly, or FreeTDS takes it from the process locale — which is "C" in
+  // Lambda, where a non-ASCII unichar value then comes back as '?'.
+  DBSETLCHARSET(w->conn->login, "UTF-8");
 
   // Set TDS version to 5.0 (Sybase ASE native)
   DBSETLVERSION(w->conn->login, DBVERSION_100);
@@ -789,6 +898,15 @@ static void connect_execute(napi_env env, void *data) {
     }
   }
 
+  if (detect_server_charset(w->conn, w->error, sizeof(w->error)) != 0) {
+    dbclose(w->conn->dbproc);
+    dbloginfree(w->conn->login);
+    uv_mutex_destroy(&w->conn->lock);
+    free(w->conn);
+    w->conn = NULL;
+    w->success = 0;
+    return;
+  }
   w->success = 1;
 }
 
@@ -937,6 +1055,16 @@ typedef struct {
   // 1 to hand datetime/smalldatetime over as wall-clock numbers (KIND_WALLCLOCK)
   // for the JS layer to turn into Dates, instead of as canonical text.
   int wall_clock_datetimes;
+  // Set to stream the result to a CSV file instead of collecting it (see
+  // csv_write_row); the rows are then never held, so no default row cap applies.
+  char *out_path;
+  // Written first, renamed to out_path only once the whole result is in it.
+  char *out_tmp;
+  FILE *out;
+  char *out_buf;
+  size_t out_len;
+  int64_t out_rows;
+  int64_t out_bytes;
   // Results
   ResultColumn *columns;
   int num_columns;
@@ -1306,6 +1434,13 @@ static int grow_rows(ResultColumn *columns, int num_columns, int capacity) {
         return -1;
       }
       col->ends = ends;
+      if (col->kind == KIND_TEXT) {
+        uint32_t *units = (uint32_t *)realloc(col->units, (size_t)capacity * sizeof(uint32_t));
+        if (!units) {
+          return -1;
+        }
+        col->units = units;
+      }
     }
   }
   return 0;
@@ -1403,22 +1538,104 @@ static int store_fixed(QueryWork *w, ResultColumn *col, int coltype, const BYTE 
 }
 
 /**
+ * Copy text as valid UTF-8, replacing each maximal invalid subsequence with
+ * U+FFFD — the WHATWG decoder's rule, which is what V8 applies when the same
+ * bytes become a JS string, so a file and a row result hold the same value.
+ * `out` needs room for 3 bytes per input byte. Returns the length written.
+ */
+static size_t utf8_sanitize(const unsigned char *in, size_t n, unsigned char *out) {
+  size_t len = 0, seq_start = 0;
+  int needed = 0, seen = 0;
+  unsigned char lower = 0x80, upper = 0xBF;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char b = in[i];
+    if (needed == 0) {
+      seq_start = i;
+      if (b <= 0x7F) {
+        out[len++] = b;
+      } else if (b >= 0xC2 && b <= 0xDF) {
+        needed = 1;
+      } else if (b >= 0xE0 && b <= 0xEF) {
+        lower = b == 0xE0 ? 0xA0 : 0x80;
+        upper = b == 0xED ? 0x9F : 0xBF;
+        needed = 2;
+      } else if (b >= 0xF0 && b <= 0xF4) {
+        lower = b == 0xF0 ? 0x90 : 0x80;
+        upper = b == 0xF4 ? 0x8F : 0xBF;
+        needed = 3;
+      } else {
+        out[len++] = 0xEF, out[len++] = 0xBF, out[len++] = 0xBD;
+      }
+      continue;
+    }
+    if (b < lower || b > upper) {
+      // The sequence so far is one invalid subpart; this byte starts afresh.
+      out[len++] = 0xEF, out[len++] = 0xBF, out[len++] = 0xBD;
+      needed = 0, seen = 0, lower = 0x80, upper = 0xBF;
+      i--;
+      continue;
+    }
+    lower = 0x80, upper = 0xBF;
+    if (++seen == needed) {
+      memcpy(out + len, in + seq_start, (size_t)needed + 1);
+      len += (size_t)needed + 1;
+      needed = 0, seen = 0;
+    }
+  }
+  if (needed > 0) {
+    out[len++] = 0xEF, out[len++] = 0xBF, out[len++] = 0xBD;
+  }
+  return len;
+}
+
+static int is_ascii(const char *text, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if ((unsigned char)text[i] >= 0x80) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/** Length in UTF-16 code units of valid UTF-8: one per code point, two past U+FFFF. */
+static uint32_t utf16_length(const unsigned char *utf8, size_t n) {
+  uint32_t units = 0;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char b = utf8[i];
+    units += (b & 0xC0) != 0x80;  // a code point starts here
+    units += b >= 0xF0;           // ... and needs a surrogate pair
+  }
+  return units;
+}
+
+/**
  * Append a value as text, followed by the NUL that separates it from the next.
  * Returns -1 (with `w->error` set) on failure.
  */
-static int store_text(QueryWork *w, ResultColumn *col, int coltype, const BYTE *src, int datalen) {
+static int store_text(QueryWork *w, ResultColumn *col, int r, int coltype, const BYTE *src,
+                      int datalen) {
   char *dest;
   int len;
 
   if (coltype == SYBCHAR || coltype == SYBVARCHAR || coltype == SYBTEXT) {
     // Already text: dbconvert would only copy it (after blank-padding the
-    // whole destination buffer).
-    if (reserve_bytes(col, (size_t)datalen + 1) != 0) {
+    // whole destination buffer). Latin-1 grows to at most 2 bytes per byte,
+    // and the result must still fit an int length.
+    if (col->latin1 && datalen > (INT_MAX - 1) / 2) {
+      snprintf(w->error, sizeof(w->error), "%s value in column '%s' is too large (%d bytes)",
+               syb_type_name(coltype), col->name, datalen);
+      return -1;
+    }
+    if (reserve_bytes(col, (size_t)datalen * (col->latin1 ? 2 : 1) + 1) != 0) {
       goto oom;
     }
     dest = col->bytes + col->bytes_len;
-    memcpy(dest, src, (size_t)datalen);
-    len = datalen;
+    if (col->latin1) {
+      len = (int)latin1_to_utf8(src, (size_t)datalen, (unsigned char *)dest);
+    } else {
+      memcpy(dest, src, (size_t)datalen);
+      len = datalen;
+    }
   } else if (is_temporal_type(coltype)) {
     // Date/time values are formatted here, never by dbconvert, which renders
     // them through a locale-dependent format string that in several locales
@@ -1476,16 +1693,28 @@ static int store_text(QueryWork *w, ResultColumn *col, int coltype, const BYTE *
       len--;
     }
   }
-  // A value ends at its first NUL, as it always has (values used to be
-  // NUL-terminated strings); it also keeps the separator unambiguous.
-  const char *nul = (const char *)memchr(dest, '\0', (size_t)len);
-  if (nul) {
-    len = (int)(nul - dest);
+  // Make it valid UTF-8, the way V8 would when the bytes become a JS string,
+  // so that every path — rows, columns, a CSV file — holds the same value and
+  // its UTF-16 length is known here. Latin-1 decoding is valid already.
+  size_t n = (size_t)len;
+  if (!col->latin1 && !is_ascii(dest, n)) {
+    char *raw = (char *)malloc(n);
+    if (!raw) {
+      goto oom;
+    }
+    memcpy(raw, dest, n);
+    if (reserve_bytes(col, n * 3) != 0) {
+      free(raw);
+      goto oom;
+    }
+    dest = col->bytes + col->bytes_len;
+    n = utf8_sanitize((const unsigned char *)raw, n, (unsigned char *)dest);
+    free(raw);
   }
-  dest[len] = '\0';
-  col->bytes_len += (size_t)len;
-  col->ends[w->num_rows] = col->bytes_len;
-  col->bytes_len += 1;
+  // NULs are kept: a value is cut out by length, never at a terminator.
+  col->units[r] = utf16_length((const unsigned char *)dest, n);
+  col->bytes_len += n;
+  col->ends[r] = col->bytes_len;
   return 0;
 
 oom:
@@ -1494,12 +1723,11 @@ oom:
 }
 
 /**
- * Store column `i` of the current row. Returns -1 (with `w->error` set) on
- * failure.
+ * Store column `i` of the current row in slot `r`. Returns -1 (with
+ * `w->error` set) on failure.
  */
-static int store_cell(QueryWork *w, int i) {
+static int store_cell(QueryWork *w, int i, int r) {
   ResultColumn *col = &w->columns[i];
-  int r = w->num_rows;
   int colno = i + 1;
   BYTE *src = dbdata(w->conn->dbproc, colno);
   int datalen = dbdatlen(w->conn->dbproc, colno);
@@ -1510,15 +1738,11 @@ static int store_cell(QueryWork *w, int i) {
     col->has_nulls = 1;
     if (size > 0) {
       memset(col->fixed + (size_t)r * size, 0, size);
-    } else if (col->kind == KIND_TEXT) {
-      if (reserve_bytes(col, 1) != 0) {
-        snprintf(w->error, sizeof(w->error), "Memory allocation failed for column value");
-        return -1;
-      }
-      col->ends[r] = col->bytes_len;
-      col->bytes[col->bytes_len++] = '\0';
     } else {
       col->ends[r] = col->bytes_len;
+      if (col->kind == KIND_TEXT) {
+        col->units[r] = 0;
+      }
     }
     return 0;
   }
@@ -1544,7 +1768,275 @@ static int store_cell(QueryWork *w, int i) {
     col->ends[r] = col->bytes_len;
     return 0;
   }
-  return store_text(w, col, dbcoltype(w->conn->dbproc, colno), src, datalen);
+  return store_text(w, col, r, dbcoltype(w->conn->dbproc, colno), src, datalen);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming a result to a CSV file
+//
+// RFC 4180: comma-separated, a header row of column names, fields quoted when
+// they hold a comma, quote, line break or NUL (or are empty, or start or end with a
+// blank), quotes doubled. NULL is an empty unquoted field, so it stays distinct
+// from an empty string (""). Values are the ones a row result holds, rendered
+// as text: the same conversion code produces them. Binary is lowercase hex.
+// ---------------------------------------------------------------------------
+
+#define OUT_BUF_SIZE ((size_t)1 << 20)
+
+#if defined(_WIN32)
+/** A UTF-8 path as the UTF-16 Windows wants; NULL if it cannot be converted. */
+static wchar_t *wide_path(const char *path) {
+  int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+  wchar_t *wide = n > 0 ? (wchar_t *)malloc((size_t)n * sizeof(wchar_t)) : NULL;
+  if (wide) {
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, n);
+  }
+  return wide;
+}
+#endif
+
+/** Create (exclusively: never an existing file) `path` for writing. */
+static FILE *open_output(const char *path) {
+#if defined(_WIN32)
+  wchar_t *wide = wide_path(path);
+  FILE *f = wide ? _wfopen(wide, L"wbx") : NULL;
+  free(wide);
+  return f;
+#else
+  return fopen(path, "wbx");
+#endif
+}
+
+static void remove_output(const char *path) {
+#if defined(_WIN32)
+  wchar_t *wide = wide_path(path);
+  if (wide) {
+    _wremove(wide);
+    free(wide);
+  }
+#else
+  remove(path);
+#endif
+}
+
+/** Replace `to` with `from` in one step: a reader sees the old file or the new one. */
+static int publish_output(const char *from, const char *to) {
+#if defined(_WIN32)
+  wchar_t *wfrom = wide_path(from), *wto = wide_path(to);
+  int ok = wfrom && wto && MoveFileExW(wfrom, wto, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  free(wfrom);
+  free(wto);
+  return ok ? 0 : -1;
+#else
+  return rename(from, to);
+#endif
+}
+
+static int out_flush(QueryWork *w) {
+  if (w->out_len > 0) {
+    if (fwrite(w->out_buf, 1, w->out_len, w->out) != w->out_len) {
+      snprintf(w->error, sizeof(w->error), "Could not write to %s: %s", w->out_path, strerror(errno));
+      return -1;
+    }
+    w->out_bytes += (int64_t)w->out_len;
+    w->out_len = 0;
+  }
+  return 0;
+}
+
+static int out_write(QueryWork *w, const char *data, size_t n) {
+  if (OUT_BUF_SIZE - w->out_len < n) {
+    if (out_flush(w) != 0) {
+      return -1;
+    }
+    if (n > OUT_BUF_SIZE) {
+      if (fwrite(data, 1, n, w->out) != n) {
+        snprintf(w->error, sizeof(w->error), "Could not write to %s: %s", w->out_path,
+                 strerror(errno));
+        return -1;
+      }
+      w->out_bytes += (int64_t)n;
+      return 0;
+    }
+  }
+  memcpy(w->out_buf + w->out_len, data, n);
+  w->out_len += n;
+  return 0;
+}
+
+static int out_char(QueryWork *w, char c) {
+  if (w->out_len == OUT_BUF_SIZE && out_flush(w) != 0) {
+    return -1;
+  }
+  w->out_buf[w->out_len++] = c;
+  return 0;
+}
+
+/** A text field (valid UTF-8, see store_text), quoted only when it has to be. */
+static int out_text_field(QueryWork *w, const char *text, size_t n) {
+  int quote = n == 0 || text[0] == ' ' || text[0] == '\t' || text[n - 1] == ' ' ||
+              text[n - 1] == '\t';
+  for (size_t i = 0; !quote && i < n; i++) {
+    char c = text[i];
+    quote = c == ',' || c == '"' || c == '\n' || c == '\r' || c == '\0';
+  }
+  if (!quote) {
+    return out_write(w, text, n);
+  }
+  if (out_char(w, '"') != 0) {
+    return -1;
+  }
+  size_t start = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (text[i] == '"') {
+      // Through the quote, then the quote again.
+      if (out_write(w, text + start, i + 1 - start) != 0 || out_char(w, '"') != 0) {
+        return -1;
+      }
+      start = i + 1;
+    }
+  }
+  if (out_write(w, text + start, n - start) != 0) {
+    return -1;
+  }
+  return out_char(w, '"');
+}
+
+/**
+ * The first of `%.15g`, `%.16g`, `%.17g` that reads back as exactly `v`, with
+ * `.` as the decimal point: `snprintf` writes the process locale's, which may
+ * be a comma — a field separator here — or a multibyte character. Whatever
+ * sits between the digits that is not a sign or an exponent is that point.
+ */
+static int format_double(double v, char *buf, size_t size) {
+  int n = 0;
+  for (int precision = 15; precision <= 17; precision++) {
+    n = snprintf(buf, size, "%.*g", precision, v);
+    if (strtod(buf, NULL) == v) {
+      break;
+    }
+  }
+  int len = 0, point = 0;
+  for (int i = 0; i < n; i++) {
+    char c = buf[i];
+    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == 'e') {
+      buf[len++] = c;
+    } else if (!point) {
+      buf[len++] = '.';
+      point = 1;
+    }
+  }
+  return len;
+}
+
+static int out_hex(QueryWork *w, const unsigned char *bytes, size_t n) {
+  static const char digits[] = "0123456789abcdef";
+  char chunk[1024];
+  size_t used = 0;
+  for (size_t i = 0; i < n; i++) {
+    chunk[used++] = digits[bytes[i] >> 4];
+    chunk[used++] = digits[bytes[i] & 15];
+    if (used == sizeof(chunk)) {
+      if (out_write(w, chunk, used) != 0) {
+        return -1;
+      }
+      used = 0;
+    }
+  }
+  return out_write(w, chunk, used);
+}
+
+static int csv_write_header(QueryWork *w) {
+  for (int i = 0; i < w->num_columns; i++) {
+    const char *name = w->columns[i].name;
+    size_t n = strlen(name);
+    // A name is made valid UTF-8 like a value (see store_text).
+    char *clean = is_ascii(name, n) ? NULL : (char *)malloc(n * 3 + 1);
+    if (!is_ascii(name, n) && !clean) {
+      snprintf(w->error, sizeof(w->error), "Memory allocation failed for column names");
+      return -1;
+    }
+    if (clean) {
+      n = utf8_sanitize((const unsigned char *)name, n, (unsigned char *)clean);
+    }
+    int rc = (i > 0 && out_char(w, ',') != 0) || out_text_field(w, clean ? clean : name, n) != 0;
+    free(clean);
+    if (rc) {
+      return -1;
+    }
+  }
+  return out_char(w, '\n');
+}
+
+/** Write the row held in slot 0 of every column, then empty the slot for the next. */
+static int csv_write_row(QueryWork *w) {
+  char num[40];
+  for (int i = 0; i < w->num_columns; i++) {
+    ResultColumn *col = &w->columns[i];
+    if (i > 0 && out_char(w, ',') != 0) {
+      return -1;
+    }
+    int rc = 0;
+    if (!col->nulls[0]) {
+      switch (col->kind) {
+        case KIND_INT32: {
+          int32_t v;
+          memcpy(&v, col->fixed, sizeof(v));
+          int len = 0;
+          if (v < 0) {
+            num[len++] = '-';
+          }
+          len += write_decimal(num + len, v < 0 ? (uint64_t)0 - (uint64_t)(int64_t)v : (uint64_t)v);
+          rc = out_write(w, num, (size_t)len);
+          break;
+        }
+        case KIND_INT64: {
+          int64_t v;
+          memcpy(&v, col->fixed, sizeof(v));
+          int len = 0;
+          if (v < 0) {
+            num[len++] = '-';
+          }
+          len += write_decimal(num + len, v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v);
+          rc = out_write(w, num, (size_t)len);
+          break;
+        }
+        case KIND_UINT64: {
+          uint64_t v;
+          memcpy(&v, col->fixed, sizeof(v));
+          rc = out_write(w, num, (size_t)write_decimal(num, v));
+          break;
+        }
+        case KIND_FLOAT64: {
+          double v;
+          memcpy(&v, col->fixed, sizeof(v));
+          rc = out_write(w, num, (size_t)format_double(v, num, sizeof(num)));
+          break;
+        }
+        case KIND_BOOL:
+          rc = col->fixed[0] ? out_write(w, "true", 4) : out_write(w, "false", 5);
+          break;
+        case KIND_TEXT:
+          rc = out_text_field(w, col->bytes, col->ends[0]);
+          break;
+        case KIND_BINARY:
+          // Quoted when empty, like an empty string: an empty unquoted field is NULL.
+          rc = col->ends[0] == 0 ? out_write(w, "\"\"", 2)
+                                 : out_hex(w, (const unsigned char *)col->bytes, col->ends[0]);
+          break;
+        case KIND_WALLCLOCK:
+          // Never chosen for a file: datetimes are written as their canonical text.
+          snprintf(w->error, sizeof(w->error), "Internal error: wall-clock column in a CSV file");
+          rc = -1;
+          break;
+      }
+    }
+    col->bytes_len = 0;
+    if (rc != 0) {
+      return -1;
+    }
+  }
+  return out_char(w, '\n');
 }
 
 static void query_execute(napi_env env, void *data) {
@@ -1582,6 +2074,28 @@ static void query_execute(napi_env env, void *data) {
   }
 
   clear_error(w->conn);
+
+  if (w->out_path) {
+    // Beside the target, so the final rename stays on one file system; unique,
+    // so concurrent exports to the same path never share a temporary.
+    size_t tmp_size = strlen(w->out_path) + 64;
+    w->out_buf = (char *)malloc(OUT_BUF_SIZE);
+    w->out_tmp = (char *)malloc(tmp_size);
+    if (w->out_buf && w->out_tmp) {
+      snprintf(w->out_tmp, tmp_size, "%s.%llx-%p.tmp", w->out_path,
+               (unsigned long long)uv_hrtime(), (void *)w);
+      w->out = open_output(w->out_tmp);
+    }
+    if (!w->out) {
+      snprintf(w->error, sizeof(w->error), "Could not create %s: %s",
+               w->out_tmp ? w->out_tmp : w->out_path,
+               w->out_buf && w->out_tmp ? strerror(errno) : "out of memory");
+      w->success = 0;
+      w->conn_dead = conn_is_dead(w->conn);
+      work_release_conn(w);
+      return;
+    }
+  }
 
   // Spawn the hard-timeout watchdog. Failure is non-fatal — db-lib's own
   // DBSETTIME still provides a cooperative timeout.
@@ -1674,9 +2188,13 @@ static void query_execute(napi_env env, void *data) {
 
     for (int i = 0; i < w->num_columns; i++) {
       const char *colname = dbcolname(w->conn->dbproc, i + 1);
-      w->columns[i].name = strdup(colname ? colname : "");
+      w->columns[i].name = dup_text(colname ? colname : "", w->conn->latin1);
       w->columns[i].type = column_type(w->conn->dbproc, i + 1);
       w->columns[i].kind = column_kind(w->columns[i].type, w->wall_clock_datetimes);
+      // unichar/univarchar (user types 34/35) also report as char types, but
+      // FreeTDS has already converted them from UTF-16 to UTF-8.
+      int usertype = dbcolutype(w->conn->dbproc, i + 1);
+      w->columns[i].latin1 = w->conn->latin1 && usertype != 34 && usertype != 35;
       if (!w->columns[i].name) {
         snprintf(w->error, sizeof(w->error), "Memory allocation failed for column names");
         discard_results(w);
@@ -1686,13 +2204,23 @@ static void query_execute(napi_env env, void *data) {
       }
     }
 
-    // Read rows
-    int capacity = 64;
+    // Read rows. Streamed to a file, each row is written as soon as it is read
+    // and its slot reused, so no default cap is needed: only maxRows limits it.
+    int file_mode = w->out != NULL;
+    int capacity = file_mode ? 1 : 64;
     w->num_rows = 0;
     int max_rows = w->max_rows > 0 ? w->max_rows : DEFAULT_MAX_ROWS;
+    int64_t row_cap = !file_mode ? max_rows : w->max_rows_explicit ? w->max_rows : INT64_MAX;
 
     if (grow_rows(w->columns, w->num_columns, capacity) != 0) {
       snprintf(w->error, sizeof(w->error), "Memory allocation failed for rows");
+      discard_results(w);
+      dbcancel(w->conn->dbproc);
+      w->success = 0;
+      goto done;
+    }
+
+    if (file_mode && csv_write_header(w) != 0) {
       discard_results(w);
       dbcancel(w->conn->dbproc);
       w->success = 0;
@@ -1719,7 +2247,7 @@ static void query_execute(napi_env env, void *data) {
       }
 
       // Safety: cap rows
-      if (w->num_rows >= max_rows) {
+      if ((file_mode ? w->out_rows : w->num_rows) >= row_cap) {
         w->truncated = 1;
         // Drain remaining rows without storing
         if (discard_rows(w->conn->dbproc) == FAIL) {
@@ -1729,7 +2257,7 @@ static void query_execute(napi_env env, void *data) {
       }
 
       // Grow arrays if needed
-      if (w->num_rows >= capacity) {
+      if (!file_mode && w->num_rows >= capacity) {
         capacity = capacity > max_rows / 2 ? max_rows : capacity * 2;
         if (grow_rows(w->columns, w->num_columns, capacity) != 0) {
           snprintf(w->error, sizeof(w->error), "Memory realloc failed at row %d", w->num_rows);
@@ -1741,15 +2269,25 @@ static void query_execute(napi_env env, void *data) {
       }
 
       // Read column values
+      int slot = file_mode ? 0 : w->num_rows;
       for (int i = 0; i < w->num_columns; i++) {
-        if (store_cell(w, i) != 0) {
+        if (store_cell(w, i, slot) != 0) {
           discard_results(w);
           dbcancel(w->conn->dbproc);
           w->success = 0;
           goto done;
         }
       }
-      w->num_rows++;
+      if (!file_mode) {
+        w->num_rows++;
+      } else if (csv_write_row(w) == 0) {
+        w->out_rows++;
+      } else {
+        discard_results(w);
+        dbcancel(w->conn->dbproc);
+        w->success = 0;
+        goto done;
+      }
     }
 
     // Capture affected rows for this result set too
@@ -1799,6 +2337,18 @@ rows_failed:
   w->success = 0;
 
 done:
+  // Write out the rest of the file while the watchdog still covers it.
+  if (w->out) {
+    if (w->success && out_flush(w) != 0) {
+      w->success = 0;
+    }
+    if (fclose(w->out) != 0 && w->success) {
+      snprintf(w->error, sizeof(w->error), "Could not write to %s: %s", w->out_tmp, strerror(errno));
+      w->success = 0;
+    }
+    w->out = NULL;
+  }
+
   // Stop the watchdog before returning. If it already fired (forced cancel),
   // overwrite the error so the JS layer knows it was a hard timeout.
   watchdog_stop(&w->wd);
@@ -1808,6 +2358,31 @@ done:
              w->hard_timeout_ms);
     discard_results(w);
     w->success = 0;
+  }
+
+  // Publish the file, or drop it. Only a complete result replaces the target —
+  // a failed query leaves whatever was there before — and not one the caller has
+  // given up on: the JS layer closes the connection when its own deadline passes,
+  // and a result appearing after the caller was told it failed would be taken
+  // for the outcome of a later attempt.
+  if (w->out_tmp) {
+    // Checked and published under the lock close_connection sets
+    // pending_close under: a close either lands first, and nothing is
+    // published, or waits for the rename, and the export finished before it.
+    uv_mutex_lock(&w->conn->lock);
+    if (w->success && w->conn->pending_close) {
+      snprintf(w->error, sizeof(w->error), "Connection was closed before the export finished");
+      w->success = 0;
+    }
+    if (w->success && publish_output(w->out_tmp, w->out_path) != 0) {
+      snprintf(w->error, sizeof(w->error), "Could not move %s to %s: %s", w->out_tmp, w->out_path,
+               strerror(errno));
+      w->success = 0;
+    }
+    uv_mutex_unlock(&w->conn->lock);
+    if (!w->success) {
+      remove_output(w->out_tmp);
+    }
   }
 
   // Snapshot connection flags before releasing — w->conn may be freed
@@ -1847,11 +2422,12 @@ static napi_status copy_typed_array(napi_env env, napi_typedarray_type type, con
 }
 
 /**
- * A text column as an array of strings, each holding consecutive values joined
- * by `\0`, for JS to split. One string per value would cost several N-API calls
- * per cell; one string for the whole column could pass V8's string length
- * limit. Bounding the chunks also bounds what a single kept value can hold on
- * to, since V8 may let a value split off a string share that string's storage.
+ * A text column as an array of strings, each holding consecutive values back
+ * to back, for JS to cut by the values' UTF-16 lengths (`units`). One string per
+ * value would cost several N-API calls per cell; one string for the whole
+ * column could pass V8's string length limit. Bounding the chunks also bounds
+ * what a single kept value can hold on to, since V8 may let a value sliced off a
+ * string share that string's storage.
  */
 static napi_status build_text_chunks(napi_env env, const ResultColumn *col, int num_rows,
                                      napi_value *out) {
@@ -1864,7 +2440,7 @@ static napi_status build_text_chunks(napi_env env, const ResultColumn *col, int 
       napi_value chunk;
       NAPI_TRY(napi_create_string_utf8(env, col->bytes + start, end - start, &chunk));
       NAPI_TRY(napi_set_element(env, *out, count++, chunk));
-      start = end + 1;  // past the separator
+      start = end;
     }
   }
   return napi_ok;
@@ -1901,9 +2477,13 @@ static napi_status build_column(napi_env env, const ResultColumn *col, int num_r
   NAPI_TRY(napi_set_named_property(env, *out, "kind", kind));
 
   switch (col->kind) {
-    case KIND_TEXT:
+    case KIND_TEXT: {
+      napi_value units;
       NAPI_TRY(build_text_chunks(env, col, num_rows, &values));
+      NAPI_TRY(copy_typed_array(env, napi_uint32_array, col->units, n, sizeof(uint32_t), &units));
+      NAPI_TRY(napi_set_named_property(env, *out, "units", units));
       break;
+    }
     case KIND_BINARY: {
       napi_value ends;
       NAPI_TRY(build_binary(env, col, num_rows, &values, &ends));
@@ -1938,7 +2518,10 @@ static napi_status build_column(napi_env env, const ResultColumn *col, int num_r
   return napi_set_named_property(env, *out, "nulls", nulls);
 }
 
-/** `{ columns, columnTypes, data, rowCount, affectedRows }`. */
+/**
+ * `{ columns, columnTypes, data, rowCount, affectedRows }`; for a result
+ * streamed to a file, `{ columns, columnTypes, rowCount, affectedRows, bytes }`.
+ */
 static napi_status build_result(napi_env env, const QueryWork *w, napi_value *out) {
   napi_value cols_arr, col_types_arr, data_arr, row_count, affected;
   size_t ncols = (size_t)w->num_columns;
@@ -1955,15 +2538,25 @@ static napi_status build_result(napi_env env, const QueryWork *w, napi_value *ou
     NAPI_TRY(napi_create_string_utf8(env, syb_type_name(w->columns[i].type), NAPI_AUTO_LENGTH,
                                      &col_type));
     NAPI_TRY(napi_set_element(env, col_types_arr, (uint32_t)i, col_type));
-    NAPI_TRY(build_column(env, &w->columns[i], w->num_rows, &col_data));
-    NAPI_TRY(napi_set_element(env, data_arr, (uint32_t)i, col_data));
+    if (!w->out_path) {
+      NAPI_TRY(build_column(env, &w->columns[i], w->num_rows, &col_data));
+      NAPI_TRY(napi_set_element(env, data_arr, (uint32_t)i, col_data));
+    }
   }
 
-  NAPI_TRY(napi_create_int32(env, w->num_rows, &row_count));
+  if (w->out_path) {
+    // Past int32 for a large file; exact in a double far beyond any row count.
+    napi_value bytes;
+    NAPI_TRY(napi_create_double(env, (double)w->out_rows, &row_count));
+    NAPI_TRY(napi_create_double(env, (double)w->out_bytes, &bytes));
+    NAPI_TRY(napi_set_named_property(env, *out, "bytes", bytes));
+  } else {
+    NAPI_TRY(napi_create_int32(env, w->num_rows, &row_count));
+    NAPI_TRY(napi_set_named_property(env, *out, "data", data_arr));
+  }
   NAPI_TRY(napi_create_int32(env, w->affected_rows, &affected));
   NAPI_TRY(napi_set_named_property(env, *out, "columns", cols_arr));
   NAPI_TRY(napi_set_named_property(env, *out, "columnTypes", col_types_arr));
-  NAPI_TRY(napi_set_named_property(env, *out, "data", data_arr));
   NAPI_TRY(napi_set_named_property(env, *out, "rowCount", row_count));
   return napi_set_named_property(env, *out, "affectedRows", affected);
 }
@@ -2021,8 +2614,60 @@ static void query_complete(napi_env env, napi_status status, void *data) {
   work_release_conn(w);
   free_columns(w->columns, w->num_columns);
   free(w->sql);
+  free(w->out_path);
+  free(w->out_tmp);
+  free(w->out_buf);
   napi_delete_async_work(env, w->work);
   free(w);
+}
+
+/**
+ * The SQL text as bytes for dbcmd: UTF-8, or Latin-1 for a Latin-1 server.
+ *
+ * A character Latin-1 cannot hold is refused rather than sent: it would reach
+ * the server as two or more unrelated characters. The query builders and
+ * `serializeValue` write such strings as `U&'...'` literals, which carry any
+ * character in ASCII escapes. Returns NULL with an exception pending.
+ */
+static char *sql_bytes(napi_env env, napi_value value, int latin1) {
+  size_t len = 0;
+  if (!latin1) {
+    napi_get_value_string_utf8(env, value, NULL, 0, &len);
+    char *out = (char *)malloc(len + 1);
+    if (!out) {
+      napi_throw_error(env, NULL, "Out of memory");
+      return NULL;
+    }
+    napi_get_value_string_utf8(env, value, out, len + 1, &len);
+    return out;
+  }
+  napi_get_value_string_utf16(env, value, NULL, 0, &len);
+  char16_t *units = (char16_t *)malloc((len + 1) * sizeof(char16_t));
+  char *out = units ? (char *)malloc(len + 1) : NULL;
+  if (!out) {
+    free(units);
+    napi_throw_error(env, NULL, "Out of memory");
+    return NULL;
+  }
+  napi_get_value_string_utf16(env, value, units, len + 1, &len);
+  for (size_t i = 0; i < len; i++) {
+    if (units[i] > 0xFF) {
+      char message[400];
+      snprintf(message, sizeof(message),
+               "The SQL contains U+%04X at offset %zu, which the server's character set (iso_1) "
+               "cannot hold. Write such text as a U&'...' literal (e.g. U&'\\%04x'); the query "
+               "builders and serializeValue do this for string values.",
+               (unsigned)units[i], i, (unsigned)units[i]);
+      free(units);
+      free(out);
+      napi_throw_range_error(env, NULL, message);
+      return NULL;
+    }
+    out[i] = (char)units[i];
+  }
+  out[len] = '\0';
+  free(units);
+  return out;
 }
 
 // napi_value query(conn, sql, options?)
@@ -2032,6 +2677,8 @@ static void query_complete(napi_env env, napi_status status, void *data) {
 //   we derive it from the connection's timeout (2x timeout, min 30s).
 // options.wallClockDateTimes: hand datetime/smalldatetime over as wall-clock
 //   numbers ("wallclock" kind) instead of canonical text.
+// options.outputPath: stream the rows to this CSV file instead (see
+//   csv_write_row); the result then carries no data, and `bytes`.
 //
 // Resolves to the result column by column — see build_result; the JS layer
 // (src/native/index.ts) turns it into rows.
@@ -2045,22 +2692,24 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
     return NULL;  // TypeError pending
   }
 
-  size_t sql_len = 0;
-  if (argc < 2 || napi_get_value_string_utf8(env, args[1], NULL, 0, &sql_len) != napi_ok) {
+  napi_valuetype sql_type = napi_undefined;
+  if (argc < 2 || napi_typeof(env, args[1], &sql_type) != napi_ok || sql_type != napi_string) {
     napi_throw_type_error(env, NULL, "Expected the SQL as a string");
     return NULL;
   }
+  // The SQL goes to the server in its own character set (see SybaseConnection.latin1).
+  char *sql = sql_bytes(env, args[1], handle->conn != NULL && handle->conn->latin1);
+  if (sql == NULL) {
+    return NULL;  // error pending
+  }
 
   QueryWork *w = (QueryWork *)calloc(1, sizeof(QueryWork));
-  char *sql = (char *)malloc(sql_len + 1);
-  if (w == NULL || sql == NULL) {
-    free(w);
+  if (w == NULL) {
     free(sql);
     napi_throw_error(env, NULL, "Out of memory");
     return NULL;
   }
   w->sql = sql;
-  napi_get_value_string_utf8(env, args[1], w->sql, sql_len + 1, &sql_len);
 
   // A closed handle has no connection: the query is rejected as on a closed
   // connection (holds_conn stays 0 below).
@@ -2108,6 +2757,24 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
         napi_get_value_bool(env, v, &flag);
         w->wall_clock_datetimes = flag ? 1 : 0;
       }
+
+      napi_get_named_property(env, args[2], "outputPath", &v);
+      napi_typeof(env, v, &vtype);
+      if (vtype == napi_string) {
+        size_t path_len = 0;
+        napi_get_value_string_utf8(env, v, NULL, 0, &path_len);
+        // Validated by the JS wrapper (non-empty, no NUL), its only caller.
+        w->out_path = (char *)malloc(path_len + 1);
+        if (w->out_path == NULL) {
+          free(w->sql);
+          free(w);
+          napi_throw_error(env, NULL, "Out of memory");
+          return NULL;
+        }
+        napi_get_value_string_utf8(env, v, w->out_path, path_len + 1, &path_len);
+        // Datetimes go to the file as their canonical text.
+        w->wall_clock_datetimes = 0;
+      }
     }
   }
 
@@ -2138,6 +2805,7 @@ static napi_value fn_query(napi_env env, napi_callback_info info) {
     napi_create_error(env, NULL, msg, &err);
     napi_reject_deferred(env, w->deferred, err);
     free(w->sql);
+    free(w->out_path);
     free(w);
   }
 
@@ -2212,6 +2880,24 @@ static napi_value fn_is_alive(napi_env env, napi_callback_info info) {
 }
 
 // ---------------------------------------------------------------------------
+// Server character set
+// ---------------------------------------------------------------------------
+
+/** The server's default character set name, or "" for a closed handle. */
+static napi_value fn_server_charset(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  ConnHandle *handle = get_conn_handle(env, args[0]);
+  if (handle == NULL) {
+    return NULL;  // TypeError pending
+  }
+  napi_value result;
+  napi_create_string_utf8(env, handle->conn ? handle->conn->charset : "", NAPI_AUTO_LENGTH, &result);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Get version
 // ---------------------------------------------------------------------------
 
@@ -2253,6 +2939,9 @@ static napi_value init(napi_env env, napi_value exports) {
 
   napi_create_function(env, "isAlive", 0, fn_is_alive, NULL, &fn);
   napi_set_named_property(env, exports, "isAlive", fn);
+
+  napi_create_function(env, "serverCharset", 0, fn_server_charset, NULL, &fn);
+  napi_set_named_property(env, exports, "serverCharset", fn);
 
   napi_create_function(env, "getVersion", 0, fn_get_version, NULL, &fn);
   napi_set_named_property(env, exports, "getVersion", fn);

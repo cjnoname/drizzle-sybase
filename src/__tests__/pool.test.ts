@@ -575,6 +575,20 @@ describe("pool configuration validation", () => {
       vi.restoreAllMocks();
     }
   );
+
+  it.each([{ path: "" }, { path: 42 }])(
+    "rejects a file query's path %j before acquiring",
+    async bad => {
+      stubConnections();
+      const pool = new SybasePool({ ...base });
+      await expect(pool.queryToFile("select 1", bad as { path: string })).rejects.toThrow(
+        TypeError
+      );
+      expect(pool.size).toBe(0);
+      await pool.close();
+      vi.restoreAllMocks();
+    }
+  );
 });
 
 describe("SybasePool identity changes", () => {

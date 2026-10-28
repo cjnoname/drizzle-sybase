@@ -47,10 +47,15 @@ const nativeAnswer = (options?: SybaseQueryOptions): NativeResult => ({
   columnTypes: ["datetime", "varchar", "money"],
   data: [
     options?.timeZone === undefined
-      ? { kind: "text", values: [STORED], nulls: undefined }
+      ? { kind: "text", values: [STORED], units: Uint32Array.of(STORED.length), nulls: undefined }
       : { kind: "wallclock", values: Float64Array.of(STORED_WALL_CLOCK), nulls: undefined },
-    { kind: "text", values: ["SOME SONG"], nulls: undefined },
-    { kind: "text", values: ["0.0000"], nulls: undefined }
+    {
+      kind: "text",
+      values: ["SOME SONG"],
+      units: Uint32Array.of("SOME SONG".length),
+      nulls: undefined
+    },
+    { kind: "text", values: ["0.0000"], units: Uint32Array.of("0.0000".length), nulls: undefined }
   ],
   rowCount: 1,
   affectedRows: 0

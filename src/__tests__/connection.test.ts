@@ -47,7 +47,8 @@ vi.mock("../native/index.js", () => ({
       return { rows, columns: [], columnTypes: [], rowCount: rows.length, affectedRows: 0 };
     },
     close: (handle: object) => opened.delete(handle),
-    isAlive: (handle: object) => opened.has(handle)
+    isAlive: (handle: object) => opened.has(handle),
+    serverCharset: () => "iso_1"
   }
 }));
 

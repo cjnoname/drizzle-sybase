@@ -128,6 +128,7 @@ export {
 export { SybaseConnection } from "./connection.js";
 export type {
   SybaseConnectionConfig,
+  SybaseFileQueryOptions,
   SybaseLogger,
   SybaseQueryLog,
   SybaseQueryOptions,
@@ -135,7 +136,12 @@ export type {
 } from "./connection.js";
 export { SybasePool } from "./pool.js";
 export type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
-export type { SybaseColumnarResult, SybaseColumnValues, SybaseResultColumn } from "./result.js";
+export type {
+  SybaseColumnarResult,
+  SybaseColumnValues,
+  SybaseFileResult,
+  SybaseResultColumn
+} from "./result.js";
 
 // Dialect
 export { SybaseDialect, escapeName, escapeString, serializeValue } from "./dialect.js";
@@ -189,4 +195,4 @@ export type { SQL } from "drizzle-orm";
 
 // Native binding utilities (lazy-loaded — only triggers native load on actual use)
 export { native, getNative } from "./native/index.js";
-export type { NativeBinding } from "./native/index.js";
+export type { NativeBinding, NativeFileQueryOptions } from "./native/index.js";
