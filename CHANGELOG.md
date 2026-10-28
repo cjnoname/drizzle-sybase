@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v3.2.0...v4.0.0) (2026-10-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* on iso_1 servers, non-ASCII text is now decoded as Latin-1 instead of being passed through as (often invalid) UTF-8, so such values change. Text values containing NUL are no longer truncated at the first NUL. Connecting fails if the server character set cannot be determined. SQL text containing characters outside Latin-1 is rejected on iso_1 servers.
+
+### Features
+
+* Stream results to CSV, decode text by server charset, keep NULs ([519c2b6](https://github.com/cjnoname/drizzle-sybase/commit/519c2b6b49651269dadd7b111fd70c38b58b2e37))
+
+
+### Bug Fixes
+
+* Create CSV exports readable by their owner only ([f3b08bf](https://github.com/cjnoname/drizzle-sybase/commit/f3b08bfcadabe19ec67a9636acc177bc1a8c6467))
+
+
+### Code Refactoring
+
+* Sanitize UTF-8 without stepping the loop index back ([07f82d8](https://github.com/cjnoname/drizzle-sybase/commit/07f82d8e827421c8c2b28980fb3d206d8341d8be))
+
 ## [3.2.0](https://github.com/cjnoname/drizzle-sybase/compare/v3.1.0...v3.2.0) (2026-10-28)
 
 
