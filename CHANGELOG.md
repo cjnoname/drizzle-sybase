@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.2.0](https://github.com/cjnoname/drizzle-sybase/compare/v3.1.0...v3.2.0) (2026-10-28)
+
+
+### Features
+
+* Columnar result transfer and executeColumns for bulk reads ([dcad3f4](https://github.com/cjnoname/drizzle-sybase/commit/dcad3f44503d37fd897ca237ea50f089e0cedb29))
+
 ## [3.1.0](https://github.com/cjnoname/drizzle-sybase/compare/v3.0.0...v3.1.0) (2026-10-24)
 
 
