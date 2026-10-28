@@ -251,9 +251,20 @@ describe("without code generation", () => {
       2
     );
     const rows = buildRows(toColumnarResult(raw, "UTC"));
-    expect(rows.map(row => ({ ...row }))).toEqual([
-      { n: 7, ["__proto__"]: "x", generic_only: "p", dt: null },
-      { n: null, ["__proto__"]: "y", generic_only: "q", dt: new Date(5) }
+    // As entries, so the expectation holds a `__proto__` key without an object literal that names it.
+    expect(rows.map(row => Object.entries(row))).toEqual([
+      [
+        ["n", 7],
+        ["__proto__", "x"],
+        ["generic_only", "p"],
+        ["dt", null]
+      ],
+      [
+        ["n", null],
+        ["__proto__", "y"],
+        ["generic_only", "q"],
+        ["dt", new Date(5)]
+      ]
     ]);
     expect(Object.getPrototypeOf(rows[0])).toBe(Object.prototype);
   });
