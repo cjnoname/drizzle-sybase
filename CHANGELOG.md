@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.1.0](https://github.com/cjnoname/drizzle-sybase/compare/v5.0.0...v5.1.0) (2026-11-11)
+
+
+### Features
+
+* Say what a bulk copy failed on, and optionally replace what iso_1 cannot hold ([8b298e2](https://github.com/cjnoname/drizzle-sybase/commit/8b298e2eef3cc405f67bc33abf5bfaf80af52a41))
+
 ## [5.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v4.0.0...v5.0.0) (2026-11-11)
 
 
