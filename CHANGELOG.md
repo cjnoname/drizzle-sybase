@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.1.1](https://github.com/cjnoname/drizzle-sybase/compare/v5.1.0...v5.1.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* Count a bulk copy that failed waiting for locks as retryable ([da833ce](https://github.com/cjnoname/drizzle-sybase/commit/da833ced67c80364d2d65877948c51de54f9fcf6))
+
 ## [5.1.0](https://github.com/cjnoname/drizzle-sybase/compare/v5.0.0...v5.1.0) (2026-11-11)
 
 
