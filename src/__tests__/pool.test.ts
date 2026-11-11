@@ -207,9 +207,7 @@ describe("SybasePool state management", () => {
     }
   }, 15000);
 
-  it("acquire timeout throws SybaseTimeoutError", async () => {
-    // We can't easily test actual acquire timeout without mocking native,
-    // but we verify the pool validates configuration
+  it("refuses a pool of no connections", async () => {
     expect(
       () =>
         new SybasePool({
@@ -282,6 +280,85 @@ const stubConnections = (
 describe("SybasePool with stubbed connections", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  // A failed replacement settles one waiter; the others still have room to be
+  // served, and must not wait out their acquire timeout for nothing.
+  it("goes on serving waiters after creating a replacement connection fails", async () => {
+    const open = stubConnections();
+    const pool = new SybasePool({ ...base, max: 1, acquireTimeoutMs: 2_000 });
+    const held = await pool.acquire();
+    const waiting = [pool.acquire(), pool.acquire(), pool.acquire()];
+    let attempts = 0;
+    vi.mocked(SybaseConnection.prototype.connect).mockImplementation(async function (
+      this: SybaseConnection
+    ) {
+      if (++attempts === 1) {
+        throw new SybaseConnectionError("refused");
+      }
+      open.add(this);
+    });
+    open.delete(held); // it died while in use
+    pool.release(held);
+    const started = Date.now();
+    const [first, second] = await Promise.allSettled(waiting.slice(0, 2));
+    expect(first.status).toBe("rejected");
+    expect(second.status).toBe("fulfilled");
+    expect(Date.now() - started).toBeLessThan(1_000);
+    pool.release((second as PromiseFulfilledResult<SybaseConnection>).value);
+    pool.release(await waiting[2]!);
+    await pool.close();
+  });
+
+  // drain() resolves once nothing of the pool is open: a connection still
+  // being opened then is waited for, and closed.
+  it("leaves no connection open once drain resolves, even one still being opened", async () => {
+    const open = stubConnections({ connectDelay: 100 });
+    const pool = new SybasePool({ ...base, max: 2 });
+    const acquiring = pool.acquire().catch((e: unknown) => e);
+    await sleep(10);
+    let connected = 0;
+    vi.mocked(SybaseConnection.prototype.connect).mock.results.forEach(r =>
+      (r.value as Promise<void>).then(() => connected++)
+    );
+    await pool.drain();
+    // The connect in flight had finished — and its connection was closed.
+    expect(connected).toBe(1);
+    expect(open.size).toBe(0);
+    expect(await acquiring).toBeInstanceOf(SybasePoolError);
+    await sleep(150);
+    expect(open.size).toBe(0);
+  });
+
+  // The timeout bounds the wait, a connection still being opened too: it then
+  // closes itself once open.
+  it("keeps to drain's timeout while a connection is still being opened", async () => {
+    const open = stubConnections({ connectDelay: 300 });
+    const pool = new SybasePool({ ...base, max: 2 });
+    const acquiring = pool.acquire().catch((e: unknown) => e);
+    await sleep(10);
+    const started = Date.now();
+    await pool.drain(30);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(pool.isClosed).toBe(true);
+    expect(await acquiring).toBeInstanceOf(SybasePoolError);
+    expect(open.size).toBe(0);
+  });
+
+  // A second drain() while the first still waits for the close waits too.
+  it("does not settle a second drain() before the close the first waits for", async () => {
+    stubConnections({ connectDelay: 100 });
+    const pool = new SybasePool({ ...base, max: 2 });
+    const acquiring = pool.acquire().catch(() => undefined);
+    await sleep(10);
+    const settled: string[] = [];
+    const first = pool.drain().then(() => settled.push("first"));
+    await sleep(10);
+    const second = pool.drain().then(() => settled.push("second"));
+    await sleep(30);
+    expect(settled).toEqual([]);
+    await Promise.all([first, second, acquiring]);
+    expect(settled.toSorted()).toEqual(["first", "second"]);
   });
 
   it("does not hand the same connection to two callers during a health check", async () => {
@@ -650,14 +727,14 @@ describe("SybasePool close races", () => {
     const open = stubConnections({ connectDelay: 20 });
     const pool = new SybasePool({ ...base, max: 1, acquireTimeoutMs: 1000 });
     const first = await pool.acquire();
-    const waiting = pool.acquire();
+    const waiting = pool.acquire().catch((e: unknown) => e);
 
     // Dead on release -> pool opens a replacement for the waiter.
     open.delete(first);
     pool.release(first);
     await pool.close();
 
-    await expect(waiting).rejects.toBeInstanceOf(SybasePoolError);
+    expect(await waiting).toBeInstanceOf(SybasePoolError);
     await sleep(40);
     expect(open.size).toBe(0);
   });

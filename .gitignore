@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 build-freetds/
+vendor/
 deps/
 *.node
 npm/

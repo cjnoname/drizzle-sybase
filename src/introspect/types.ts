@@ -44,6 +44,11 @@ export interface ColumnMeta {
   scale: number | null;
   isNullable: boolean;
   isIdentity: boolean;
+  /** A computed column: the server derives its value (and refuses one written to it); optional in an insert. */
+  isComputed: boolean;
+  /** Whether the column has a default (whose text may be hidden). */
+  hasDefault: boolean;
+  /** The default's text, when it can be read. */
   defaultValue: string | null;
 }
 

@@ -45,8 +45,15 @@ function safeIdentifier(name: string): string {
   return name;
 }
 
-/** Render an object-literal property key, quoting it when not a bare identifier. */
+/**
+ * Render an object-literal property key, quoting it when not a bare identifier.
+ * `__proto__` is written computed: bare or quoted, it would set the object's
+ * prototype instead of making a property.
+ */
 function memberKey(name: string): string {
+  if (name === "__proto__") {
+    return '["__proto__"]';
+  }
   return TS_IDENTIFIER.test(name) ? name : JSON.stringify(name);
 }
 
@@ -56,6 +63,10 @@ function capitalize(name: string): string {
 }
 
 const RESERVED_WORDS = new Set([
+  // Not reserved words, but no binding may take these names in strict mode
+  // code — which an ES module is.
+  "arguments",
+  "eval",
   "break",
   "case",
   "catch",
@@ -149,8 +160,9 @@ function renderColumnBuilder(col: ColumnMeta, mapping: TypeMapping, charSizes: C
   if (!col.isNullable) {
     builder += ".notNull()";
   }
-  // Mirrors the insert schema, where such a column is optional.
-  if (col.defaultValue) {
+  // Mirrors the insert schema, where such a column is optional — and a computed
+  // one absent: the server derives its value (and refuses one written to it).
+  if (col.hasDefault || col.isComputed) {
     builder += ".hasDatabaseDefault()";
   }
   return builder;
@@ -393,17 +405,14 @@ function planNames(tables: TableMeta[], warnings: string[]): Map<TableMeta, Tabl
 }
 
 /**
- * Owner argument for `sybaseTable`, or "" to leave the table unqualified.
+ * Owner argument for `sybaseTable`, or "" when the owner is unknown.
  *
- * dbo tables stay unqualified: an unqualified name already resolves to dbo's
- * table for any user without a same-named table of their own, and it keeps the
- * common case's generated code unchanged. Any other owner is only reachable
- * by that user unqualified, so it is emitted.
+ * Emitted for dbo too: ASE resolves an unqualified name to the user's own
+ * table of that name first, so for a user who has one, an unqualified dbo
+ * table would be read and written as that other table.
  */
 function ownerOption(table: TableMeta): string {
-  return table.owner && table.owner.toLowerCase() !== "dbo"
-    ? `, { owner: ${JSON.stringify(table.owner)} }`
-    : "";
+  return table.owner ? `, { owner: ${JSON.stringify(table.owner)} }` : "";
 }
 
 function generateTableDefinition(
@@ -482,7 +491,8 @@ function generateInsertSchema(table: TableMeta, names: TableNames, charSizes: Ch
     .map(col => {
       const { mapping } = resolveMapping(col.typeName);
       let zod = renderZodType(col, mapping, "insert", charSizes);
-      if (col.isNullable || col.defaultValue) {
+      // A computed column is optional, as in the table (see renderColumnBuilder).
+      if (col.isNullable || col.hasDefault || col.isComputed) {
         zod += ".optional()";
       }
       return `  ${memberKey(names.keys.get(col.name)!)}: ${zod}`;

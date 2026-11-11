@@ -8,8 +8,8 @@
  * Does NOT depend on drizzle-orm/mssql-core.
  */
 
-import { aliasedColumn } from "drizzle-orm";
-import type { SQL, SQLWrapper } from "drizzle-orm";
+import { aliasedColumn, noopDecoder, SQL } from "drizzle-orm";
+import type { SQLWrapper } from "drizzle-orm";
 
 import { EXACT_NUMERIC_TYPES } from "../codecs.js";
 
@@ -165,6 +165,14 @@ export class SybaseColumn<
    */
   mapToDriverValue: (value: any) => any;
 
+  /**
+   * The value as is: results come decoded from the addon (see above). Drizzle
+   * reads this where a column stands for its type — `max(col)`, `min(col)`,
+   * `sql\`...\`.mapWith(col)` — and, being its no-op, skips the call. On the
+   * prototype: there is nothing per column to it.
+   */
+  declare mapFromDriverValue: (value: any) => T["data"];
+
   constructor(table: any, config: SybaseColumnConfig) {
     this.table = table;
     this.name = config.name;
@@ -191,10 +199,9 @@ export class SybaseColumn<
 
   // SQLWrapper interface — required for drizzle-orm sql template embedding
   getSQL(): SQL<SybaseColumnRead<this>> {
-    // Return a minimal SQL wrapper that references this column.
-    // The actual SQL generation happens in drizzle-orm's sql.js buildQueryFromSourceParams
-    // which checks `is(chunk, Column)` and reads chunk.name/chunk.table directly.
-    return { queryChunks: [this] } as unknown as SQL<SybaseColumnRead<this>>;
+    // As drizzle's own Column: rendered by drizzle-orm's SQL builder, which
+    // checks `is(chunk, Column)` and reads chunk.name / chunk.table.
+    return new SQL([this]) as SQL<SybaseColumnRead<this>>;
   }
 
   /**
@@ -211,6 +218,8 @@ export class SybaseColumn<
     return this;
   }
 }
+
+SybaseColumn.prototype.mapFromDriverValue = noopDecoder.mapFromDriverValue;
 
 // Make SybaseColumn pass `is(col, Column)` by inserting a marker
 // with entityKind = "Column" in the prototype chain.

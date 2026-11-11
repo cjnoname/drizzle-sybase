@@ -583,8 +583,9 @@ describe("serializeValue edge cases", () => {
     expect(() => serializeValue({ foo: "bar" })).toThrow("Cannot serialize object");
   });
 
-  it("handles strings with null bytes", () => {
-    expect(escapeString("hello\0world")).toBe("'helloworld'");
+  // Not dropped (the value would change): refused.
+  it("refuses strings with null bytes", () => {
+    expect(() => escapeString("hello\0world")).toThrow(/NUL/);
   });
 
   it("handles empty string", () => {
@@ -597,7 +598,7 @@ describe("serializeValue edge cases", () => {
   });
 
   it("handles strings with multiple special chars", () => {
-    expect(escapeString("it's a \0'test'")).toBe("'it''s a ''test'''");
+    expect(escapeString("it's a 'test'")).toBe("'it''s a ''test'''");
   });
 });
 

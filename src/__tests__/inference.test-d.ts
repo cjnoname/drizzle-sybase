@@ -6,6 +6,7 @@
  * finds an error, fails the type check.
  */
 import { eq, getColumns, getTableColumns, getTableName, is, sql, Table } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
 import { describe, expectTypeOf, it } from "vitest";
 
 import {
@@ -367,5 +368,41 @@ describe("select", () => {
       // @ts-expect-error -- name is required
       tx.insert(users).values({ status: "active" });
     });
+  });
+});
+
+describe("bulk copy and result sets", () => {
+  it("offers bulkInsert on db and withConnection's handle, not on a transaction", async () => {
+    expectTypeOf(db.bulkInsert)
+      .returns.resolves.toHaveProperty("rowsCopied")
+      .toEqualTypeOf<number>();
+    await db.withConnection(async conn => {
+      expectTypeOf(conn).toHaveProperty("bulkInsert");
+    });
+    await db.transaction(async tx => {
+      // @ts-expect-error -- a copy commits its batches: not inside a transaction
+      void tx.bulkInsert;
+    });
+  });
+
+  it("types the extra result sets as untyped rows, the first set's rows as before", async () => {
+    const result = await db.execute<{ id: number }>(sql`select 1 as id`, { allResultSets: true });
+    expectTypeOf(result.rows).toEqualTypeOf<{ id: number }[]>();
+    expectTypeOf(result.resultSets).toEqualTypeOf<Record<string, unknown>[][] | undefined>();
+  });
+
+  it("does not offer allResultSets when writing to a file", () => {
+    // @ts-expect-error -- a file holds one result set
+    void db.executeToFile("select 1", { path: "/tmp/x.csv", allResultSets: true });
+  });
+});
+
+describe("mapWith(column)", () => {
+  it("reads as the column's type", () => {
+    expectTypeOf(sql`max(score)`.mapWith(users.score)).toEqualTypeOf<SQL<number>>();
+    expectTypeOf(sql`max(created_at)`.mapWith(users.createdAt)).toEqualTypeOf<SQL<Date>>();
+    expectTypeOf(sql<string | null>`email`.mapWith(users.email)).toEqualTypeOf<
+      SQL<string | null>
+    >();
   });
 });

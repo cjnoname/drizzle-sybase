@@ -59,6 +59,9 @@ const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const DEFAULT_ATTEMPTS = 60;
 const DEFAULT_INTERVAL_MS = 15_000;
 
+/** Longest a single request to the registry may take: a hung one is a failed attempt. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
 export interface VerifyOptions {
   readonly registry?: string;
   readonly attempts?: number;
@@ -126,7 +129,8 @@ export async function verifyPublished(
     let response: Response;
     try {
       response = await fetch(url, {
-        headers: { accept: "application/json", "cache-control": "no-cache" }
+        headers: { accept: "application/json", "cache-control": "no-cache" },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
       });
     } catch (cause) {
       last = `request failed: ${cause instanceof Error ? cause.message : String(cause)}`;
@@ -166,7 +170,23 @@ export async function verifyPublished(
       continue;
     }
 
-    const document = (await response.json()) as { version?: unknown; dist?: { tarball?: unknown } };
+    let document: { version?: unknown; dist?: { tarball?: unknown } };
+    try {
+      const parsed: unknown = await response.json();
+      // Valid JSON but no version document (`null`, a string, ...): as garbled.
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error(`not a version document: ${JSON.stringify(parsed).slice(0, 80)}`);
+      }
+      document = parsed as typeof document;
+    } catch (cause) {
+      // A cut-off or garbled answer says nothing about the version: ask again.
+      last = `unreadable answer: ${cause instanceof Error ? cause.message : String(cause)}`;
+      log(`  ${label}: ${last} (attempt ${attempt}/${attempts})`);
+      if (attempt < attempts) {
+        await sleep(intervalMs);
+      }
+      continue;
+    }
     if (document.version !== spec.version) {
       // The registry answered for a different version than the path asked for,
       // which would make every later assertion meaningless.
@@ -182,7 +202,10 @@ export async function verifyPublished(
     }
 
     // A version document naming a tarball nobody can fetch is not a release.
-    const head = await fetch(tarball, { method: "HEAD" }).catch(() => undefined);
+    const head = await fetch(tarball, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    }).catch(() => undefined);
     if (head === undefined || !head.ok) {
       last = `tarball not fetchable (${head === undefined ? "request failed" : `HTTP ${head.status}`})`;
       log(`  ${label}: ${last} (attempt ${attempt}/${attempts})`);
@@ -192,7 +215,7 @@ export async function verifyPublished(
       continue;
     }
 
-    log(`✓ ${label} is live and installable (attempt ${attempt}/${attempts})`);
+    log(`✓ ${label} is live and its tarball fetchable (attempt ${attempt}/${attempts})`);
     return { ok: true, attempts: attempt };
   }
 
@@ -228,7 +251,8 @@ export async function versionExists(
   const url = versionUrl(options.registry ?? DEFAULT_REGISTRY, spec);
   try {
     const response = await fetch(url, {
-      headers: { accept: "application/json", "cache-control": "no-cache" }
+      headers: { accept: "application/json", "cache-control": "no-cache" },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
     if (response.status === 401 || response.status === 403) {
       return true;

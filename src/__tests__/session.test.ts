@@ -6,8 +6,9 @@
  * reaches the code that decodes rows, on every path (plain query, transaction)
  * and through `createSybaseDrizzle`.
  */
-import { eq } from "drizzle-orm";
-import { describe, it, expect } from "vitest";
+import { Subquery, eq, getColumns, max, min, sql } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
+import { describe, it, expect, vi } from "vitest";
 
 import { datetime, money, varchar } from "../columns/index.js";
 import type { QueryResult, SybaseQueryOptions } from "../connection.js";
@@ -259,6 +260,49 @@ describe("createSybaseDrizzle timeZone wiring", () => {
     const sql = db.select().from(winf).where(eq(winf.totPrRoyalty, "1.5000")).toSQL();
     expect(sql).toContain("convert(money, '1.5000')");
   });
+
+  // Every parameter is written into the SQL anyway: .inlineParams() would make
+  // drizzle render it its own way instead (local-time Dates, no CONVERT), so it
+  // is refused — at the top or nested in a condition.
+  it("refuses .inlineParams()", () => {
+    const db = createSybaseDrizzle({ ...config, timeZone: SYDNEY });
+    // A fresh condition each time: inlineParams() marks the SQL it is called on.
+    const cond = () => sql`${eq(winf.dtRecAdded, instant)}`;
+    expect(() => db.select().from(winf).where(cond().inlineParams()).toSQL()).toThrow(
+      /remove \.inlineParams\(\)/
+    );
+    expect(() =>
+      db
+        .select()
+        .from(winf)
+        .where(sql`${eq(winf.key, "W1")} and ${sql`1 = ${true}`.inlineParams()}`)
+        .toSQL()
+    ).toThrow(/remove \.inlineParams\(\)/);
+    expect(db.select().from(winf).where(cond()).toSQL()).toContain("'2016-06-09 09:48:46.753'");
+  });
+
+  // Every way drizzle reaches a marked SQL is refused — they all end in the
+  // one place it writes a parameter itself — and only those.
+  it("refuses .inlineParams() wherever drizzle renders it, and only there", () => {
+    const db = createSybaseDrizzle({ ...config, timeZone: SYDNEY });
+    const marked = () => sql`1 = ${true}`.inlineParams();
+    const where = (cond: SQL) => () => db.select().from(winf).where(cond).toSQL();
+    let deep: SQL = marked();
+    for (let i = 0; i < 70; i++) {
+      deep = sql`${deep}`;
+    }
+    for (const render of [
+      where(sql`${sql.param(marked())}`),
+      where(sql`${sql.param(1, { mapToDriverValue: marked })}`),
+      where(sql`${{ getSQL: marked }}`),
+      where(deep),
+      where(sql`exists ${new Subquery(marked(), {}, "s")}`)
+    ]) {
+      expect(render).toThrow(/remove \.inlineParams\(\)/);
+    }
+    // Only the alias is rendered: nothing of what it names is written.
+    expect(where(sql`${marked().as("a")} = 1`)()).toContain("[a] = 1");
+  });
 });
 
 describe("column mapping hooks", () => {
@@ -302,11 +346,227 @@ describe("query surface", () => {
   });
 
   // `exec` used to delegate through `this`, which broke when destructured.
-  it("keeps exec working when detached from the handle", () => {
+  it("keeps exec working when detached from the handle", async () => {
+    const db = createSybaseDrizzle(config);
+    const query = vi
+      .spyOn(SybasePool.prototype, "query")
+      .mockResolvedValue(result({ rows: [{ x: 1 }], rowCount: 1 }));
+    try {
+      const { exec } = db;
+      const answer = await exec(sql`exec some_proc`);
+      expect(answer.rows).toEqual([{ x: 1 }]);
+      expect(query).toHaveBeenCalledWith("exec some_proc", expect.anything());
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  // Drizzle's max()/min() use the column as its decoder, as does
+  // mapWith(column): a column must be one.
+  it("selects max() and min() of a column, and a sql field mapped with a column", async () => {
+    const db = createSybaseDrizzle(config);
+    const t = sybaseTable("T", { k: varchar("k", { length: 5 }).primaryKey() });
+    const query = vi
+      .spyOn(SybasePool.prototype, "query")
+      .mockResolvedValue(result({ rows: [{ hi: "b", lo: "a", m: "c" }], rowCount: 1 }));
+    try {
+      const rows = await db
+        .select({ hi: max(t.k), lo: min(t.k), m: sql`'c'`.mapWith(getColumns(t).k) })
+        .from(t);
+      expect(rows).toEqual([{ hi: "b", lo: "a", m: "c" }]);
+      expect(query.mock.calls[0]![0]).toMatch(/max\(\[T\]\.\[k\]\)/);
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  // Assigned, a column keyed `__proto__` would set the prototype instead.
+  it("keeps a column keyed __proto__ as a column", () => {
+    const db = createSybaseDrizzle(config);
+    const key = "__proto__";
+    const t = sybaseTable("T", {
+      k: varchar("k", { length: 5 }),
+      [key]: varchar("p", { length: 5 })
+    });
+    const columns: Record<string, unknown> = getColumns(t);
+    expect(Object.keys(columns)).toEqual(["k", key]);
+    expect(Object.getPrototypeOf(t)).not.toBe(columns[key]);
+    expect(db.select().from(t).toSQL()).toMatch(/\[p\] as \[__proto__\]/);
+  });
+
+  it("sets a column to another column's value", () => {
+    const db = createSybaseDrizzle(config);
+    const t = sybaseTable("T", {
+      k: varchar("k", { length: 5 }).primaryKey(),
+      a: varchar("a", { length: 5 }),
+      b: varchar("b", { length: 5 })
+    });
+    expect(db.update(t).set({ a: t.b }).where(eq(t.k, "x")).toSQL()).toMatch(
+      /set \[a\] = \[T\]\.\[b\]/i
+    );
+  });
+
+  it("keeps insert working when detached from the handle", () => {
     const db = createSybaseDrizzle(config);
     const t = sybaseTable("T", { k: varchar("k", { length: 5 }).primaryKey() });
     const { insert } = db;
     expect(() => insert(t).values({ k: "a" }).toSQL()).not.toThrow();
+  });
+
+  // As Drizzle does: a sql field's mapWith() decoder applies to its values.
+  it("applies the decoder a selected sql field was given with mapWith", async () => {
+    const db = createSybaseDrizzle(config);
+    const t = sybaseTable("T", { k: varchar("k", { length: 5 }).primaryKey() });
+    const query = vi.spyOn(SybasePool.prototype, "query").mockResolvedValue(
+      result({
+        rows: [
+          { amount: "1.5000", plain: "2.5000", aliased: "3" },
+          { amount: null, plain: null, aliased: null }
+        ],
+        rowCount: 2
+      })
+    );
+    try {
+      const rows = await db
+        .select({
+          amount: sql<number>`convert(money, '1.5')`.mapWith(Number),
+          plain: sql<string>`convert(money, '2.5')`,
+          aliased: sql`3`.mapWith(v => `#${String(v)}`).as("aliased")
+        })
+        .from(t);
+      expect(rows).toEqual([
+        { amount: 1.5, plain: "2.5000", aliased: "#3" },
+        { amount: null, plain: null, aliased: null }
+      ]);
+    } finally {
+      query.mockRestore();
+    }
+  });
+});
+
+describe("transaction begin", () => {
+  // BEGIN may have run on the server even though its result never arrived.
+  it("rolls back what a failed BEGIN may have begun before releasing the connection", async () => {
+    const { pool, conn, executed } = fakePool();
+    Object.assign(conn, {
+      query: async (sql: string) => {
+        executed.push(sql);
+        if (sql.includes("BEGIN TRAN")) {
+          throw new Error("Could not hand the query result to JavaScript");
+        }
+        return serverVar(sql) ?? result();
+      }
+    });
+    await expect(new SybaseSession(pool).transaction(async () => "x")).rejects.toThrow(
+      /hand the query result/
+    );
+    expect(executed).toContain("if @@trancount > 0 rollback tran");
+  });
+});
+
+describe("withConnection executeAtomic", () => {
+  // Once a ROLLBACK or COMMIT runs, the rest of the batch runs in autocommit:
+  // refused before anything is sent, as in db.transaction().
+  it.each(["rollback tran\ninsert t values (1)", "insert t values (1)\ncommit"])(
+    "refuses %j before sending it",
+    async sql => {
+      const { pool, executed } = fakePool();
+      await expect(
+        new SybaseSession(pool).withConnection(c => c.executeAtomic(sql))
+      ).rejects.toThrow(/COMMIT and ROLLBACK cannot run inside executeAtomic/);
+      expect(executed.filter(q => q.includes("insert t"))).toEqual([]);
+    }
+  );
+
+  // Under a savepoint of an open transaction, a procedure that ends that
+  // transaction leaves the rest of the batch committed on its own.
+  it("fails when a procedure ends the enclosing transaction", async () => {
+    const { pool, conn, executed } = fakePool();
+    let tc = 1;
+    Object.assign(conn, {
+      query: async (sql: string) => {
+        executed.push(sql);
+        if (sql.startsWith("exec")) {
+          tc = 0;
+        }
+        return serverVar(sql, { tc }) ?? result();
+      }
+    });
+    await expect(
+      new SybaseSession(pool).withConnection(c => c.executeAtomic("exec ends_tran"))
+    ).rejects.toThrow(/ended the transaction it ran in/);
+  });
+});
+
+describe("withConnection cleanup", () => {
+  // Closing the connection rolls back what the callback left uncommitted: its
+  // success cannot be reported when the state could not be checked.
+  it("fails when the session's state cannot be checked after the callback", async () => {
+    const { pool, conn } = fakePool();
+    Object.assign(conn, {
+      resetSessionState: async () => {
+        throw new Error("connection lost");
+      }
+    });
+    let closed = false;
+    Object.assign(conn, { close: () => (closed = true) });
+    await expect(
+      new SybaseSession(pool).withConnection(async c => {
+        await c.executeRaw("begin tran insert t values (1)");
+        return "done";
+      })
+    ).rejects.toThrow(/state could not be checked/);
+    expect(closed).toBe(true);
+  });
+
+  // Gone without the callback being told: what it left uncommitted is lost.
+  it("fails when the connection was lost without the callback being told", async () => {
+    const { pool, conn } = fakePool();
+    await expect(
+      new SybaseSession(pool).withConnection(async c => {
+        await c.executeRaw("begin tran insert t values (1)");
+        Object.assign(conn, { isConnected: false });
+        return "done";
+      })
+    ).rejects.toThrow(/state could not be checked/);
+  });
+
+  // A call that failed as the connection went does not say the callback knew
+  // what was lost: the error may be another one, or come after it returned.
+  it("fails after a lost connection even when the callback caught the error", async () => {
+    const { pool, conn } = fakePool();
+    Object.assign(conn, {
+      query: async () => {
+        Object.assign(conn, { isConnected: false });
+        throw new Error("connection lost");
+      }
+    });
+    await expect(
+      new SybaseSession(pool).withConnection(async c =>
+        c.executeRaw("select 1").catch(() => "handled")
+      )
+    ).rejects.toThrow(/state could not be checked/);
+  });
+
+  it("fails when a call left running fails after the callback returned", async () => {
+    const { pool, conn } = fakePool();
+    let fail!: () => void;
+    Object.assign(conn, {
+      query: () =>
+        new Promise((_, reject) => {
+          fail = () => {
+            Object.assign(conn, { isConnected: false });
+            reject(new Error("connection lost"));
+          };
+        })
+    });
+    const done = new SybaseSession(pool).withConnection(async c => {
+      c.executeRaw("insert t values (1)").catch(() => {});
+      return "done";
+    });
+    await vi.waitFor(() => expect(fail).toBeTypeOf("function"));
+    fail();
+    await expect(done).rejects.toThrow(/state could not be checked/);
   });
 });
 

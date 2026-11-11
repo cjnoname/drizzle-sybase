@@ -221,6 +221,39 @@ describe.skipIf(!hasConfig)("native close while a query is queued", () => {
     ]);
   }, 70_000);
 
+  // Making a query's promise runs promise hooks — JavaScript, which may close
+  // the handle. The connection was pinned only after: the close freed it
+  // (on a worker, while the hook blocked) and the query then used it.
+  it("keeps the connection of a query closed by a promise hook", () => {
+    const nativeUrl = new URL("../native/index.ts", import.meta.url).href;
+    const script = `${RESOLVE_TS}
+      const { native } = await import(${JSON.stringify(nativeUrl)});
+      const { promiseHooks } = await import("node:v8");
+      const cfg = JSON.parse(process.env.CFG);
+      const h = await native.connect(cfg);
+      let armed = true;
+      const stop = promiseHooks.onInit(() => {
+        if (!armed) return;
+        armed = false;
+        native.close(h);
+        // Time for the close's worker to free the connection.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+      });
+      const result = native.query(h, "select 1 as x");
+      stop();
+      console.log(JSON.stringify(await result.then(() => "resolved", e => e.message)));
+    `;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, CFG: JSON.stringify(config) },
+      cwd: fileURLToPath(new URL("../..", import.meta.url)),
+      encoding: "utf8",
+      timeout: 60_000
+    });
+
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout.trim().split("\n").at(-1)!)).toMatch(/closed/i);
+  }, 70_000);
+
   // The handle outlives the connection: before, a second close or any use of
   // the handle after close read freed memory. Run in a child, as above.
   it("keeps a closed handle safe to close, check and query", () => {
@@ -234,12 +267,28 @@ describe.skipIf(!hasConfig)("native close while a query is queued", () => {
       native.close(h);
       out.push(native.isAlive(h));
       out.push(await native.query(h, "select 1").then(() => "resolved", e => e.message));
-      // Never closed: the GC finalizer must release it cleanly.
+      // Never closed: the GC finalizer must release it — its server session
+      // ends — without holding up the JS thread for its logout.
+      const probe = await native.connect(cfg);
       let leaked = await native.connect(cfg);
-      await native.query(leaked, "select 1");
+      const spid = (await native.query(leaked, "select @@spid as s")).rows[0].s;
       leaked = null;
-      for (let i = 0; i < 5; i++) { globalThis.gc(); await new Promise(r => setTimeout(r, 20)); }
-      out.push("gc ok");
+      let longest = 0;
+      for (let i = 0; i < 5; i++) {
+        const t = performance.now();
+        globalThis.gc();
+        await new Promise(r => setTimeout(r, 20));
+        longest = Math.max(longest, performance.now() - t - 20);
+      }
+      let gone = false;
+      for (let i = 0; i < 100 && !gone; i++) {
+        const { rows } = await native.query(probe, "select count(*) as n from master..sysprocesses where spid = " + spid + " and program_name = 'drizzle-sybase'");
+        gone = rows[0].n === 0;
+        if (!gone) await new Promise(r => setTimeout(r, 100));
+      }
+      native.close(probe);
+      out.push(gone ? "gc closed it" : "still open");
+      out.push(longest < 1000 ? "not blocked" : "blocked " + Math.round(longest) + " ms");
       console.log(JSON.stringify(out));
     `;
     const child = spawnSync(
@@ -257,9 +306,64 @@ describe.skipIf(!hasConfig)("native close while a query is queued", () => {
     expect(JSON.parse(child.stdout.trim().split("\n").at(-1)!)).toEqual([
       false,
       "Connection is closed",
-      "gc ok"
+      "gc closed it",
+      "not blocked"
     ]);
   }, 70_000);
+
+  // A worker thread ending right after a close (or with a connection still
+  // open) must not take the process down: the close runs as async work Node
+  // waits for, not as a request its loop would be torn down under (that
+  // aborted the process: "uv_loop_close() while having open handles").
+  it("lets worker threads end while their connections close", () => {
+    const nativeUrl = new URL("../native/index.ts", import.meta.url).href;
+    const workerCode = `
+      const { workerData, parentPort } = require("node:worker_threads");
+      require("node:module").registerHooks({
+        resolve(specifier, context, next) {
+          try { return next(specifier, context); } catch (err) {
+            if (!specifier.startsWith(".") || !specifier.endsWith(".js")) throw err;
+            return next(specifier.slice(0, -3) + ".ts", context);
+          }
+        }
+      });
+      import(workerData.url).then(async ({ native }) => {
+        const h = await native.connect(workerData.cfg);
+        await native.query(h, "select 1");
+        if (workerData.mode.startsWith("close")) native.close(h);
+        if (workerData.mode.endsWith("exit")) process.exit(0);
+        parentPort.postMessage("ready");
+      });`;
+    const script = `
+      const { Worker } = await import("node:worker_threads");
+      const cfg = JSON.parse(process.env.CFG);
+      let ended = 0;
+      for (const mode of ["close-exit", "open-exit", "close-terminate", "open-terminate"]) {
+        for (let i = 0; i < 4; i++) {
+          const w = new Worker(${JSON.stringify(workerCode)}, {
+            eval: true,
+            execArgv: [],
+            workerData: { url: ${JSON.stringify(nativeUrl)}, cfg, mode }
+          });
+          await new Promise((resolve, reject) => {
+            w.on("message", () => w.terminate());
+            w.on("error", reject);
+            w.on("exit", resolve);
+          });
+          ended++;
+        }
+      }
+      console.log(ended);
+    `;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, CFG: JSON.stringify(config) },
+      cwd: fileURLToPath(new URL("../..", import.meta.url)),
+      encoding: "utf8",
+      timeout: 120_000
+    });
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stdout.trim().split("\n").at(-1)).toBe("16");
+  }, 130_000);
 
   // Rows past the internal cap used to be dropped and the rest returned as if
   // it were the whole result.
@@ -1196,6 +1300,25 @@ describe.skipIf(!hasConfig)("builder round trip for every column type", () => {
     uc unichar(4) null, uvc univarchar(20) null, t text null, ut unitext null,
     bin binary(4) null, vbin varbinary(4) null, img image null)`;
 
+  // unsigned bigint takes a digit string as bigint does: converted exactly,
+  // in a write and in a WHERE.
+  it("writes and matches an unsigned bigint given as a digit string", async () => {
+    const db = createSybaseDrizzle({ ...config, max: 1 });
+    try {
+      await db.withConnection(async conn => {
+        await conn.executeRaw("create table #ub (k int not null, ub unsigned bigint null)");
+        const ub = sybaseTable("#ub", { k: int("k").notNull(), ub: unsignedBigint("ub") });
+        await conn.executeRaw(db.insert(ub).values({ k: 1, ub: "18446744073709551615" }).toSQL());
+        const found = await conn.executeRaw(
+          db.select().from(ub).where(eq(ub.ub, "18446744073709551615")).toSQL()
+        );
+        expect(found.rows).toEqual([{ k: 1, ub: 18446744073709551615n }]);
+      });
+    } finally {
+      await db.close();
+    }
+  }, 60_000);
+
   it("writes every declared write type and reads back the declared read type", async () => {
     const db = createSybaseDrizzle({ ...config, max: 1 });
     try {
@@ -1385,6 +1508,25 @@ describe.skipIf(!hasConfig)("transaction after a caught statement error", () => 
       const after = await pool.query("SELECT name FROM sysobjects WHERE type = 'S'");
       expect(after.rows).toHaveLength(all);
       expect((await pool.query("SELECT @@trancount AS tc")).rows[0]).toEqual({ tc: 0 });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  // The same in withConnection: a caught failure must not leave the next
+  // statements of the callback cut to one row.
+  it("puts ROWCOUNT back after a failed statement in withConnection", async () => {
+    const pool = new SybasePool({ ...config, max: 1 });
+    const session = new SybaseSession(pool);
+    try {
+      const all = (await pool.query("SELECT name FROM sysobjects WHERE type = 'S'")).rows.length;
+      const after = await session.withConnection(async conn => {
+        await expect(
+          conn.execute("SET ROWCOUNT 1\nSELECT 1/0 AS v\nSET ROWCOUNT 0")
+        ).rejects.toThrow(/Msg 3607/);
+        return (await conn.execute("SELECT name FROM sysobjects WHERE type = 'S'")).rows.length;
+      });
+      expect(after).toBe(all);
     } finally {
       await pool.close();
     }

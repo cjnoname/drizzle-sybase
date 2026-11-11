@@ -29,7 +29,14 @@
 import type { Codecs } from "drizzle-orm/codecs";
 
 /** Type keys of the codecs below; set as `codec` on the matching columns. */
-export const EXACT_NUMERIC_TYPES = ["money", "smallmoney", "bigint", "numeric", "decimal"] as const;
+export const EXACT_NUMERIC_TYPES = [
+  "money",
+  "smallmoney",
+  "bigint",
+  "unsigned bigint",
+  "numeric",
+  "decimal"
+] as const;
 
 /**
  * Column shape the helpers here rely on. Satisfied by `SybaseColumn` and by
@@ -49,7 +56,8 @@ const columnSqlType = (col: SqlTypedColumn): string => {
 const FIXED_SCALES: Readonly<Record<string, number>> = {
   money: 4,
   smallmoney: 4,
-  bigint: 0
+  bigint: 0,
+  "unsigned bigint": 0
 };
 
 /**

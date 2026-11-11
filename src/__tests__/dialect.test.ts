@@ -51,6 +51,12 @@ describe("escapeString", () => {
   it("refuses an unpaired surrogate, which is not a character", () => {
     expect(() => escapeString("a\ud83d")).toThrow(/unpaired surrogate/);
   });
+
+  // db-lib would end the SQL at it: refused, rather than dropped (which would
+  // change the value).
+  it("refuses a NUL character", () => {
+    expect(() => escapeString("a\u0000b")).toThrow(/NUL/);
+  });
 });
 
 describe("serializeValue", () => {

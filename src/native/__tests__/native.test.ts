@@ -3,8 +3,9 @@ import { describe, it, expect } from "vitest";
 import { native } from "../index.js";
 
 describe("native binding", () => {
+  // `native` loads the addon on first use: this is that use.
   it("loads successfully", () => {
-    expect(native).toBeDefined();
+    expect(String(native.getVersion())).toContain("FreeTDS");
   });
 
   it("exposes connect function", () => {
@@ -23,6 +24,10 @@ describe("native binding", () => {
     expect(typeof native.isAlive).toBe("function");
   });
 
+  it.each(["bulkBegin", "bulkSend"] as const)("exposes %s function", name => {
+    expect(typeof native[name]).toBe("function");
+  });
+
   it("exposes serverCharset function", () => {
     expect(typeof native.serverCharset).toBe("function");
   });
@@ -38,6 +43,13 @@ describe("native binding", () => {
     const version = native.getVersion();
     expect(version).toContain("FreeTDS");
     expect(version).toContain("db-lib");
+  });
+
+  // As SybaseConnection.queryToFile does: a file holds one result set.
+  it("refuses allResultSets for queryToFile", () => {
+    expect(() =>
+      native.queryToFile({}, "select 1", { path: "/nowhere/x.csv", allResultSets: true } as never)
+    ).toThrow(/allResultSets is not supported/);
   });
 
   // Anything but a handle from connect() must be rejected, never dereferenced.

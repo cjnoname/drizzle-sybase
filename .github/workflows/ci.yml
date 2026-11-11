@@ -14,6 +14,13 @@ jobs:
     steps:
       - run: echo "CI should run"
 
+  # Every platform's binary built and loaded where it runs, and the package
+  # packed and loaded: what a release would publish.
+  native:
+    needs: should-run
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/native.yml
+
   # Build native addon + run tests on all platforms
   test:
     needs: should-run
@@ -96,8 +103,10 @@ jobs:
       - name: Run linter
         run: pnpm lint
 
+      # The full type check (`tsc --noEmit`), which covers the tests and the type
+      # tests (*.test-d.ts) that the build config leaves out.
       - name: Run type check
-        run: pnpm build
+        run: pnpm type
 
   # One job per language: `build-mode` is only valid when a single language is
   # analyzed per job, and the two languages need different treatment anyway.

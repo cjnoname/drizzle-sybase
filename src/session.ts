@@ -1,3 +1,4 @@
+import type { SybaseBulkInsertOptions, SybaseBulkInsertResult } from "./bulk.js";
 /**
  * Sybase session — wraps connection pool to provide query execution.
  *
@@ -14,7 +15,7 @@ import type {
 } from "./connection.js";
 import { emitQueryLog, readServerInt } from "./connection.js";
 import { resolveTimeZone } from "./datetime.js";
-import { SybaseConnectionError, SybaseError } from "./errors.js";
+import { SybaseBulkCopyError, SybaseConnectionError, SybaseError } from "./errors.js";
 import type { SybasePool } from "./pool.js";
 import type { SybaseColumnarResult, SybaseFileResult } from "./result.js";
 import {
@@ -70,6 +71,8 @@ export interface SybaseSessionQueryResult<T = Record<string, unknown>> {
   rows: T[];
   rowCount: number;
   affectedRows: number;
+  /** With the `allResultSets` option: the rows of every result set, the first being `rows`. */
+  resultSets?: Record<string, unknown>[][];
 }
 
 /**
@@ -88,7 +91,8 @@ const inZone = (options: SybaseQueryOptions | undefined, timeZone: string): Syba
 const toSessionResult = <T>(result: QueryResult<T>): SybaseSessionQueryResult<T> => ({
   rows: result.rows,
   rowCount: result.rowCount,
-  affectedRows: result.affectedRows
+  affectedRows: result.affectedRows,
+  ...(result.resultSets && { resultSets: result.resultSets })
 });
 
 const TRANSACTION_ABORTED =
@@ -169,6 +173,14 @@ export class SybaseSession {
   }
 
   /**
+   * Bulk copy rows into a table on a pooled connection — see
+   * `SybaseConnection.bulkInsert`.
+   */
+  async bulkInsert(options: SybaseBulkInsertOptions): Promise<SybaseBulkInsertResult> {
+    return this.pool.bulkInsert(options);
+  }
+
+  /**
    * Execute a multi-statement batch all-or-nothing.
    *
    * ASE commits each statement of a batch as it runs and carries on past
@@ -204,9 +216,24 @@ export class SybaseSession {
     try {
       // The isolation level applies to the transaction begun in the same batch.
       const level = options?.isolationLevel ? isolationLevelMap[options.isolationLevel] : undefined;
-      await conn.query(
-        level === undefined ? "BEGIN TRAN" : `SET TRANSACTION ISOLATION LEVEL ${level}\nBEGIN TRAN`
-      );
+      try {
+        await conn.query(
+          level === undefined
+            ? "BEGIN TRAN"
+            : `SET TRANSACTION ISOLATION LEVEL ${level}\nBEGIN TRAN`
+        );
+      } catch (err) {
+        // A failure does not say the server did not begin it (its answer may be
+        // what was lost): never hand the connection back with one open.
+        if (conn.isConnected) {
+          try {
+            await conn.query("if @@trancount > 0 rollback tran");
+          } catch {
+            conn.close();
+          }
+        }
+        throw err;
+      }
       tx = new SybaseTransactionSession(conn, this.pool.logger, this.timeZone);
       try {
         const result = await fn(tx);
@@ -292,11 +319,23 @@ export class SybaseSession {
     // Finishes anything `fn` started without awaiting, and refuses later use
     // of `session`: the connection may already be someone else's.
     await session.end();
-    const leftOpen = await this.releasePinned(conn, session);
-    if (leftOpen) {
+    const state = await this.releasePinned(conn, session);
+    if (state === "open") {
       throw new SybaseError(
         "withConnection() left a transaction open (or chained mode on); it was rolled back. " +
           "Use db.transaction() for transactions."
+      );
+    }
+    // Not known to be clean: the connection is gone (or its reset failed and it
+    // was closed), which rolled back whatever `fn` may have left uncommitted —
+    // so its success cannot be reported as such. That one of its calls failed
+    // as the connection went does not say `fn` knew what was lost: the error
+    // may have been another, or come after `fn` returned.
+    if (state === "unknown") {
+      throw new SybaseError(
+        "withConnection(): the session's state could not be checked after the callback (the " +
+          "connection was lost, or could not be reset and was closed); anything it left " +
+          "uncommitted was rolled back."
       );
     }
     return result;
@@ -304,17 +343,21 @@ export class SybaseSession {
 
   /**
    * Return a {@link withConnection} connection to the pool in its baseline
-   * state. Resolves to whether a transaction was left open; a connection whose
-   * state cannot be established is discarded.
+   * state. Resolves to what the callback left: `"clean"`, `"open"` (a
+   * transaction or chained mode, now undone) or `"unknown"`: its state could
+   * not be checked (the connection was gone, or the reset failed), and it is
+   * discarded.
    */
   private async releasePinned(
     conn: SybaseConnection,
     session: SybaseConnectionSession
-  ): Promise<boolean> {
-    let leftOpen = false;
+  ): Promise<"clean" | "open" | "unknown"> {
+    let state: "clean" | "open" | "unknown" = "unknown";
     try {
       if (conn.isConnected) {
-        leftOpen = (await conn.resetSessionState()).leftOpen;
+        state = (await conn.resetSessionState()).leftOpen ? "open" : "clean";
+      } else if (session.closedAfterCompleteCopy) {
+        state = "clean";
       }
       // After the reset: a drop inside the transaction it rolls back would be undone.
       if (session.mayHaveCreatedTempTables && conn.isConnected) {
@@ -322,12 +365,13 @@ export class SybaseSession {
       }
     } catch {
       conn.close();
+      state = "unknown";
     }
     if (session.discardConnection) {
       conn.close();
     }
     this.pool.release(conn);
-    return leftOpen;
+    return state;
   }
 }
 
@@ -342,6 +386,7 @@ export class SybaseConnectionSession {
   private queue: Promise<unknown> = Promise.resolve();
   private _discardConnection = false;
   private _mayHaveCreatedTempTables = false;
+  private _closedAfterCompleteCopy = false;
 
   constructor(
     private readonly conn: SybaseConnection,
@@ -363,6 +408,14 @@ export class SybaseConnectionSession {
   /** @internal See {@link SybaseTransactionSession.mayHaveCreatedTempTables}. */
   get mayHaveCreatedTempTables(): boolean {
     return this._mayHaveCreatedTempTables;
+  }
+
+  /**
+   * @internal The connection was closed by a bulk copy that completed: what it
+   * left is known — nothing uncommitted was lost — though it cannot be checked.
+   */
+  get closedAfterCompleteCopy(): boolean {
+    return this._closedAfterCompleteCopy;
   }
 
   async execute<T extends Record<string, unknown> = Record<string, unknown>>(
@@ -396,12 +449,68 @@ export class SybaseConnectionSession {
   }
 
   /**
+   * Bulk copy rows into a table on this connection — see
+   * `SybaseConnection.bulkInsert`. Can load a `#temp` table created earlier in
+   * the callback. A copy that fails part way closes the connection (that is
+   * what rolls its open batch back), so the callback cannot use it afterwards.
+   */
+  async bulkInsert(options: SybaseBulkInsertOptions): Promise<SybaseBulkInsertResult> {
+    return this.serialize(async () => {
+      if (this.ended) {
+        throw new SybaseError(
+          "withConnection() has ended; statements must run inside its callback"
+        );
+      }
+      if (!this.conn.isConnected) {
+        throw new SybaseConnectionError("Connection is dead");
+      }
+      const sql = `insert bulk ${options.table}`;
+      const startTime = Date.now();
+      try {
+        const result = await this.conn.bulkInsert(options);
+        // A copy that succeeded but could not restore its session settings
+        // closes the connection. Nothing was uncommitted then (a copy is
+        // refused in a transaction or chained mode), and nothing ran after it.
+        if (!this.conn.isConnected) {
+          this._closedAfterCompleteCopy = true;
+        }
+        emitQueryLog(this.logger, {
+          sql,
+          durationMs: Date.now() - startTime,
+          rowCount: result.rowsCopied,
+          timestamp: new Date(startTime)
+        });
+        return result;
+      } catch (err) {
+        emitQueryLog(this.logger, {
+          sql,
+          durationMs: Date.now() - startTime,
+          // Batches committed before the failure stay (rows in doubt may not).
+          rowCount: err instanceof SybaseBulkCopyError ? err.rowsCommitted : 0,
+          error: err instanceof Error ? err : new Error(String(err)),
+          timestamp: new Date(startTime)
+        });
+        throw err;
+      }
+    });
+  }
+
+  /**
    * Execute a multi-statement batch all-or-nothing: in a transaction of its
    * own, or under a savepoint if the caller has opened one with raw SQL.
    */
   async executeAtomic<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string
   ): Promise<SybaseSessionQueryResult<T>> {
+    // Refused before it is sent, as in db.transaction(): once a COMMIT or
+    // ROLLBACK runs, the rest of the batch runs in autocommit.
+    if (endsTransaction(rawSql)) {
+      throw new SybaseError(
+        "COMMIT and ROLLBACK cannot run inside executeAtomic(): the batch runs in a transaction " +
+          "(or under a savepoint) of its own. Savepoints (`save tran x` / `rollback tran x`) " +
+          "are allowed."
+      );
+    }
     return toSessionResult(
       await this.serialize(async () => {
         const { rows } = await this.run<Record<string, unknown>>(
@@ -409,13 +518,28 @@ export class SybaseConnectionSession {
           undefined,
           true
         );
-        const nested = (readServerInt(rows, "tc") ?? 0) > 0;
+        const depth = readServerInt(rows, "tc") ?? 0;
+        const nested = depth > 0;
         const savepoint = `${ATOMIC_SAVEPOINT_PREFIX}1`;
         await this.run(nested ? `save tran ${savepoint}` : "BEGIN TRAN", undefined, true);
         try {
           const result = await this.run<T>(rawSql);
           if (!nested) {
             await this.run(COMMIT_SQL, undefined, true);
+          } else if (mayLeaveSessionState(rawSql)) {
+            // A procedure may have ended the transaction this batch was meant
+            // to be part of: the rest of it then ran in autocommit.
+            const after = await this.run<Record<string, unknown>>(
+              "select @@trancount as tc",
+              undefined,
+              true
+            );
+            if ((readServerInt(after.rows, "tc") ?? 0) < depth) {
+              throw new SybaseError(
+                "executeAtomic(): the batch ended the transaction it ran in, so it was not atomic: " +
+                  "what ran after that was committed on its own"
+              );
+            }
           }
           return result;
         } catch (err) {
@@ -492,6 +616,17 @@ export class SybaseConnectionSession {
         error: err instanceof Error ? err : new Error(String(err)),
         timestamp: new Date(startTime)
       });
+      // A failed batch can skip its trailing `SET ROWCOUNT 0`, and the callback
+      // may catch the error and go on: every later statement would then be
+      // silently cut short. Put back (it leaves any transaction alone), or the
+      // connection is closed, its state unknown.
+      if (!internal && this.conn.isConnected) {
+        try {
+          await this.conn.query("SET ROWCOUNT 0");
+        } catch {
+          this.conn.close();
+        }
+      }
       throw err;
     }
   }

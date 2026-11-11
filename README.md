@@ -150,7 +150,11 @@ the number of rows (only with the largest single value) and the event loop
 stays free. The file is written beside `path` and renamed into place when the
 query succeeds: a failed query leaves an existing file untouched and no partial
 one behind, and a query whose connection was closed before it finished (as on a
-hard timeout) publishes nothing. On Linux and macOS the file is created
+hard timeout) publishes nothing — unless the close lands while the finished file
+is being renamed into place: then it is still published, possibly just after the
+call has rejected (only a slow file system makes that window noticeable). So a
+retry after a timeout should write to a path of its own: one into the same path
+could be overwritten by the late rename of the attempt that timed out. On Linux and macOS the file is created
 readable by its owner only (mode `0600`), since it holds query results; `chmod`
 it if another user must read it. The file is not fsynced: it is meant to be read
 right away (by DuckDB, or an upload), not to survive a crash of the machine.
@@ -201,6 +205,242 @@ file (main thread busy ~20 ms, peak RSS ~0.4 GB) against about 4.7 s via
 `executeColumns` and the DuckDB appender (main thread busy ~3 s, peak RSS
 1.1–1.6 GB).
 
+## Bulk Copy (bcp, in process)
+
+`db.bulkInsert()` loads rows with ASE's bulk copy protocol — what the `bcp`
+utility uses — from inside the process: no `bcp` binary, no separate Lambda,
+no payload limits. Rows are arrays of values or TSV, read as the copy goes:
+
+```ts
+const { rowsCopied, batches } = await db.bulkInsert({
+  table: "apradb..DDSD", // db..table, db.owner.table, owner.table, table or #temp
+  columns: ["RCSBkey", "cd_unit_type", "line_number", "price"], // default: every column
+  rows: [["A0000001", "C", 1, "12.3456"] /* , ... */], // arrays, an async generator, or TSV
+  batchSize: 20_000, // default "all": one batch for the whole call
+  expectedRows: 20_000 // optional: fail unless exactly this many are copied
+});
+// { rowsCopied: 20000, batches: [{ rows: 20000 }], rejected: [], rejectedCount: 0, elapsedMs }
+```
+
+It is on `db` (a pooled connection) and on `withConnection`'s handle (to load a
+`#temp` table created in the same callback). It is not on a `db.transaction()`
+handle, and is refused when a transaction is open, or in chained mode (where
+every statement opens one): each batch it commits must be committed for good.
+
+**Rows.**
+
+- **Values:** any `Iterable` or `AsyncIterable` of arrays — an array, a
+  generator, an object-mode stream.
+- **TSV:** a `string` or `Buffer` of UTF-8 text, or an iterable of such pieces
+  (e.g. `fs.createReadStream(path)`) split anywhere. bcp's character format:
+  fields separated by tab, rows by `\n` or `\r\n`, an empty field is NULL, no
+  quoting, binary columns in hex. As in bcp, every line is a row — an empty one
+  too — and a byte-order mark is data.
+- An array of strings is TSV pieces, not rows: `["a", "b"]` is the one row
+  `ab`; rows of values are arrays (`[["a"], ["b"]]`).
+- **Memory:** the input is never held whole. Rows are read ahead of what is
+  being sent, so reading and sending overlap: about three chunks of up to 4 MiB,
+  plus a copy of the TSV piece being cut (a stream's are 64 KiB).
+
+**Atomicity.** Each batch is a transaction on the server: it commits whole or
+not at all. With `batchSize: "all"` (the default), a failure before the server
+confirms the copy's end commits nothing. With a batch size, each batch commits
+as soon as it is full — even when it turns out to be the only one, before the
+source is known to have ended — so a failure after it (the source throwing on
+its next row, say) leaves it committed, and the error says exactly which:
+
+```ts
+try {
+  await db.bulkInsert({ table, rows, batchSize: 20_000 });
+} catch (err) {
+  if (err instanceof SybaseBulkCopyError) {
+    err.rowsCommitted; // rows of the batches the server confirmed before the failure
+    err.batches; // [{ rows }, ...] — the batches committed, each with its count
+    err.rowsInDoubt; // see below; 0 in every other case
+    (err.row, err.column); // the input row (1-based) and column a refused value was in
+    err.cause; // SybaseQueryError (e.g. Msg 2601 duplicate key), SybaseTimeoutError, ...
+  }
+}
+```
+
+A failed copy is abandoned by closing its connection — that is what makes the
+server roll back the batch it never saw the end of — so the pool never hands
+out a connection left in the middle of a copy. A duplicate key in a unique
+index fails the batch that holds it, as a whole. The one case the outcome cannot be
+known is when the connection is lost (or the deadline passes) while the server
+is committing a batch: the answer never arrives, and the error reports those
+rows as `rowsInDoubt` instead of guessing — every row of that batch handed to
+the server, so an upper bound (rows it would have refused under `maxErrors` are
+in it too). Only then does the caller have to look.
+
+**Bulk copy is not an `insert`: CHECK constraints, foreign keys, rules and
+triggers are not applied.** This is ASE's bulk copy itself — the `bcp` utility
+behaves the same — not this driver: the server checks a row's types, NOT NULL
+and unique indexes, but a row that breaks a CHECK constraint or references a
+missing parent row is stored, and no insert trigger fires (checked against ASE
+15.7). So a copy into a table that has any of these is **refused** before it
+starts, naming what the table has. Load such a table through a staging table
+and an `insert ... select`; or, when the rows are known to satisfy them (or the
+trigger need not run), pass `allowConstraintBypass: true` to copy anyway. The
+check is made once, as the copy starts: changing the table's constraints or
+triggers while a copy into it runs is not supported.
+
+**Counts are the server's.** `rowsCopied` and each batch's `rows` are what the
+server reported when it committed (`bcp_batch` / `bcp_done`), never what was
+sent; a batch whose count differs from what was sent fails the call.
+`expectedRows` is checked before the last commit, so a mismatch commits
+nothing more.
+
+**Locking and size.** A batch is one transaction holding its locks until it
+commits. Once a batch holds more rows than the table's lock promotion
+threshold, ASE escalates to a **table lock** for the rest of that batch,
+blocking every other reader and writer of the table until it commits: the
+`row lock promotion HWM` for datarows tables (ASE's default is 200; many
+servers raise it — the one this was tested on uses 25,000; see
+`sp_configure "row lock promotion HWM"` and `sp_setrowlockpromote`), the `page
+lock promotion HWM` for allpages tables. On a table others use, keep
+`batchSize` below it. A batch is also logged as one transaction (a table with
+indexes gets a fully logged "slow" bcp), so a very large single batch needs log
+space for all of it. The driver does not cap or split batches behind your back.
+
+**Values are copied exactly, or refused.** Each value is checked and converted
+before it is sent, with the query builders' rules — except that money takes no
+`bigint` here (below):
+
+- `money`/`smallmoney` take a decimal string (`"12.3456"`) — **not a
+  `bigint`**: an amount held as an integer may count whole units or
+  ten-thousandths, and guessing wrong stores it 10,000 times off without an
+  error. Turn it into the decimal string for its unit first.
+- `numeric`/`decimal` take a decimal string or a `bigint` (a whole number).
+  More fraction digits than the column keeps are
+  refused, never rounded (`"1.50000"` is fine, `"12.34567"` into money is not).
+  A `number` is refused where it cannot hold every value of the column.
+- Integers must be in the column's range; `bigint` takes a `bigint` or digits.
+- `datetime`/`smalldatetime` take a `Date` (written as its wall clock in the
+  configured `timeZone`, like everywhere else) or a wall-clock string
+  `YYYY-MM-DD[ HH:MM[:SS[.mmm]]]`, stored as written. The sub-millisecond
+  rounding to 1/300 s is the server's own: a copied value equals the same
+  literal inserted with SQL.
+- A string longer than its column is refused, never cut — measured in bytes in
+  the server's character set, after the trailing blanks ASE drops anyway.
+- Bulk copy runs only against iso_1 and utf8 servers, the character sets text
+  is converted to; any other is refused rather than sent unconverted.
+- A TSV row longer than 4 MiB fails the copy (no table's row comes near it).
+- On an iso_1 server text is sent as Latin-1; a character Latin-1 cannot hold
+  (e.g. `中`) refuses its row, naming the row, column and character — it is
+  never stored as `?`.
+- Text holding a NUL character refuses its row, as SQL text with one is
+  refused (db-lib would store a lone NUL as a blank).
+- A number, date or bit given as a string of more than 127 characters refuses
+  its row: no value of those types is written that long.
+- An empty string is stored as ASE stores `''` from SQL: one blank. NULL stays
+  NULL — except that, as with the bcp utility, a NULL (an empty TSV field,
+  `null`, `undefined`) or a column left out of `columns` gets the column's
+  DEFAULT. `ignoreDefaults: true` keeps them NULL instead (bcp's
+  `--ignoredefaults`).
+- Identity columns are assigned by the server and left out of the default
+  `columns`. `keepIdentity: true` copies them from the rows (bcp's `-E`;
+  `identity_insert` is switched back off afterwards).
+- `maxErrors: n` leaves up to `n` rows with a refused value out (listed in
+  `rejected`) instead of failing; the default 0 fails on the first.
+
+Column types that can be loaded: `tinyint`, `smallint`, `int`, `bigint`, `bit`,
+`float`, `real`, `money`, `smallmoney`, `numeric`, `decimal`, `datetime`,
+`smalldatetime`, `char`, `varchar`, `nchar`, `nvarchar`, `binary`, `varbinary`.
+Columns of other types (`text`, `image`, `unichar`, `univarchar`, `date`,
+`time`, `bigdatetime`, unsigned integers, `timestamp`, ...) can be left out of
+`columns`.
+
+**Timeouts.** `timeoutSeconds` is the cooperative timeout for each wait on the
+server during the copy — including a batch's commit, which on a large indexed
+table can take a while — and `hardTimeoutMs` (default: twice that, at least
+30 s) bounds the whole call, reading the rows included. When it passes the
+connection is closed, rolling back the open batch.
+
+**Throughput.** The server sets the pace, not the driver. What helps:
+
+- **Fewer, larger calls.** Each call costs about five round trips before and
+  after its rows (reading the table, opening the copy, ending it). Load a large
+  input in one call with `batchSize`, not many small calls.
+- **Load staging tables before indexing them.** Every index is maintained row by
+  row during the copy; build it afterwards.
+
+Datarows and datapages tables are supported through FreeTDS changes not yet
+released, carried in `patches/`.
+
+## Timeouts
+
+`timeout` (seconds, default 30) is the cooperative timeout of each connection:
+when a statement waits on the server longer than that, db-lib cancels it and the
+call fails with a `SybaseTimeoutError`, leaving the connection usable. It is
+set on each connection's own DBPROCESS, not process-wide.
+
+`timeoutSeconds` overrides it for one call, on `execute`, `exec`, `executeRaw`,
+`executeColumns`, `executeToFile` and `bulkInsert`:
+
+```ts
+await db.execute(sql`exec long_report ${id}`, { timeoutSeconds: 600 });
+await db.executeRaw("select ...", { timeoutSeconds: 5 });
+```
+
+It applies to that call only — set on its connection before the call and
+restored after it; other calls, on that connection or others, keep theirs.
+
+**Budget a call on its hard timeout, not on `timeoutSeconds`.** The cooperative
+timeout limits each wait for the server, not the call: a query whose rows keep
+arriving runs past it for as long as it takes. `hardTimeoutMs` bounds the whole
+statement: when it passes, the call fails with a `SybaseTimeoutError` and the
+connection is closed (the pool replaces it). The call settles by then, plus at
+most one second — given a JS thread that is not blocked.
+
+- **Default:** `max(2 * timeoutSeconds * 1000, 30000)` ms. A configured
+  `hardTimeoutMs` applies to calls that do not set their own `timeoutSeconds`
+  (a longer wait asked for must not be cut short by it).
+- **`bulkInsert`:** it bounds the whole copy, reading the rows included, with no
+  grace.
+- **Abandoned calls:** the worker thread and the server session are released
+  within about a second, even from one long wait (a lock, a `waitfor`).
+
+```ts
+// Each wait at most 30 s; the statement at most 45 s.
+await db.execute(sql`exec check_batch ${id}`, { timeoutSeconds: 30, hardTimeoutMs: 45_000 });
+```
+
+**What it does not cover.** It starts when the statement is handed to the
+native layer (waiting there for a worker thread counts). Not counted:
+
+- waiting behind other calls on the same connection (several at once in a
+  `withConnection` callback, say);
+- up to `acquireTimeoutMs` (default 10 s) waiting for a pool connection;
+- after a statement that may have left session state behind (an open
+  transaction, `#temp` tables, a `SET`), a query or two to restore it, under
+  the connection's `timeout`;
+- for a read-only statement whose connection was lost, `retries` more attempts
+  (default 2), each with its own acquire and hard timeout, `retryDelayMs` apart.
+
+A call that must finish by a deadline needs an `acquireTimeoutMs` and
+`hardTimeoutMs` that fit it, and a pool sized so calls do not queue.
+
+## Multiple Result Sets
+
+A batch or procedure that selects several times returns only its first result
+set by default (`rows`), as before. `allResultSets: true` returns all of them —
+every result set that has columns, in order — as `resultSets`, with `rows`
+still the first:
+
+```ts
+const { rows, resultSets } = await db.executeRaw("exec report_with_totals @run = 42", {
+  allResultSets: true
+});
+// resultSets: [[...detail rows], [{ total: "1234.5000" }]]
+```
+
+It works on `execute`, `exec`, `executeRaw` and `executeColumns` (there,
+`resultSets` holds one `{ columns, rowCount }` per set). `maxRows` caps each
+set on its own; as for one set, a set cut short there is not marked as such.
+A statement of the batch that fails fails the call: the sets read before it are
+not returned. `executeToFile` writes one result set and refuses the option.
+
 ## Why not `child_process` + `tsql`?
 
 |                | Old (tsql child_process)    | New (native db-lib)            |
@@ -224,21 +464,35 @@ file (main thread busy ~20 ms, peak RSS ~0.4 GB) against about 4.7 s via
 
 All platform binaries are bundled in the package. At runtime, only the binary matching your `process.platform` + `process.arch` is loaded via `dlopen`.
 
+- **Linux** binaries need glibc 2.34 or later — AWS Lambda's Amazon Linux 2023,
+  Debian 12, Ubuntu 22.04 and later. musl (Alpine) is not supported.
+- **Windows** needs the Microsoft Visual C++ runtime (it links `/MD`).
+- **No TLS.** FreeTDS is built without a TLS library, so the connection to ASE
+  is not encrypted: run it over a network you trust (a VPC, a VPN or an SSH
+  tunnel).
+
 ## Building from Source
 
-If no prebuilt binary exists for your platform:
+To rebuild the binary for one of the platforms above (the loader knows no
+others):
 
 ```bash
-# Requires: C compiler, node-gyp, curl
+# Requires: C compiler, node-gyp, curl. On Windows: scripts/build-win.ps1
 bash scripts/build.sh
 ```
 
 This will:
 
-1. Download FreeTDS source
+1. Download FreeTDS source, check its SHA-256, and apply
+   `patches/freetds-<version>-*.patch` (fixes from FreeTDS's development branch
+   not yet in a release, and a few of our own; each patch says which, and why)
 2. Compile as static library (`libsybdb.a`)
 3. Build the N-API addon linked against it
-4. Place the `.node` file in `src/native/` (e.g. `sybase_native.darwin-arm64.node`)
+4. Place the `.node` file in `src/native/` (e.g. `sybase_native.darwin-arm64.node`),
+   and in `dist/native/` when it exists (an installed package)
+
+After a change to `binding.c` alone, `npm run build:native` rebuilds just the
+addon and puts it in the same places.
 
 ## Architecture
 
@@ -260,6 +514,7 @@ This will:
 │  sybase_native.node (C addon)                        │
 │  - connect() → dbopen()                              │
 │  - query()   → dbcmd() + dbsqlexec() + dbresults()  │
+│  - bulkSend()→ bcp_sendrow() + bcp_batch()/done()   │
 │  - close()   → dbclose()                             │
 │  - Async on libuv worker threads                     │
 │  - FreeTDS libsybdb.a statically linked              │
@@ -278,7 +533,7 @@ This will:
 - **Server-aborted transactions**: ASE rolls a transaction back on its own after some errors (conversion, divide-by-zero, deadlock). Once that happens the `tx` handle refuses further statements and `db.transaction` rejects instead of committing
 - **Raw multi-statement batches are not atomic**: after a statement-level error (e.g. a duplicate key) ASE carries on with the rest of the batch, so earlier and later statements may already be applied when the error is reported. Run such batches inside `db.transaction()` if they must be all-or-nothing
 - **Session state does not leak between pool users**: a connection always returns to the pool with no open transaction, `ROWCOUNT 0`, chained mode off, its original isolation level and the configured database. A raw statement outside `db.transaction()` that leaves a transaction open is rolled back and reported as an error — use `db.transaction()` instead. A connection that ran `setuser` is discarded rather than reused, since its original identity cannot be restored reliably. Other `SET` options (`dateformat`, `textsize`, ...) are not reset
-- **Inside `db.transaction()`, the callback must not end the transaction itself**: a batch containing `COMMIT` or a `ROLLBACK` without a savepoint name is refused before it is sent — once it ran, the rest of its batch would run in autocommit. A procedure that commits or rolls back cannot be seen in the SQL: the driver detects it after the call and refuses every later statement (what the procedure committed stays committed). Savepoints (`save tran x` / `rollback tran x`) are fine
+- **Inside `db.transaction()`, the callback must not end the transaction itself**: a batch containing `COMMIT` or a `ROLLBACK` without a savepoint name is refused before it is sent — once it ran, the rest of its batch would run in autocommit. A procedure that commits or rolls back cannot be seen in the SQL: the driver detects it after the call (from `@@trancount`) and refuses every later statement (what the procedure committed stays committed). It cannot detect a procedure that ends the transaction and then begins another — the depth is the same — so do not call one that does. Savepoints (`save tran x` / `rollback tran x`) are fine
 - **Results are capped at 1,000,000 rows**: a larger result fails rather than being silently cut short. Pass `maxRows` (`db.execute(query, { maxRows })`, also on `exec`, `executeRaw` and `executeColumns`) to raise the cap or accept a truncated result. `executeToFile` holds no rows and has no cap
 - **Packet size**: `packetSize` defaults to 2048, ASE's out-of-the-box `max network packet size`. A server whose limit was raised (e.g. to 4096) can take a larger value for fewer round-trips on big results; one whose limit was lowered (it can go down to 512) needs a smaller one. A request above the server's limit is refused with the same "Login failed" (Msg 4002) as a wrong password — the error message points this out
 - **Temporary tables do not outlive their query or transaction**: a `#temp` table created by a pool query is dropped when that query finishes (the next one may run on another connection), and one created inside `db.transaction()` is dropped when the transaction ends. To use one across several statements, run them in `db.withConnection(async conn => ...)`: one connection, no transaction, and its `#temp` tables are dropped when the callback returns. (Inside `db.transaction()` ASE only allows creating them when `ddl in tran` is enabled.)
@@ -509,4 +764,6 @@ Unmapped Sybase types fall back to `varchar` and are reported via `warnings`.
 
 ## License
 
-MIT
+MIT. The native binaries statically link [FreeTDS](https://www.freetds.org/),
+which is licensed under the GNU LGPL; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -29,7 +29,11 @@
     "dist",
     "src/native/binding.c",
     "binding.gyp",
-    "scripts"
+    "patches",
+    "scripts",
+    "licenses",
+    "vendor",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "type": "module",
   "main": "./dist/index.js",
@@ -47,7 +51,7 @@
   "scripts": {
     "install": "echo 'native addon is prebuilt — skip node-gyp'",
     "build": "tsc -p tsconfig.build.json",
-    "build:native": "node-gyp rebuild",
+    "build:native": "node scripts/build-native.ts",
     "prepare": "husky",
     "prepublishOnly": "npm run build",
     "test": "vitest run",
@@ -62,7 +66,7 @@
     "@types/node": "^26.6.5",
     "concurrently": "^10.0.6",
     "husky": "^9.1.7",
-    "node-gyp": "^13.1.0",
+    "node-gyp": "13.1.0",
     "oxfmt": "^0.74.0",
     "oxlint": "^1.89.0",
     "oxlint-tsgolint": "latest",

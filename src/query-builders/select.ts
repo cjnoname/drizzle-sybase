@@ -56,6 +56,11 @@ const ColumnsSymbol = Symbol.for("drizzle:Columns");
 export interface SybaseSelectField {
   expression: string;
   alias?: string;
+  /**
+   * Applied to the field's non-NULL values: the decoder of a `sql\`...\``
+   * field given one with `.mapWith()`, as Drizzle applies it.
+   */
+  decode?: (value: unknown) => unknown;
 }
 
 /** ASE has no FULL OUTER JOIN. */
@@ -130,6 +135,11 @@ export class SybaseSelectBuilder<
   from<T extends AnySybaseTable>(table: T): SybaseSelectBuilder<WithFrom<S, T>>;
   from(table: string): SybaseSelectBuilder<WithNamedSource<S>>;
   from(table: AnySybaseTable | string): unknown {
+    // Once, as in drizzle: a second FROM would leave the first's columns (and
+    // joins on it) in the select list of a query that no longer reads it.
+    if (this.config.table !== undefined) {
+      throw new Error("select: .from() can be called once");
+    }
     this.config.table = this.addSource(table);
     return this;
   }
@@ -261,6 +271,17 @@ export class SybaseSelectBuilder<
     // The rows are shaped by the field list this builder generated, which is
     // what the result type describes.
     const rows = result.rows as SybaseSelectResult<S>[];
+    const decoded = this.config.fields.filter(field => field.decode && field.alias !== undefined);
+    if (decoded.length > 0) {
+      for (const row of rows as Record<string, unknown>[]) {
+        for (const field of decoded) {
+          const value = row[field.alias!];
+          if (value !== null && value !== undefined) {
+            row[field.alias!] = field.decode!(value);
+          }
+        }
+      }
+    }
 
     // If offset is set, skip the first N rows in application code
     // (Sybase ASE has no native OFFSET support)

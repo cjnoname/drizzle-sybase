@@ -347,8 +347,10 @@ function col(overrides: Partial<ColumnMeta> & Pick<ColumnMeta, "name" | "typeNam
     scale: null,
     isNullable: false,
     isIdentity: false,
+    isComputed: false,
     defaultValue: null,
-    ...overrides
+    ...overrides,
+    hasDefault: overrides.hasDefault ?? Boolean(overrides.defaultValue)
   };
 }
 
@@ -658,13 +660,15 @@ describe("owner-qualified introspection", () => {
     expect(code).toContain('}, { owner: "alice" });');
   });
 
-  it("leaves dbo tables unqualified", () => {
+  // Unqualified, a dbo table would be another table for a user who owns one
+  // of the same name: ASE looks for the user's own first.
+  it("qualifies dbo tables too", () => {
     const { code } = generateSchemaCode(
       [table("T", [col({ name: "ID", typeName: "int" })])],
       "mydb",
       CHAR_SIZES
     );
-    expect(code).not.toContain("owner:");
+    expect(code).toContain('{ owner: "dbo" }');
   });
 });
 
@@ -811,5 +815,90 @@ describe("import collection", () => {
     expect(imported).not.toContain("decimal");
     // Deterministic order, so regenerating an unchanged schema is a no-op diff.
     expect(imported).toEqual([...factories]);
+  });
+});
+
+describe("catalog edge cases", () => {
+  const columnRow = (over: Record<string, unknown>) => ({
+    colid: 1,
+    type_name: "int",
+    length: 4,
+    prec: null,
+    scale: null,
+    status: 0,
+    status2: 0,
+    status3: 0,
+    cdefault: 0,
+    ...over
+  });
+
+  // Computed columns are read, never written; a hidden one (made for a
+  // function-based index) is not part of the table as its users see it.
+  it("marks computed columns and leaves hidden ones out", async () => {
+    const db = createMockDb(sql =>
+      sql.includes("systypes")
+        ? [
+            columnRow({ name: "a" }),
+            columnRow({ name: "c", colid: 2, status: 8, status2: 16 }),
+            columnRow({ name: "sybfi2_1", colid: 3, status: 8, status2: 48, status3: 1 })
+          ]
+        : []
+    );
+    const columns = await fetchColumns(db, "mydb", "T");
+    expect(columns.map(c => [c.name, c.isComputed])).toEqual([
+      ["a", false],
+      ["c", true]
+    ]);
+    const { code } = generateSchemaCode([table("T", columns)], "mydb", CHAR_SIZES);
+    // Computed: read like any column; in an insert, never required — in the
+    // insert schema and the table's own insert type alike.
+    expect(code).toContain('c: int("c").hasDatabaseDefault()');
+    expect(code).toMatch(/InsertSchema = z\.object\(\{[^}]*\bc: z\.number\(\)[^,}]*\.optional\(\)/);
+  });
+
+  // A default's text may span rows, or be hidden: whether there is one comes
+  // from the column itself.
+  it("joins a default's text across rows, and knows a hidden one is there", async () => {
+    const db = createMockDb(sql =>
+      sql.includes("syscomments")
+        ? [
+            { col_name: "a", default_text: "DEFAULT 'abc" },
+            { col_name: "a", default_text: "def'" }
+          ]
+        : sql.includes("systypes")
+          ? [
+              columnRow({ name: "a", type_name: "varchar", length: 20, cdefault: 11 }),
+              columnRow({ name: "b", colid: 2, cdefault: 12 })
+            ]
+          : []
+    );
+    const columns = await fetchColumns(db, "mydb", "T");
+    expect(columns.map(c => [c.name, c.hasDefault, c.defaultValue])).toEqual([
+      ["a", true, "DEFAULT 'abcdef'"],
+      ["b", true, null]
+    ]);
+    expect(db.executed.find(q => q.includes("syscomments"))).toMatch(/ORDER BY/);
+  });
+
+  // System tables are type 'S'; text chains have indid 255. Names say nothing.
+  it("keeps user tables and indexes whatever their names begin with", async () => {
+    const db = createMockDb(() => []);
+    await fetchTables(db, "mydb");
+    await fetchIndexes(db, "mydb", "T");
+    expect(db.executed.join("\n")).not.toMatch(/NOT LIKE/);
+    expect(db.executed.find(q => q.includes("sysindexes"))?.trimEnd()).toMatch(
+      /AND i\.indid < 255$/
+    );
+  });
+
+  // Bare or quoted, `__proto__` in an object literal sets the prototype.
+  it("generates a column keyed __proto__ as a property, and no binding named eval", () => {
+    const { code } = generateSchemaCode(
+      [table("eval", [col({ name: "__proto__", typeName: "int" })])],
+      "mydb",
+      CHAR_SIZES
+    );
+    expect(code).toContain('["__proto__"]: int("__proto__")');
+    expect(code).not.toMatch(/export const eval\b/);
   });
 });

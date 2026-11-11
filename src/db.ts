@@ -26,8 +26,9 @@
  * await db.close();
  * ```
  */
-import type { SQL } from "drizzle-orm";
+import { is, SQL } from "drizzle-orm";
 
+import type { SybaseBulkInsertOptions, SybaseBulkInsertResult } from "./bulk.js";
 import type { SybaseFileQueryOptions, SybaseQueryOptions } from "./connection.js";
 import { SybaseDialect } from "./dialect.js";
 import type { SybaseDialectConfig } from "./dialect.js";
@@ -62,6 +63,17 @@ export type SybaseDrizzleConfig = SybasePoolConfig & {
   codecs?: SybaseDialectConfig["codecs"];
 };
 
+/**
+ * What `execute`, `exec` and `executeRaw` resolve to. `resultSets` is there only
+ * with the `allResultSets` option: the rows of every result set that has
+ * columns, in order, the first being `rows`.
+ */
+export interface SybaseExecuteResult<T = Record<string, unknown>> {
+  rows: T[];
+  rowCount: number;
+  resultSets?: Record<string, unknown>[][];
+}
+
 export interface SybaseDrizzle {
   /**
    * Start a SELECT query.
@@ -87,17 +99,17 @@ export interface SybaseDrizzle {
   execute<T extends Record<string, unknown> = Record<string, unknown>>(
     query: SQL,
     options?: SybaseQueryOptions
-  ): Promise<{ rows: T[]; rowCount: number }>;
+  ): Promise<SybaseExecuteResult<T>>;
   /** Execute a stored procedure or raw SQL. */
   exec<T extends Record<string, unknown> = Record<string, unknown>>(
     query: SQL,
     options?: SybaseQueryOptions
-  ): Promise<{ rows: T[]; rowCount: number }>;
+  ): Promise<SybaseExecuteResult<T>>;
   /** Execute a raw SQL string directly. */
   executeRaw<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string,
     options?: SybaseQueryOptions
-  ): Promise<{ rows: T[]; rowCount: number }>;
+  ): Promise<SybaseExecuteResult<T>>;
   /**
    * Execute SQL (a `sql` template or a raw string) and return the result column
    * by column — for bulk reads such as exports to Arrow, DuckDB or Parquet,
@@ -130,6 +142,25 @@ export interface SybaseDrizzle {
    */
   executeToFile(query: SQL | string, options: SybaseFileQueryOptions): Promise<SybaseFileResult>;
   /**
+   * Bulk copy rows into a table — db-lib's bcp, in process, on a pooled
+   * connection, outside any transaction. Committed in batches (`batchSize`,
+   * default: one batch for the whole call); the result's counts are what the
+   * server reported. A failure throws `SybaseBulkCopyError`, which says
+   * exactly what earlier batches committed. See the README's "Bulk Copy".
+   *
+   * @example
+   * ```ts
+   * const { rowsCopied } = await db.bulkInsert({
+   *   table: "apradb..DDSD",
+   *   columns: ["RCSBkey", "cd_unit_type", "line_number", "amount"],
+   *   rows: chunk, // arrays of values, or TSV
+   *   batchSize: 20_000,
+   *   expectedRows: chunk.length
+   * });
+   * ```
+   */
+  bulkInsert(options: SybaseBulkInsertOptions): Promise<SybaseBulkInsertResult>;
+  /**
    * Run statements in a real database transaction.
    *
    * @example
@@ -158,7 +189,7 @@ export interface SybaseDrizzle {
    * });
    * ```
    */
-  withConnection<T>(fn: (conn: SybaseDrizzleTx) => Promise<T>): Promise<T>;
+  withConnection<T>(fn: (conn: SybaseDrizzleConnection) => Promise<T>): Promise<T>;
   /** Close all connections and shut down the pool. */
   close(): Promise<void>;
   /**
@@ -201,24 +232,54 @@ export interface SybaseDrizzleTx {
   execute<T extends Record<string, unknown> = Record<string, unknown>>(
     query: SQL,
     options?: SybaseQueryOptions
-  ): Promise<{ rows: T[]; rowCount: number }>;
+  ): Promise<SybaseExecuteResult<T>>;
   exec<T extends Record<string, unknown> = Record<string, unknown>>(
     query: SQL,
     options?: SybaseQueryOptions
-  ): Promise<{ rows: T[]; rowCount: number }>;
+  ): Promise<SybaseExecuteResult<T>>;
   executeRaw<T extends Record<string, unknown> = Record<string, unknown>>(
     rawSql: string,
     options?: SybaseQueryOptions
-  ): Promise<{ rows: T[]; rowCount: number }>;
+  ): Promise<SybaseExecuteResult<T>>;
   /** See {@link SybaseDrizzle.executeColumns}. */
   executeColumns(query: SQL | string, options?: SybaseQueryOptions): Promise<SybaseColumnarResult>;
   /** See {@link SybaseDrizzle.executeToFile}. */
   executeToFile(query: SQL | string, options: SybaseFileQueryOptions): Promise<SybaseFileResult>;
 }
 
+/**
+ * The handle `withConnection` gives its callback: one held connection, no
+ * transaction — the transaction handle's queries, plus bulk copy (which a
+ * transaction cannot run).
+ */
+export interface SybaseDrizzleConnection extends SybaseDrizzleTx {
+  /**
+   * Bulk copy rows into a table on this connection — e.g. into a `#temp`
+   * table created earlier in the callback. See {@link SybaseDrizzle.bulkInsert}.
+   * A copy that fails part way closes the connection.
+   */
+  bulkInsert(options: SybaseBulkInsertOptions): Promise<SybaseBulkInsertResult>;
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
+
+/**
+ * The decoder a `sql` field (or an aliased one) was given with `.mapWith()`, as
+ * Drizzle's own row mapping applies it; none for plain SQL or a column.
+ */
+const sqlDecoder = (field: unknown): ((value: unknown) => unknown) | undefined => {
+  const source = is(field, SQL) ? field : is(field, SQL.Aliased) ? field.sql : undefined;
+  // Not in drizzle-orm's declarations, but where mapWith() keeps it (sql.js) and
+  // where its own row mappers read it from (utils.js, makeDefaultQueryMapper).
+  const decoder = (source as { decoder?: { mapFromDriverValue: (value: unknown) => unknown } })
+    ?.decoder;
+  if (!decoder || (decoder.mapFromDriverValue as { isNoop?: boolean }).isNoop) {
+    return undefined;
+  }
+  return value => decoder.mapFromDriverValue(value);
+};
 
 export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle => {
   const dialect = new SybaseDialect({ codecs: config.codecs, timeZone: config.timeZone });
@@ -231,6 +292,10 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
       return undefined;
     }
     return Object.entries(fields).map(([alias, field]) => {
+      // It names the column in the result: SQL has no empty name to give it.
+      if (alias === "") {
+        throw new Error("Cannot select a field under an empty name");
+      }
       const expression = dialect.renderExpression(field, "field");
       if (expression === undefined) {
         throw new Error(
@@ -238,7 +303,7 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
             `Expected a column reference, SQL expression, or string.`
         );
       }
-      return { expression, alias };
+      return { expression, alias, decode: sqlDecoder(field) };
     });
   };
 
@@ -309,8 +374,17 @@ export const createSybaseDrizzle = (config: SybaseDrizzleConfig): SybaseDrizzle 
       return session.transaction(txSession => fn(queryApi(txSession)), options);
     },
 
-    async withConnection<T>(fn: (conn: SybaseDrizzleTx) => Promise<T>): Promise<T> {
-      return session.withConnection(connSession => fn(queryApi(connSession)));
+    async bulkInsert(options: SybaseBulkInsertOptions) {
+      return session.bulkInsert(options);
+    },
+
+    async withConnection<T>(fn: (conn: SybaseDrizzleConnection) => Promise<T>): Promise<T> {
+      return session.withConnection(connSession =>
+        fn({
+          ...queryApi(connSession),
+          bulkInsert: options => connSession.bulkInsert(options)
+        })
+      );
     },
 
     async close() {

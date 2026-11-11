@@ -76,7 +76,7 @@ export const everyType = sybaseTable("EVERY_TYPE", {
   varbinaryN: varbinary("VARBINARY_N", { length: 20 }),
   imageNn: image("IMAGE_NN").notNull(),
   imageN: image("IMAGE_N")
-});
+}, { owner: "dbo" });
 
 
 export const widths = sybaseTable("WIDTHS", {
@@ -85,7 +85,7 @@ export const widths = sybaseTable("WIDTHS", {
   exactFrac: numeric("EXACT_FRAC", { precision: 15, scale: 4 }).notNull(),
   wideInt: numeric("WIDE_INT", { precision: 16, scale: 0 }).notNull(),
   wideFrac: numeric("WIDE_FRAC", { precision: 38, scale: 10 }).notNull()
-});
+}, { owner: "dbo" });
 
 
 export const defaults = sybaseTable("DEFAULTS", {
@@ -93,8 +93,9 @@ export const defaults = sybaseTable("DEFAULTS", {
   required: varchar("REQUIRED", { length: 10 }).notNull(),
   defaulted: datetime("DEFAULTED").notNull().hasDatabaseDefault(),
   nullableDefaulted: int("NULLABLE_DEFAULTED").hasDatabaseDefault(),
-  optional: money("OPTIONAL")
-});
+  optional: money("OPTIONAL"),
+  computed: int("COMPUTED").notNull().hasDatabaseDefault()
+}, { owner: "dbo" });
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -192,7 +193,8 @@ export const defaultsSchema = z.object({
   required: z.string().max(10),
   defaulted: z.date(),
   nullableDefaulted: z.number().nullable(),
-  optional: z.string().nullable()
+  optional: z.string().nullable(),
+  computed: z.number()
 });
 export type DefaultsRow = z.infer<typeof defaultsSchema>;
 
@@ -291,7 +293,8 @@ export const defaultsInsertSchema = z.object({
   required: z.string().max(10),
   defaulted: z.date().optional(),
   nullableDefaulted: z.number().nullable().optional(),
-  optional: decimalLiteral.nullable().optional()
+  optional: decimalLiteral.nullable().optional(),
+  computed: z.number().optional()
 });
 export type NewDefaults = z.infer<typeof defaultsInsertSchema>;
 

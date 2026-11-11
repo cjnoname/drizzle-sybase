@@ -37,7 +37,7 @@ npm run check           # Lint + type check — run before commit
 npm run format          # Format (oxfmt)
 npm test                # All tests (vitest)
 npm run build           # Compile TS -> dist (tsc)
-npm run build:native    # Rebuild native addon (node-gyp) — only when C/gyp changes
+npm run build:native    # Rebuild native addon (node-gyp) into src/native — only when C/gyp changes
 
 # Single test file
 pnpm exec vitest run src/__tests__/<file>.test.ts
@@ -55,6 +55,8 @@ src/
 ├── db.ts               # drizzle() factory
 ├── dialect.ts          # SQL dialect (Sybase-specific SQL generation)
 ├── table.ts            # Table definition helpers
+├── bulk.ts             # Bulk copy (bcp): options, row chunking, batch bookkeeping
+├── checks.ts           # Option validation shared by connection, pool and bulk copy
 ├── columns/            # Column type definitions
 ├── query-builders/     # select / insert / update / delete builders
 ├── errors.ts           # Error types
@@ -63,6 +65,7 @@ src/
 ```
 
 - Tests live in `__tests__/*.test.ts` alongside the code they cover.
+- `patches/` holds patches `scripts/build.sh` (and the Windows release job) apply to FreeTDS before building it; each names its upstream commits. Rebuilding with a changed patch set rebuilds FreeTDS.
 - `dist/` is the build output. `deps/`, `build-freetds/`, `build/` are native build artifacts.
 
 ## Code Style
@@ -76,3 +79,5 @@ src/
 ## Release
 
 Versioning and changelog are automated via **release-please** (`release-please-config.json`). Use Conventional Commits. Do not manually bump `version` in `package.json`.
+
+If a release's build or publish fails after its tag was created, publish it by running the release workflow on the tag: `gh workflow run release.yml --ref vX.Y.Z`.

@@ -18,17 +18,28 @@ import type { NativeResult, SybaseColumnarResult, SybaseFileResult } from "../re
 export interface NativeQueryOptions {
   maxRows?: number;
   /**
-   * Hard timeout in ms. If the query has not produced a result by this
-   * deadline, the returned promise rejects with `error.hardTimeout = true`
-   * and the connection is marked dead so the pool replaces it.
+   * Cooperative timeout for this query alone, in seconds (db-lib's DBSETTIME on
+   * this connection only). Defaults to the connection's `timeout`.
+   */
+  timeoutSeconds?: number;
+  /**
+   * Hard timeout in ms, counted from the call: past it nothing more is sent,
+   * the worker stops (between rows, or within about a second of a wait) and
+   * the promise rejects with `error.hardTimeout = true`; the connection is
+   * marked dead. The promise settles when the worker returns, though — late if
+   * it waited for a busy thread pool, or is blocked in the file system. For a
+   * promise that settles on schedule whatever the worker does, use
+   * `SybaseConnection` (or the pool), which adds that on top.
    *
-   * Note: the underlying libuv worker may continue running until db-lib's
-   * cooperative DBSETTIME fires (set from the connection's `timeout`).
-   * Its result is discarded.
-   *
-   * Defaults to `max(2 * connection.timeout * 1000, 30000)` on the native side.
+   * Defaults to `max(2 * timeout * 1000, 30000)` on the native side, where
+   * `timeout` is `timeoutSeconds` if given, else the connection's.
    */
   hardTimeoutMs?: number;
+  /**
+   * Return every result set with columns as `resultSets`, not only the first.
+   * Each set is capped at `maxRows` on its own.
+   */
+  allResultSets?: boolean;
   /**
    * Decode `datetime` and `smalldatetime` columns to `Date`, reading their
    * stored wall clock in this IANA zone. Without it they come back as canonical
@@ -62,6 +73,8 @@ export interface NativeBinding {
     columnTypes: string[];
     rowCount: number;
     affectedRows: number;
+    /** With `allResultSets`: the rows of every result set with columns, the first being `rows`. */
+    resultSets?: Record<string, unknown>[][];
   }>;
   /** Like {@link query}, but the result column by column. */
   queryColumns(
@@ -83,6 +96,14 @@ export interface NativeBinding {
   close(conn: unknown): void;
   isAlive(conn: unknown): boolean;
   /**
+   * @internal Open a bulk copy into `options.table` on `conn`; see
+   * `bulkBegin` in binding.c. The connection then takes nothing but
+   * {@link bulkSend} until the copy ends or the connection is closed.
+   */
+  bulkBegin(conn: unknown, options: NativeBulkBeginOptions): Promise<NativeBulkBeginResult>;
+  /** @internal Send one chunk of rows of the open copy, and commit if asked; see binding.c. */
+  bulkSend(conn: unknown, chunk: NativeBulkChunk): Promise<NativeBulkSendResult>;
+  /**
    * @internal The server's default character set (`iso_1`, `utf8`, ...), read
    * when the connection opened; `""` for a closed handle. Text is converted for
    * iso_1 and utf8, and passed through unconverted for any other.
@@ -92,9 +113,82 @@ export interface NativeBinding {
 }
 
 /** Options of {@link NativeBinding.queryToFile}. */
-export interface NativeFileQueryOptions extends Omit<NativeQueryOptions, "timeZone"> {
+export interface NativeFileQueryOptions extends Omit<
+  NativeQueryOptions,
+  "timeZone" | "allResultSets"
+> {
   /** File to write; replaced only once the query has succeeded. */
   path: string;
+}
+
+/** @internal Options of {@link NativeBinding.bulkBegin}. */
+export interface NativeBulkBeginOptions {
+  /** `db.owner.table`, `db..table`, `owner.table`, `table` or `#temp` — plain identifiers. */
+  table: string;
+  /** Columns the rows give values for, in that order; default: every loadable column. */
+  columns?: readonly string[];
+  /** Copy identity values from the rows instead of letting the server assign them. */
+  keepIdentity?: boolean;
+  /** Keep NULLs (and columns left out) NULL instead of using column defaults. */
+  ignoreDefaults?: boolean;
+  /** Copy even into a table with triggers, CHECK/foreign key constraints or rules (not applied). */
+  allowConstraintBypass?: boolean;
+  /** Cooperative timeout of the copy, in seconds; default: the connection's. */
+  timeoutSeconds?: number;
+  hardTimeoutMs: number;
+}
+
+/** @internal A column a bulk copy loads, as the server describes it. */
+export interface NativeBulkColumn {
+  name: string;
+  /** Sybase type name; `varchar` reports as `char`. */
+  type: string;
+  nullable: boolean;
+  /** Bytes. */
+  length: number;
+  precision: number;
+  scale: number;
+}
+
+/** @internal Result of {@link NativeBinding.bulkBegin}. */
+export interface NativeBulkBeginResult {
+  columns: NativeBulkColumn[];
+}
+
+/** @internal How {@link NativeBinding.bulkSend} sends a chunk of rows. */
+export interface NativeBulkChunkHeader {
+  rows: number;
+  /** 1-based number of the chunk's first row in the whole input, for error messages. */
+  firstRow: number;
+  /** Rows that may still be rejected before the copy fails. */
+  maxRejects: number;
+  /** After the rows: 0 keeps the batch open, 1 commits it, 2 commits it and ends the copy. */
+  commit: 0 | 1 | 2;
+  hardTimeoutMs: number;
+}
+
+/** @internal The rows of a chunk: TSV, or value rows. */
+export type NativeBulkPayload =
+  | { tsv: string | Uint8Array }
+  | {
+      /** Every field of every row, back to back. */
+      text: string;
+      /** Each field's length in UTF-16 units; 0xFFFFFFFF for NULL. */
+      lens: Uint32Array;
+    };
+
+/** @internal One chunk of rows for {@link NativeBinding.bulkSend}. */
+export type NativeBulkChunk = NativeBulkChunkHeader & NativeBulkPayload;
+
+/** @internal Result of {@link NativeBinding.bulkSend}; failures carry the same fields. */
+export interface NativeBulkSendResult {
+  rowsSent: number;
+  rejectedCount: number;
+  rejected: { row: number; column?: string; message: string }[];
+  /** Rows the server reported committed by this call; `null` if it committed nothing. */
+  committed: number | null;
+  /** The copy ended, but the session could not be put back; close the connection. */
+  discard: boolean;
 }
 
 /** The addon's own exports. Its `query` resolves to the result column by column. */
@@ -104,7 +198,9 @@ interface NativeAddon extends Omit<NativeBinding, "query" | "queryColumns" | "qu
     sql: string,
     options: {
       maxRows?: number;
+      timeoutSeconds?: number;
       hardTimeoutMs?: number;
+      allResultSets?: boolean;
       wallClockDateTimes?: boolean;
       outputPath?: string;
     }
@@ -123,7 +219,9 @@ const wrapAddon = (addon: NativeAddon): NativeBinding => {
       options?.timeZone === undefined ? undefined : resolveTimeZone(options.timeZone);
     const pending = (addon.query as (...args: unknown[]) => Promise<NativeResult>)(conn, sql, {
       maxRows: options?.maxRows,
+      timeoutSeconds: options?.timeoutSeconds,
       hardTimeoutMs: options?.hardTimeoutMs,
+      allResultSets: options?.allResultSets,
       wallClockDateTimes: timeZone !== undefined
     }).then(raw => {
       // An addon from an older build hands over rows instead.
@@ -153,9 +251,17 @@ const wrapAddon = (addon: NativeAddon): NativeBinding => {
       if (typeof path !== "string" || path === "" || path.includes("\0")) {
         throw new TypeError("queryToFile: path must be a non-empty string without NUL characters");
       }
+      // As SybaseConnection.queryToFile: a file holds one result set, and the
+      // option would otherwise be dropped without a word.
+      if ((options as { allResultSets?: unknown }).allResultSets) {
+        throw new TypeError(
+          "queryToFile: allResultSets is not supported (a file holds one result set)"
+        );
+      }
       return (
         addon.query(conn, sql, {
           maxRows: options.maxRows,
+          timeoutSeconds: options.timeoutSeconds,
           hardTimeoutMs: options.hardTimeoutMs,
           outputPath: options.path
         }) as Promise<SybaseFileResult>
@@ -169,6 +275,17 @@ const wrapAddon = (addon: NativeAddon): NativeBinding => {
         return result;
       });
     },
+    bulkBegin: (conn, options) => {
+      // An addon from an older build has no bulk copy.
+      if (typeof addon.bulkBegin !== "function") {
+        throw new Error(
+          "drizzle-sybase: the loaded native addon predates bulkInsert. Reinstall drizzle-sybase " +
+            "so the bundled addon matches."
+        );
+      }
+      return addon.bulkBegin(conn, options);
+    },
+    bulkSend: (conn, chunk) => addon.bulkSend(conn, chunk),
     close: conn => addon.close(conn),
     isAlive: conn => addon.isAlive(conn),
     serverCharset: conn => addon.serverCharset(conn),

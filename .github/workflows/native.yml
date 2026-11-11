@@ -1,0 +1,217 @@
+name: Native
+
+# Build the native addon for every platform the package ships and load each
+# binary under Node.js 24 on its own platform — Linux in AWS Lambda's Node.js 24
+# image. On Linux, also run the test suite (all but the tests that need a
+# server) against that very binary. Then pack the package with all five, as
+# published, and install and load it as an application would.
+#
+# Called by release.yml (before publishing) and by ci.yml (on pull requests).
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        description: Prefix of the uploaded artifacts' names (one per platform)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+            docker: linux/amd64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            docker: linux/arm64
+          - os: macos-latest
+            platform: darwin-arm64
+            node-arch: arm64
+          # Built and loaded with an x64 Node.js (under Rosetta), as on an Intel Mac.
+          - os: macos-latest
+            platform: darwin-x64
+            node-arch: x64
+          - os: windows-latest
+            platform: win32-x64
+            node-arch: x64
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          architecture: ${{ matrix.node-arch }}
+
+      # Linux builds in Debian bookworm (glibc 2.36), not on the runner (Ubuntu
+      # 24.04, glibc 2.39): built there, the addon can need glibc symbols that
+      # AWS Lambda's Amazon Linux 2023 (glibc 2.34) does not have.
+      - name: Build in Docker (linux)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            node:24-bookworm \
+            bash -c "
+              apt-get update && apt-get install -y build-essential python3 curl &&
+              npm install -g node-gyp@\$(node -p \"require('./package.json').devDependencies['node-gyp']\") &&
+              bash scripts/build.sh
+            "
+
+      - name: Check glibc requirement (linux)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          # The newest glibc symbol version the addon needs; Lambda (AL2023) has 2.34.
+          NEED=$(objdump -T build/Release/sybase_native.node | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "needs glibc $NEED"
+          [ "$(printf '%s\n2.34\n' "$NEED" | sort -V | tail -1)" = "2.34" ] || { echo "needs glibc $NEED > 2.34" >&2; exit 1; }
+
+      - name: Build native (macos)
+        if: runner.os == 'macOS'
+        env:
+          TARGET_ARCH: ${{ matrix.node-arch }}
+        run: |
+          npm install -g "node-gyp@$(node -p "require('./package.json').devDependencies['node-gyp']")"
+          bash scripts/build.sh
+
+      # --- Windows: CMake + MSVC ---
+      - name: Set up MSVC (windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch and patch FreeTDS (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://www.freetds.org/files/stable/freetds-1.5.17.tar.gz -o freetds.tar.gz
+          # As in scripts/build.sh: refuse a tarball that is not the known one.
+          echo "8d154ce458d1825a8625b0ef1c3288afecfc32b3a09015a5ece4fbdf8aafd144  freetds.tar.gz" | sha256sum -c -
+          tar xzf freetds.tar.gz
+          # Same patches as scripts/build.sh applies on the other platforms.
+          for p in patches/freetds-1.5.17-*.patch; do
+            patch -d freetds-1.5.17 -p1 --forward < "$p"
+          done
+
+      - name: Build FreeTDS (windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          set ROOT_DIR=%CD%
+          cd freetds-1.5.17
+          cmake -B build -G "Ninja" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INSTALL_PREFIX="%ROOT_DIR%\deps\freetds" ^
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DWITH_OPENSSL=OFF ^
+            -DENABLE_ODBC=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build build --parallel
+          if errorlevel 1 exit /b 1
+          cmake --install build
+
+      - name: Build native addon (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          npm install -g "node-gyp@$(node -p "require('./package.json').devDependencies['node-gyp']")"
+          # Some Node.js Windows builds enable thin-LTO, so node-gyp inherits
+          # Clang LTO flags (-flto=thin and /opt:lldltojobs=N) that MSVC's
+          # link.exe rejects (LNK1117). binding.gyp strips those flags on
+          # Windows; -D here is a secondary lever for config.gypi files that use
+          # the %-default form.
+          npx node-gyp configure -Denable_lto=false -Denable_thin_lto=false
+          grep -Ei "lto" build/config.gypi || echo "(no lto keys found)"
+          npx node-gyp build
+
+      # --- Load it where it must run ---
+      - name: Load test (linux, in AWS Lambda's Node.js 24)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          docker run --rm --pull always --platform ${{ matrix.docker }} --entrypoint node \
+            -v ${{ github.workspace }}:/w -w /w public.ecr.aws/lambda/nodejs:24 \
+            scripts/smoke-native.ts build/Release/sybase_native.node
+
+      - name: Load test (macos, windows)
+        if: "!startsWith(matrix.platform, 'linux-')"
+        shell: bash
+        run: |
+          node -p "process.platform + '-' + process.arch" | grep -qx "${{ matrix.platform }}"
+          node scripts/smoke-native.ts build/Release/sybase_native.node
+
+      - name: Rename artifact
+        shell: bash
+        run: cp build/Release/sybase_native.node sybase_native.${{ matrix.platform }}.node
+
+      # The suite against this binary, as uploaded: the tests that need a server
+      # skip (no credentials here); the rest — the addon's own checks among them
+      # — run on the platform the binary is for.
+      - name: Test this binary (linux)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          cp sybase_native.${{ matrix.platform }}.node src/native/
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace node:24-bookworm bash -c "
+            npm install -g pnpm@\$(node -p \"require('./package.json').packageManager.split('@')[1]\") &&
+            pnpm i --frozen-lockfile && pnpm test
+          "
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-prefix }}${{ matrix.platform }}
+          path: sybase_native.${{ matrix.platform }}.node
+
+  # The package as it would be published, with all five binaries and the
+  # FreeTDS source: what it holds is the same on every platform, so it is packed
+  # and checked once, then installed into an empty project and loaded in
+  # Lambda's Node.js 24 image (linux-x64).
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install dependencies
+        shell: bash
+        run: |
+          npm install -g "pnpm@$(node -p "require('./package.json').packageManager.split('@')[1]")"
+          pnpm i --frozen-lockfile
+      - name: Download native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.artifact-prefix }}*
+          path: artifacts
+      - name: Place native binaries
+        shell: bash
+        run: |
+          mkdir -p src/native
+          for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
+            cp "artifacts/${{ inputs.artifact-prefix }}${platform}/sybase_native.${platform}.node" src/native/
+          done
+      - name: Build TypeScript
+        run: pnpm build
+      - name: Copy .node files to dist
+        shell: bash
+        run: |
+          mkdir -p dist/native
+          cp src/native/sybase_native.*.node dist/native/
+      - name: Put the FreeTDS source in the package
+        shell: bash
+        run: bash scripts/build.sh --fetch-source
+      - name: Install and load the packed package
+        shell: bash
+        run: bash scripts/smoke-package.sh

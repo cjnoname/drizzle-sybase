@@ -329,3 +329,37 @@ describe("without code generation", () => {
     expect(Object.getPrototypeOf(rows[0])).toBe(Object.prototype);
   });
 });
+
+describe("all result sets", () => {
+  const ints = (values: number[]) =>
+    ({ kind: "int32", values: Int32Array.from(values), nulls: undefined }) as const;
+  const first = native([["a", "int", ints([1, 2])]], 2);
+  const second = native([["b", "int", ints([7])]], 1);
+  const raw: NativeResult = { ...first, affectedRows: 3, resultSets: [first, second] };
+
+  it("decodes every set, the first also at the top level", () => {
+    const rows = toRowResult(raw);
+    expect(rows.rows).toEqual([{ a: 1 }, { a: 2 }]);
+    expect(rows.resultSets).toEqual([[{ a: 1 }, { a: 2 }], [{ b: 7 }]]);
+    // The first set is the top level, not a second copy of it.
+    expect(rows.resultSets![0]).toBe(rows.rows);
+    expect(rows.affectedRows).toBe(3);
+    const columnar = toColumnarResult(raw);
+    expect(
+      columnar.resultSets!.map(set =>
+        set.columns.map(c => [c.name, Array.from(c.values as Int32Array)])
+      )
+    ).toEqual([[["a", [1, 2]]], [["b", [7]]]]);
+    expect(columnar.resultSets![0]!.columns).toBe(columnar.columns);
+  });
+
+  it("is absent unless asked for, as before", () => {
+    expect("resultSets" in toRowResult(first)).toBe(false);
+    expect("resultSets" in toColumnarResult(first)).toBe(false);
+  });
+
+  it("is empty for a batch with no result set", () => {
+    const none: NativeResult = { ...native([], 0), resultSets: [] };
+    expect(toRowResult(none)).toMatchObject({ rows: [], resultSets: [] });
+  });
+});

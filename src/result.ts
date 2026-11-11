@@ -54,7 +54,16 @@ export interface NativeResult {
   data: NativeColumn[];
   rowCount: number;
   affectedRows: number;
+  /** With `allResultSets`: every result set with columns, the first being the one above. */
+  resultSets?: NativeResultSet[];
 }
+
+/**
+ * One result set of a native result asked for with `allResultSets`.
+ *
+ * @internal
+ */
+export type NativeResultSet = Pick<NativeResult, "columns" | "columnTypes" | "data" | "rowCount">;
 
 // ---------------------------------------------------------------------------
 // Columnar result
@@ -110,6 +119,18 @@ export interface SybaseColumnarResult {
   columns: SybaseResultColumn[];
   rowCount: number;
   affectedRows: number;
+  /**
+   * With the `allResultSets` option only: every result set that has columns,
+   * in order — the first is the one `columns` describes.
+   */
+  resultSets?: SybaseColumnarResultSet[];
+}
+
+/** One result set of a {@link SybaseColumnarResult} read with `allResultSets`. */
+export interface SybaseColumnarResultSet {
+  /** The columns, in select-list order. */
+  columns: SybaseResultColumn[];
+  rowCount: number;
 }
 
 /**
@@ -279,16 +300,29 @@ const decodeValues = (
  *
  * @internal
  */
-export const toColumnarResult = (raw: NativeResult, timeZone?: string): SybaseColumnarResult => ({
-  columns: raw.data.map((column, i) => ({
-    name: raw.columns[i]!,
-    type: raw.columnTypes[i]!,
-    values: decodeValues(raw.columns[i]!, column, raw.rowCount, timeZone),
+const decodeColumns = (set: NativeResultSet, timeZone?: string): SybaseResultColumn[] =>
+  set.data.map((column, i) => ({
+    name: set.columns[i]!,
+    type: set.columnTypes[i]!,
+    values: decodeValues(set.columns[i]!, column, set.rowCount, timeZone),
     nulls: column.nulls
-  })),
-  rowCount: raw.rowCount,
-  affectedRows: raw.affectedRows
-});
+  }));
+
+export const toColumnarResult = (raw: NativeResult, timeZone?: string): SybaseColumnarResult => {
+  const result: SybaseColumnarResult = {
+    columns: decodeColumns(raw, timeZone),
+    rowCount: raw.rowCount,
+    affectedRows: raw.affectedRows
+  };
+  if (raw.resultSets) {
+    // The first set is the top level: decoded once, shared.
+    result.resultSets = raw.resultSets.map((set, i) => ({
+      columns: i === 0 ? result.columns : decodeColumns(set, timeZone),
+      rowCount: set.rowCount
+    }));
+  }
+  return result;
+};
 
 // ---------------------------------------------------------------------------
 // Rows
@@ -488,10 +522,20 @@ export const toRowResult = (
   columnTypes: string[];
   rowCount: number;
   affectedRows: number;
-} => ({
-  rows: buildRows(toColumnarResult(raw, timeZone)),
-  columns: raw.columns,
-  columnTypes: raw.columnTypes,
-  rowCount: raw.rowCount,
-  affectedRows: raw.affectedRows
-});
+  resultSets?: Record<string, unknown>[][];
+} => {
+  const columnar = toColumnarResult(raw, timeZone);
+  const rows = buildRows(columnar);
+  return {
+    rows,
+    columns: raw.columns,
+    columnTypes: raw.columnTypes,
+    rowCount: raw.rowCount,
+    affectedRows: raw.affectedRows,
+    ...(columnar.resultSets && {
+      resultSets: columnar.resultSets.map((set, i) =>
+        i === 0 ? rows : buildRows({ ...set, affectedRows: 0 })
+      )
+    })
+  };
+};

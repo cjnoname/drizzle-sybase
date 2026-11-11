@@ -135,6 +135,11 @@ export class SybaseInsertBuilder<TTable extends AnySybaseTable = AnySybaseTable>
   }
 
   private buildSql(): string {
+    // Without rows there is nothing to insert — and on a table with an
+    // identity, the `SELECT @@identity` alone would hand back an earlier one.
+    if (this.insertValues.length === 0) {
+      throw new Error("insert(): no rows to insert; call .values() first");
+    }
     const statements = this.buildInsertStatements();
     const hasIdentity = this.hasIdentityColumn();
 

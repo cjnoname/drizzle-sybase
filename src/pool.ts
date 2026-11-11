@@ -1,3 +1,5 @@
+import { validateBulkInsertOptions } from "./bulk.js";
+import type { SybaseBulkInsertOptions, SybaseBulkInsertResult } from "./bulk.js";
 /**
  * Sybase connection pool: sizing, health checks, idle cleanup, acquire
  * deadlines, retries, graceful drain, metrics, query logging — and the
@@ -21,6 +23,7 @@ import type {
   SybaseQueryOptions
 } from "./connection.js";
 import {
+  SybaseBulkCopyError,
   SybaseError,
   SybaseConnectionError,
   SybaseTimeoutError,
@@ -452,6 +455,47 @@ export class SybasePool {
     return this.run(sql, options, conn => conn.queryToFile(sql, options));
   }
 
+  /**
+   * Bulk copy rows into a table on a pooled connection; see
+   * {@link SybaseConnection.bulkInsert}. Never retried: it writes. A connection
+   * whose copy failed part way is closed by the copy, and so discarded here.
+   */
+  async bulkInsert(options: SybaseBulkInsertOptions): Promise<SybaseBulkInsertResult> {
+    // Before a connection is taken for it.
+    validateBulkInsertOptions(options);
+    const conn = await this.acquire();
+    const sql = `insert bulk ${options.table}`;
+    const startTime = Date.now();
+    try {
+      const result = await conn.bulkInsert(options);
+      const durationMs = Date.now() - startTime;
+      this._totalQueriesExecuted++;
+      this._queryDurationSum += durationMs;
+      this._queryDurationCount++;
+      emitQueryLog(this.cfg.logger, {
+        sql,
+        durationMs,
+        rowCount: result.rowsCopied,
+        timestamp: new Date(startTime)
+      });
+      return result;
+    } catch (err) {
+      this._totalQueryErrors++;
+      emitQueryLog(this.cfg.logger, {
+        sql,
+        durationMs: Date.now() - startTime,
+        // Batches committed before the failure stay: they are rows written.
+        // (Rows in doubt are not counted: they may not be.)
+        rowCount: err instanceof SybaseBulkCopyError ? err.rowsCommitted : 0,
+        error: err instanceof Error ? err : new Error(String(err)),
+        timestamp: new Date(startTime)
+      });
+      throw err;
+    } finally {
+      this.release(conn);
+    }
+  }
+
   private async run<R extends { rowCount: number }>(
     sql: string,
     options: SybaseQueryOptions | undefined,
@@ -594,52 +638,55 @@ export class SybasePool {
    * Gracefully drain the pool — finish all in-flight operations, then close.
    *
    * New acquire() calls will be rejected immediately.
-   * Returns a promise that resolves when all active connections are released.
+   * Returns a promise that resolves when all active connections are released
+   * and the pool is closed — or, at the latest, once `timeoutMs` has passed:
+   * the pool is then closed by force, and a connection still being opened
+   * closes itself as soon as it is open.
    *
    * @param timeoutMs - Maximum time to wait for drain. Default: 30000ms
    */
   async drain(timeoutMs = 30000): Promise<void> {
-    if (this.closed) {
-      return;
-    }
-    // Concurrent callers share one drain; a second timer or callback would
-    // leave the first caller waiting.
-    if (this.drainPromise) {
-      return this.drainPromise;
-    }
-    this.draining = true;
+    // Concurrent callers share one drain (each waiting at most its own
+    // timeout); once the pool is closing, that close is what there is to wait for.
+    if (!this.drainPromise && !this.closing) {
+      this.draining = true;
 
-    // Reject all waiters immediately
-    for (const waiter of this.waitQueue) {
-      waiter.reject(new SybasePoolError("Pool is draining", "draining"));
+      // Reject all waiters immediately
+      for (const waiter of this.waitQueue) {
+        waiter.reject(new SybasePoolError("Pool is draining", "draining"));
+      }
+      this.waitQueue = [];
+
+      // Settled by close(), whichever path triggers it: the last release, the
+      // timeout, or a direct close() call.
+      this.drainPromise = new Promise<void>(resolve => {
+        this.settleDrain = resolve;
+      });
+
+      // No active connections — close immediately
+      this.checkDrainComplete();
     }
-    this.waitQueue = [];
-
-    // Settled by close(), whichever path triggers it: the last release, the
-    // timeout, or a direct close() call.
-    this.drainPromise = new Promise<void>(resolve => {
-      const timer = setTimeout(() => {
-        // Force close after timeout
-        void this.close();
-      }, timeoutMs);
-
+    const done = this.drainPromise ?? this.closing!;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, timeoutMs);
       if (typeof timer.unref === "function") {
         timer.unref();
       }
-
-      this.settleDrain = () => {
-        clearTimeout(timer);
-        resolve();
-      };
     });
-
-    // No active connections — close immediately
-    this.checkDrainComplete();
-    return this.drainPromise;
+    try {
+      await Promise.race([done, timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+    // Force close after timeout (the close already done or under way otherwise)
+    void this.close();
   }
 
   private drainPromise: Promise<void> | null = null;
   private settleDrain?: () => void;
+  /** The close under way or done: close() is run once. */
+  private closing: Promise<void> | null = null;
 
   private checkDrainComplete(): void {
     if (this.draining && this.active === 0) {
@@ -648,9 +695,15 @@ export class SybasePool {
   }
 
   /**
-   * Close all connections and shut down the pool.
+   * Close all connections and shut down the pool. Resolves once connections
+   * still being opened have opened, and closed themselves.
    */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.closeOnce();
+    return this.closing;
+  }
+
+  private async closeOnce(): Promise<void> {
     this.closed = true;
     this.draining = false;
 
@@ -674,10 +727,16 @@ export class SybasePool {
     this.pool = [];
     this._activeCount = 0;
 
+    // Connections still being opened close themselves once open (see
+    // createConnection): wait for them, so that nothing of the pool is left
+    // open once close() — or drain() — has resolved.
+    if (this.creating.size > 0) {
+      await Promise.allSettled([...this.creating]);
+    }
+
     // Settle a pending drain() — the pool it was waiting on is now closed.
     const settle = this.settleDrain;
     this.settleDrain = undefined;
-    this.drainPromise = null;
     settle?.();
   }
 
@@ -745,11 +804,33 @@ export class SybasePool {
   // Private
   // ---------------------------------------------------------------------------
 
-  private async createConnection(): Promise<SybaseConnection> {
-    const conn = new SybaseConnection(this.cfg);
-    await conn.connect();
-    this._totalConnectionsCreated++;
-    return conn;
+  /** Connections being opened, which close() waits for. */
+  private creating = new Set<Promise<unknown>>();
+
+  /**
+   * Open a connection for the pool. One that opens after the pool was closed or
+   * began draining is closed here, and the call rejects: nothing would ever
+   * close it otherwise. close() waits for these, so nothing is left open once
+   * it (or drain()) has resolved.
+   */
+  private createConnection(): Promise<SybaseConnection> {
+    const creating = (async () => {
+      const conn = new SybaseConnection(this.cfg);
+      await conn.connect();
+      this._totalConnectionsCreated++;
+      if (this.closed || this.draining) {
+        conn.close();
+        this._totalConnectionsDestroyed++;
+        throw this.unavailableError();
+      }
+      return conn;
+    })();
+    this.creating.add(creating);
+    void creating.then(
+      () => this.creating.delete(creating),
+      () => this.creating.delete(creating)
+    );
+    return creating;
   }
 
   private removeFromPool(index: number): void {
@@ -814,6 +895,9 @@ export class SybasePool {
       if (waiter) {
         waiter.reject(err instanceof Error ? err : new SybaseError(String(err)));
       }
+      // The others still wait for a connection there is room for: try again
+      // for the next one. Each failure settles one waiter, so this ends.
+      void this.serveWaiter();
     }
   }
 

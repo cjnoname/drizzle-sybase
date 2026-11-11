@@ -28,8 +28,10 @@ const col = (
   scale: null,
   isNullable: false,
   isIdentity: false,
+  isComputed: false,
   defaultValue: null,
-  ...overrides
+  ...overrides,
+  hasDefault: overrides.hasDefault ?? Boolean(overrides.defaultValue)
 });
 
 /** Every registry type, nullable and not. */
@@ -65,7 +67,7 @@ const widths: TableMeta = {
   ]
 };
 
-/** Identity, database defaults and nullability, as they decide insert optionality. */
+/** Identity, database defaults, nullability and computed columns, as they decide insert optionality. */
 const defaults: TableMeta = {
   name: "DEFAULTS",
   owner: "dbo",
@@ -80,7 +82,8 @@ const defaults: TableMeta = {
       isNullable: true,
       defaultValue: "DEFAULT 0"
     }),
-    col({ name: "OPTIONAL", typeName: "money", isNullable: true })
+    col({ name: "OPTIONAL", typeName: "money", isNullable: true }),
+    col({ name: "COMPUTED", typeName: "int", isComputed: true })
   ]
 };
 
@@ -94,7 +97,9 @@ describe("generated schema fixture", () => {
       unichar: 2
     });
     const expected = normalize(code);
-    if (process.env.UPDATE_FIXTURES) {
+    // Exactly "1", and never in CI: rewriting the fixture makes this check
+    // compare the output with itself.
+    if (process.env.UPDATE_FIXTURES === "1" && !process.env.CI) {
       writeFileSync(FIXTURE, expected);
     }
     expect(readFileSync(FIXTURE, "utf8")).toBe(expected);

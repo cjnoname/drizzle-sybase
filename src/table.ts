@@ -231,9 +231,12 @@ export const sybaseTable = <
   for (const [key, builder] of Object.entries(columns)) {
     if (builder instanceof SybaseColumnBuilder) {
       const col = builder.build(table);
-      builtColumns[key] = col;
+      // Defined, not assigned: assigned, a column keyed `__proto__` would set
+      // the object's prototype instead of becoming a property.
+      const property = { value: col, enumerable: true, writable: true, configurable: true };
+      Object.defineProperty(builtColumns, key, property);
       // Expose column directly on table for use in eq(table.col, value)
-      (table as any)[key] = col;
+      Object.defineProperty(table, key, property);
     }
   }
 

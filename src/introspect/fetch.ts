@@ -52,6 +52,10 @@ function objectName(database: string, tableName: string, owner?: string): string
 
 const COLUMN_STATUS_NULLABLE = 8;
 const COLUMN_STATUS_IDENTITY = 128;
+/** syscolumns.status2: a computed column (materialized or not). */
+const COLUMN_STATUS2_COMPUTED = 0x10;
+/** syscolumns.status3: a hidden computed column, made for a function-based index. */
+const COLUMN_STATUS3_HIDDEN = 0x1;
 const INDEX_STATUS_UNIQUE = 2;
 const INDEX_STATUS_PRIMARY = 2048;
 
@@ -109,7 +113,6 @@ export async function fetchTables(
      FROM ${database}..sysobjects o
      LEFT JOIN ${database}..sysusers u ON o.uid = u.uid
      WHERE o.type = 'U'
-       AND o.name NOT LIKE 'sys%'
        ${ownerFilter}
        ${tableFilterSql}
      ORDER BY o.name`
@@ -130,6 +133,9 @@ interface ColumnRow extends Record<string, unknown> {
   prec: number | null;
   scale: number | null;
   status: number;
+  status2: number | null;
+  status3: number | null;
+  cdefault: number | null;
 }
 
 interface DefaultRow extends Record<string, unknown> {
@@ -165,13 +171,17 @@ export async function fetchColumns(
        c.length,
        c.prec,
        c.scale,
-       c.status
+       c.status,
+       c.status2,
+       c.status3,
+       c.cdefault
      FROM ${database}..syscolumns c
      JOIN ${database}..systypes t ON c.usertype = t.usertype
      WHERE c.id = OBJECT_ID('${object}')
      ORDER BY c.colid`
   );
 
+  // A long default's text spans several rows, in (colid2, colid) order.
   const defaultsResult = await db.executeRaw<DefaultRow>(
     `SELECT
        c.name AS col_name,
@@ -179,14 +189,19 @@ export async function fetchColumns(
      FROM ${database}..syscolumns c
      JOIN ${database}..syscomments com ON com.id = c.cdefault
      WHERE c.id = OBJECT_ID('${object}')
-       AND c.cdefault != 0`
+       AND c.cdefault != 0
+     ORDER BY c.colid, com.colid2, com.colid`
   );
 
-  const defaultsMap = new Map(
-    defaultsResult.rows.map(r => [r.col_name, r.default_text?.trim() ?? null])
-  );
+  const defaultsMap = new Map<string, string>();
+  for (const r of defaultsResult.rows) {
+    defaultsMap.set(r.col_name, (defaultsMap.get(r.col_name) ?? "") + (r.default_text ?? ""));
+  }
 
-  return result.rows.map(row => {
+  // A hidden computed column is not part of the table as its users see it:
+  // `select *` leaves it out, and it cannot be written.
+  const visible = result.rows.filter(row => ((row.status3 ?? 0) & COLUMN_STATUS3_HIDDEN) === 0);
+  return visible.map(row => {
     if (!row.type_name) {
       throw new Error(
         `Could not resolve a base system type for column "${row.name}" of table "${tableName}". ` +
@@ -202,7 +217,10 @@ export async function fetchColumns(
       scale: row.scale,
       isNullable: (row.status & COLUMN_STATUS_NULLABLE) === COLUMN_STATUS_NULLABLE,
       isIdentity: (row.status & COLUMN_STATUS_IDENTITY) === COLUMN_STATUS_IDENTITY,
-      defaultValue: defaultsMap.get(row.name) ?? null
+      isComputed: ((row.status2 ?? 0) & COLUMN_STATUS2_COMPUTED) !== 0,
+      // Whether there is one, from the column itself: its text may be hidden.
+      hasDefault: (row.cdefault ?? 0) !== 0,
+      defaultValue: defaultsMap.get(row.name)?.trim() || null
     };
   });
 }
@@ -233,8 +251,7 @@ export async function fetchIndexes(
      FROM ${database}..sysindexes i
      WHERE i.id = OBJECT_ID('${object}')
        AND i.indid > 0
-       AND i.indid < 255
-       AND i.name NOT LIKE 't%'`
+       AND i.indid < 255`
   );
 
   const indexes: IndexMeta[] = [];

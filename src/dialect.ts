@@ -11,8 +11,7 @@
  */
 import { Buffer } from "node:buffer";
 
-import type { SQL } from "drizzle-orm";
-import { getTableName } from "drizzle-orm";
+import { getTableName, SQL } from "drizzle-orm";
 import { CodecsCollection, refineCodecs, type Codecs } from "drizzle-orm/codecs";
 
 import { castExactNumericLiteral, SYBASE_CODECS } from "./codecs.js";
@@ -66,7 +65,7 @@ const NON_LATIN1 = /[^\u0000-\u00ff]/;
  *
  * Handles:
  * - Single quotes (doubled)
- * - Null bytes (removed — Sybase db-lib cannot handle \0 in strings)
+ * - Null bytes (refused — db-lib takes the SQL as a C string, which one would end)
  * - Backslashes (kept as-is — Sybase does not use C-style escaping)
  * - Characters past U+00FF: the string is written as a `U&'...'` literal with
  *   those characters as `\XXXX` / `\+XXXXXX` escapes. A server whose character
@@ -76,15 +75,17 @@ const NON_LATIN1 = /[^\u0000-\u00ff]/;
  *   that cannot hold the character makes the server refuse it (Msg 2402).
  */
 export const escapeString = (str: string): string => {
-  // Remove null bytes which can cause truncation in db-lib
-  // eslint-disable-next-line no-control-regex
-  const sanitized = str.replace(/\u0000/g, "");
-  if (!NON_LATIN1.test(sanitized)) {
+  // A NUL cannot be in the SQL text (db-lib takes it as a C string, which it
+  // would end). Refused rather than dropped, which would change the value.
+  if (str.includes("\u0000")) {
+    throw new Error("Cannot write a string holding a NUL character into the SQL");
+  }
+  if (!NON_LATIN1.test(str)) {
     // Double single quotes for SQL escaping
-    return `'${sanitized.replace(/'/g, "''")}'`;
+    return `'${str.replace(/'/g, "''")}'`;
   }
   let body = "";
-  for (const char of sanitized) {
+  for (const char of str) {
     const code = char.codePointAt(0)!;
     if (code >= 0xd800 && code <= 0xdfff) {
       throw new Error(
@@ -181,6 +182,30 @@ export interface SybaseDialectConfig {
   timeZone?: string;
 }
 
+/**
+ * Stands in for drizzle's `mapInlineParam` while a statement is rendered: the
+ * one place drizzle writes a parameter itself — one marked with
+ * `.inlineParams()`, at any depth — as JS sees it (a boolean as `true`, a Date
+ * in the process's local time, without the CONVERT an exact numeric needs).
+ * Every parameter is written into the SQL by this dialect already, so the call
+ * is refused rather than followed.
+ */
+const refuseInlining = (): never => {
+  throw new Error(
+    "drizzle-sybase writes every parameter into the SQL already, as Sybase needs it: " +
+      "remove .inlineParams()"
+  );
+};
+
+/**
+ * A statement rendered through this: it holds the statement as its one chunk,
+ * which drizzle renders as it would on its own (its `.inlineParams()` mark
+ * included), but with {@link refuseInlining} as `mapInlineParam` — drizzle
+ * calls it on the SQL it renders from.
+ */
+class RenderedSQL extends SQL {}
+Object.defineProperty(RenderedSQL.prototype, "mapInlineParam", { value: refuseInlining });
+
 export class SybaseDialect {
   /**
    * Applied to inlined parameters by drizzle-orm. This is what covers WHERE,
@@ -200,6 +225,13 @@ export class SybaseDialect {
     // Validated here so a typo fails at setup rather than from inside the first
     // statement that happens to carry a Date.
     this.timeZone = resolveTimeZone(config?.timeZone);
+    const timeZone = this.timeZone;
+    this.queryConfig = {
+      escapeName,
+      escapeParam: (_index: number, value: unknown) => serializeValue(value, timeZone),
+      escapeString,
+      codecs: this.codecs
+    };
   }
 
   /**
@@ -207,14 +239,16 @@ export class SybaseDialect {
    * All parameters are inlined.
    */
   sqlToQuery(sqlObj: SQL): string {
-    const { sql: sqlString } = sqlObj.toQuery({
-      escapeName,
-      escapeParam: (_index: number, value: unknown) => serializeValue(value, this.timeZone),
-      escapeString,
-      codecs: this.codecs
-    });
-    return sqlString;
+    return new RenderedSQL([sqlObj]).toQuery(this.queryConfig).sql;
   }
+
+  /** How drizzle renders SQL here: made once, as it depends only on this dialect. */
+  private readonly queryConfig: {
+    escapeName: typeof escapeName;
+    escapeParam: (index: number, value: unknown) => string;
+    escapeString: typeof escapeString;
+    codecs: CodecsCollection;
+  };
 
   /**
    * Serialize a column value to inline SQL.

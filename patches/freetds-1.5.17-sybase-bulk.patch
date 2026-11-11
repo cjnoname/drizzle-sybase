@@ -1,0 +1,592 @@
+Sybase ASE bulk copy fixes from FreeTDS master, backported to FreeTDS 1.5.17.
+
+None of these are in a FreeTDS release yet (1.5.21 is the latest at the time of
+writing); they are expected in 1.6. Remove this patch once FreeTDS is upgraded to
+a release that contains them.
+
+Each file this patch changes carries a notice saying so. Changes made on
+2026-11-11 (the drizzle-sybase git history dates each one).
+
+Upstream commits (https://github.com/FreeTDS/freetds):
+  e1133a1685  [DOL BULK] Add TDS_REQ_DOL_BULK to capabilities.
+  c431b958d2  [DOL BULK] Probe for datarows-lock on the table
+  6f65b6e1ba  [DOL BULK] Row data packet layout
+  4b0ff06729  [DOL BULK] Also support freebcp being invoked with database.owner.tablename
+  c78eb67371  [DOL BULK] Perform the locktype query before the columns query - hidden dependency
+  29de16d9c4  [DOL BULK] Documentation for sysstat2; warn about slow index for datarows-locked table
+  556003bb85  tds: Detect data rows locking looking to capabilities
+  797b63215a  bcp: (ASE) Correctly detect Datarows Locking for temporary tables
+  0f34ecbd52  bcp in: (ASE) Adjust row buffer size formula to allow for datarows-locked format
+  afc0b85cd8  freebcp: Implement -k (meaning -hKEEP_NULLS)            (libTDS part only)
+  5703d0b96b  tds: Do not ignore conversion errors in Sybase bulk copy (libTDS part only)
+  bce8b3791e  tds: Remove trailing zeroes from binary data in Sybase bulk copy (libTDS part only)
+
+Why drizzle-sybase needs them:
+  - Without the DOL_BULK capability and row format, ASE refuses a bulk copy into a
+    data-only-locked (datarows) table: Msg 4845, "Client does not have the
+    capability to bulk copy into the data-only locked table".
+  - KEEP_NULLS (bcp_options BCPHINTS) is ASE bcp's --ignoredefaults: a NULL stays
+    NULL instead of becoming the column default (bulkInsert's emptyAsNull).
+  - A value that fails conversion must fail its row, not be sent as NULL/default.
+
+Adaptation to 1.5.17: c431b958d2's own int conversion is kept (master later
+switched to tds_try_get_int_col, which 1.5.17 does not have); otherwise the code
+is master's final form of each hunk, with these fixes master does not have yet
+(all checked against ASE 15.7):
+  - datapages-locked tables are data-only locked too, and take the same DOL
+    format; master only detects datarows (sysstat2 0x8000, not 0x4000), so a
+    copy into a datapages table fails with Msg 4837 (bad row length).
+  - With KEEP_NULLS, master skips reading the default values but still
+    substitutes them, as empty values: a NULL char column with a default gets a
+    blank instead of NULL. Here a column is treated as having no default.
+  - A #temp table lives in the session's temporary database, which on a server
+    with several (tempdb, tempdb_2, ...) is often not tempdb: master looks it up
+    in tempdb..sysobjects, misses it, and sends the wrong row format (Msg 4837).
+    Here its lock scheme is read with lockscheme(object_id, @@tempdbid).
+  - The lock scheme probe looked the table up by bare name in sysobjects, which
+    matches every owner's table of that name (owner.table also put the owner
+    in front of sysobjects); it now reads lockscheme() of exactly the target
+    object, in its database. A failed probe, or an unknown lock scheme, fails
+    the copy instead of being taken for an allpages table (the probe's own
+    statement errors are checked too).
+  - The row buffer was sized by a formula that did not bound what the row
+    writer writes: in the DOL format it left out the 2-byte offset per variable
+    column (100 varbinary(8) columns given 8 bytes each wrote 93 bytes past
+    it), and in the allpages format it counted the adjustment table from the
+    variable data alone, not from the end of the whole row (six full
+    binary(248) and a full varbinary(8) wrote 3 bytes past it). It is now sized
+    for the largest row of either format, whichever columns the server makes
+    fixed or variable.
+  - The variable-column offsets are a 256-entry array and their count one
+    byte: a row with more than 255 variable columns wrote past the array. It
+    now fails instead (drizzle-sybase refuses such a table before starting).
+  - Reading the column defaults ignored a failed allocation, leaving a default
+    size without its value (later copied from a NULL or stale buffer); and a
+    numeric column's buffer was used before its allocation was checked. Both
+    now fail the copy. A default of NULL is treated as no default.
+  - A NULL for a NOT NULL column without a default failed the row without a
+    report when no default had been read; it is now reported (SYBEBCNN) as
+    for any other column, so a failure without a report is never a refused
+    value (the caller can tell an out-of-memory failure from a bad row).
+  - bcp_batch() ignored a failure to open the copy again after committing a
+    batch: every row sent next then failed without an error, as if refused on
+    its own. It now reports SYBEBULKINSERT, still returning the batch's count
+    (the batch is committed).
+
+diff --git a/include/freetds/tds.h b/include/freetds/tds.h
+--- a/include/freetds/tds.h
++++ b/include/freetds/tds.h
+@@ -18,6 +18,12 @@
+  * Boston, MA 02111-1307, USA.
+  */
+ 
++/*
++ * Modified by the drizzle-sybase project, last on 2026-11-11.
++ * The changes, and why, are listed in patches/freetds-1.5.17-sybase-bulk.patch
++ * of drizzle-sybase; this file is otherwise FreeTDS 1.5.17's.
++ */
++
+ #ifndef _tdsguard_hfOrWb5znoUCWdBPoNQvqN_
+ #define _tdsguard_hfOrWb5znoUCWdBPoNQvqN_
+ 
+@@ -1700,6 +1706,7 @@
+ 	TDS_INT direction;
+ 	bool identity_insert_on;
+ 	bool xfer_init;
++	bool datarows_locking;
+ 	TDS_INT bind_count;
+ 	TDSRESULTINFO *bindinfo;
+ 	TDS5COLINFO *sybase_colinfo;
+diff --git a/src/dblib/bcp.c b/src/dblib/bcp.c
+--- a/src/dblib/bcp.c
++++ b/src/dblib/bcp.c
+@@ -16,6 +16,12 @@
+  * License along with this library; if not, write to the
+  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+  * Boston, MA 02111-1307, USA.
++ */
++
++/*
++ * Modified by the drizzle-sybase project, last on 2026-11-11.
++ * The changes, and why, are listed in patches/freetds-1.5.17-sybase-bulk.patch
++ * of drizzle-sybase; this file is otherwise FreeTDS 1.5.17's.
+  */
+ 
+ #include <config.h>
+@@ -2022,7 +2028,11 @@
+ 	if (TDS_FAILED(tds_bcp_done(dbproc->tds_socket, &rows_copied)))
+ 		return -1;
+ 
+-	tds_bcp_start(dbproc->tds_socket, dbproc->bcpinfo);
++	/* The batch is committed whatever follows: its count stands. A copy that
++	 * cannot be opened again is reported, so that rows sent next are not taken
++	 * for rows refused one by one. */
++	if (TDS_FAILED(tds_bcp_start(dbproc->tds_socket, dbproc->bcpinfo)))
++		dbperror(dbproc, SYBEBULKINSERT, 0);
+ 
+ 	return rows_copied;
+ }
+diff --git a/src/tds/bulk.c b/src/tds/bulk.c
+--- a/src/tds/bulk.c
++++ b/src/tds/bulk.c
+@@ -17,6 +17,12 @@
+  * Boston, MA 02111-1307, USA.
+  */
+ 
++/*
++ * Modified by the drizzle-sybase project, last on 2026-11-11.
++ * The changes, and why, are listed in patches/freetds-1.5.17-sybase-bulk.patch
++ * of drizzle-sybase; this file is otherwise FreeTDS 1.5.17's.
++ */
++
+ /**
+  * \file
+  * \brief Handle bulk copy
+@@ -46,6 +52,7 @@
+ #include <freetds/convert.h>
+ #include <freetds/utils/string.h>
+ #include <freetds/replacements.h>
++#include <freetds/enum_cap.h>
+ 
+ /** \cond HIDDEN_SYMBOLS */
+ #ifndef MAX
+@@ -74,6 +81,14 @@
+ 					 int offset, TDS_UCHAR *rowbuffer, int start, int *pncols);
+ static void tds_bcp_row_free(TDSRESULTINFO* result, unsigned char *row);
+ static TDSRET tds5_process_insert_bulk_reply(TDSSOCKET * tds, TDSBCPINFO *bcpinfo);
++static TDSRET probe_sap_locking(TDSSOCKET *tds, TDSBCPINFO *bcpinfo);
++
++/** Whether the KEEP_NULLS hint (ASE bcp's --ignoredefaults) was given. */
++static bool
++tds5_keep_nulls(TDSBCPINFO *bcpinfo)
++{
++	return !tds_dstr_isempty(&bcpinfo->hint) && strstr(tds_dstr_cstr(&bcpinfo->hint), "KEEP_NULLS") != NULL;
++}
+ static TDSRET tds5_get_col_data_or_dflt(tds_bcp_get_col_data get_col_data,
+ 					TDSBCPINFO * bulk, TDSCOLUMN * bcpcol, int offset, int colnum);
+ 
+@@ -97,6 +112,12 @@
+ 
+ 	/* FIXME don't leave state in processing state */
+ 
++	/* Check table locking type. Do this first, because the code in bcp_init() which
++	 * calls us seems to depend on the information from the columns query still being
++	 * active in the context.
++	 */
++	TDS_PROPAGATE(probe_sap_locking(tds, bcpinfo));
++
+ 	/* TODO quote tablename if needed */
+ 	if (bcpinfo->direction != TDS_BCP_QUERYOUT)
+ 		fmt = "SET FMTONLY ON select * from %s SET FMTONLY OFF";
+@@ -177,6 +198,8 @@
+ 
+ 		if (is_numeric_type(curcol->column_type)) {
+ 			curcol->bcp_column_data = tds_alloc_bcp_column_data(sizeof(TDS_NUMERIC));
++			if (!curcol->bcp_column_data)
++				goto cleanup;
+ 			((TDS_NUMERIC *) curcol->bcp_column_data->data)->precision = curcol->column_prec;
+ 			((TDS_NUMERIC *) curcol->bcp_column_data->data)->scale = curcol->column_scale;
+ 		} else {
+@@ -218,6 +241,116 @@
+ }
+ 
+ /**
++ * Detect if table we're writing to uses 'datarows' lockmode.
++ * \tds
++ * \param bcpinfo BCP information already prepared
++ * \return TDS_SUCCESS or TDS_FAIL.
++ */
++static TDSRET
++probe_sap_locking(TDSSOCKET *tds, TDSBCPINFO *bcpinfo)
++{
++	TDSRET rc;
++	unsigned int value;
++	bool value_found;
++	TDS_INT resulttype;
++	int done_flags;
++	bool failed;
++	const char *full_tablename, *dot;
++
++	/* Only needed for inward data */
++	if (bcpinfo->direction != TDS_BCP_IN)
++		return TDS_SUCCESS;
++
++	/* Only needed for SAP ASE versions which support datarows-locking. */
++	if (!TDS_IS_SYBASE(tds) || !tds_capability_has_req(tds->conn, TDS_REQ_DOL_BULK))
++		return TDS_SUCCESS;
++
++	/* The lock scheme of exactly the target object -- 1 for allpages, 2 for
++	 * data-only locking (datapages or datarows), 0 if unknown: looked up by its full name (owner included), in its own
++	 * database -- the named one for db.owner.table / db..table, the session's
++	 * temporary database for a #temp table (on a server with several, not always
++	 * tempdb), else the current one. A lookup by bare name in sysobjects could
++	 * match another owner's table of the same name. */
++	full_tablename = tds_dstr_cstr(&bcpinfo->tablename);
++	dot = strchr(full_tablename, '.');
++	if (full_tablename[0] == '#') {
++		rc = tds_submit_queryf(tds, "select case lockscheme(object_id('%s'), @@tempdbid) "
++				       "when 'allpages' then 1 when 'datarows' then 2 when 'datapages' then 2 else 0 end",
++				       full_tablename);
++	} else if (dot != NULL && strchr(dot + 1, '.') != NULL) {
++		rc = tds_submit_queryf(tds, "select case lockscheme(object_id('%s'), db_id('%.*s')) "
++				       "when 'allpages' then 1 when 'datarows' then 2 when 'datapages' then 2 else 0 end",
++				       full_tablename, (int) (dot - full_tablename), full_tablename);
++	} else {
++		rc = tds_submit_queryf(tds, "select case lockscheme(object_id('%s')) "
++				       "when 'allpages' then 1 when 'datarows' then 2 when 'datapages' then 2 else 0 end",
++				       full_tablename);
++	}
++	TDS_PROPAGATE(rc);
++
++	value = 0;
++	value_found = false;
++	failed = false;
++
++	while ((rc = tds_process_tokens(tds, &resulttype, &done_flags, TDS_TOKEN_RESULTS)) == TDS_SUCCESS) {
++		const unsigned int stop_mask = TDS_RETURN_DONE | TDS_RETURN_ROW;
++
++		if (resulttype == TDS_DONE_RESULT && (done_flags & TDS_DONE_ERROR))
++			failed = true;
++		if (resulttype != TDS_ROW_RESULT)
++			continue;
++
++		/* We must keep processing result tokens (even if we've found what we're looking for) so that the
++		 * stream is ready for subsequent queries. */
++		while ((rc = tds_process_tokens(tds, &resulttype, &done_flags, stop_mask)) == TDS_SUCCESS) {
++			TDSCOLUMN *col;
++			TDS_SERVER_TYPE ctype;
++			CONV_RESULT dres;
++			TDS_INT res;
++
++			if (resulttype != TDS_ROW_RESULT) {
++				if (resulttype == TDS_DONE_RESULT && (done_flags & TDS_DONE_ERROR))
++					failed = true;
++				break;
++			}
++
++			/* Get INT4 from column 0 */
++			if (!tds->current_results || tds->current_results->num_cols < 1)
++				continue;
++
++			col = tds->current_results->columns[0];
++			if (col->column_cur_size < 0)
++				continue;
++
++			ctype = tds_get_conversion_type(col->column_type, col->column_size);
++			res = tds_convert(tds_get_ctx(tds), ctype, col->column_data, col->column_cur_size, SYBINT4, &dres);
++			if (res < 0)
++				continue;
++
++			value = dres.i;
++			value_found = true;
++		}
++	}
++	if (TDS_FAILED(rc))
++		return rc;
++
++	/* The row format depends on the answer: without a definite one (the probe
++	 * failed, or the table's lock scheme is unknown), nothing is sent. Servers
++	 * without data-only locking were left out above, by their capabilities. */
++	if (failed || !value_found || (value != 1 && value != 2)) {
++		tdsdump_log(TDS_DBG_ERROR, "[DOL BULK] No lock scheme found for '%s'.\n", full_tablename);
++		return TDS_FAIL;
++	}
++
++	tdsdump_log(TDS_DBG_INFO1, "lock scheme %u for '%s'\n", value, full_tablename);
++	if (value == 2) {
++		bcpinfo->datarows_locking = true;
++		tdsdump_log(TDS_DBG_INFO1, "Table has data-only locking; enabling DOL BULK format.\n");
++	}
++	return TDS_SUCCESS;
++}
++
++/**
+  * Help to build query to be sent to server.
+  * Append column declaration to the query.
+  * Only for TDS 7.0+.
+@@ -406,21 +539,27 @@
+ tds5_send_record(TDSSOCKET *tds, TDSBCPINFO *bcpinfo,
+ 		 tds_bcp_get_col_data get_col_data, tds_bcp_null_error null_error, int offset)
+ {
+-	int row_pos;
++	int row_pos = 0;
+ 	int row_sz_pos;
+ 	int blob_cols = 0;
++	int var_cols_pos;
+ 	int var_cols_written = 0;
+ 	TDS_INT	 old_record_size = bcpinfo->bindinfo->row_size;
+ 	unsigned char *record = bcpinfo->bindinfo->current_row;
+ 	int i;
+ 
+ 	memset(record, '\0', old_record_size);	/* zero the rowbuffer */
++
++	/* SAP ASE Datarows-locked tables expect additional 4 blank bytes before everything else */
++	if (bcpinfo->datarows_locking)
++		row_pos += 4;
+ 
+ 	/*
+ 	 * offset 0 = number of var columns
+ 	 * offset 1 = row number.  zeroed (datasever assigns)
+ 	 */
+-	row_pos = 2;
++	var_cols_pos = row_pos;
++	row_pos += 2;
+ 
+ 	if ((row_pos = tds5_bcp_add_fixed_columns(bcpinfo, get_col_data, null_error, offset, record, row_pos)) < 0)
+ 		return TDS_FAIL;
+@@ -436,7 +575,7 @@
+ 
+ 	if (var_cols_written) {
+ 		TDS_PUT_UA2LE(&record[row_sz_pos], row_pos);
+-		record[0] = var_cols_written;
++		record[var_cols_pos] = var_cols_written;
+ 	}
+ 
+ 	tdsdump_log(TDS_DBG_INFO1, "old_record_size = %d new size = %d \n", old_record_size, row_pos);
+@@ -704,7 +843,15 @@
+ 				rowbuffer[row_pos] = ' ';
+ 			} else {
+ 				cpbytes = bcpcol->bcp_column_data->datalen > bcpcol->column_size ?
+-				bcpcol->column_size : bcpcol->bcp_column_data->datalen;
++					bcpcol->column_size : bcpcol->bcp_column_data->datalen;
++				/*
++				 * Sybase stores variable binary data without trailing
++				 * zeroes (keeping at least a byte), do the same as
++				 * a normal insert.
++				 */
++				if (is_binary_type(bcpcol->on_server.column_type))
++					while (cpbytes > 1 && bcpcol->bcp_column_data->data[cpbytes - 1] == 0)
++						--cpbytes;
+ 				memcpy(&rowbuffer[row_pos], bcpcol->bcp_column_data->data, cpbytes);
+ 				tds5_swap_data(bcpcol, &rowbuffer[row_pos]);
+ 			}
+@@ -713,6 +860,10 @@
+ 		}
+ 
+ 		row_pos += cpbytes;
++		/* The offset table, and the row's one-byte count of variable columns,
++		 * hold at most 255 columns. */
++		if (ncols >= 255)
++			return -1;
+ 		offsets[++ncols] = row_pos;
+ 		tdsdump_dump_buf(TDS_DBG_NETWORK, "BCP row buffer so far", rowbuffer,  row_pos);
+ 	}
+@@ -740,7 +891,7 @@
+ 	while (ncols && offsets[ncols] == offsets[ncols-1])
+ 		ncols--;	/* trailing NULL columns are not sent and are not included in the offset table */
+ 
+-	if (ncols) {
++	if (ncols && !bcpinfo->datarows_locking) {
+ 		TDS_UCHAR *poff = rowbuffer + row_pos;
+ 		unsigned int pfx_top = offsets[ncols] >> 8;
+ 
+@@ -764,6 +915,17 @@
+ 		for (i=0; i <= ncols; i++)
+ 			*poff++ = offsets[ncols-i] & 0xFF;
+ 		row_pos = (unsigned int)(poff - rowbuffer);
++	} else {		/* Datarows-locking */
++		unsigned int col;
++
++		for (col = ncols; col-- > 0;) {
++			/* The DOL BULK format has a much simpler row table -- it's just a 2-byte length for every
++			 * non-fixed column (does not have the extra "offset after the end" that the basic format has) */
++			rowbuffer[row_pos++] = offsets[col] % 256u;
++			rowbuffer[row_pos++] = offsets[col] / 256u;
++
++			tdsdump_log(TDS_DBG_FUNC, "[DOL BULK offset table] col=%u offset=%u\n", col, offsets[col]);
++		}
+ 	}
+ 
+ 	tdsdump_log(TDS_DBG_FUNC, "%4d %8d %8d\n", i, ncols, row_pos);
+@@ -991,13 +1153,20 @@
+ 	return -1;
+ }
+ 
+-static void
++static TDSRET
+ tds5_read_bulk_defaults(TDSRESULTINFO *res_info, TDSBCPINFO *bcpinfo)
+ {
+ 	int i;
+ 	TDS5COLINFO *syb_info = bcpinfo->sybase_colinfo;
+ 	TDS5COLINFO *const syb_info_end = syb_info + bcpinfo->sybase_count;
+ 
++	/* testing of behaviour of --ignoredefaults in ASE BCP client appears
++	 * to show it behaves exactly as if defaults did not exist. For example
++	 * a null value or omitted value for a default non-null column will
++	 * give an error, instead of using the default. */
++	if (tds5_keep_nulls(bcpinfo))
++		return TDS_SUCCESS;
++
+ 	for (i = 0; i < res_info->num_cols; ++i, ++syb_info) {
+ 		TDSCOLUMN *col = res_info->columns[i];
+ 		TDS_UCHAR *src = col->column_data;
+@@ -1010,17 +1179,27 @@
+ 		for (;;) {
+ 			/* avoid overflows */
+ 			if (syb_info >= syb_info_end)
+-				return;
++				return TDS_SUCCESS;
+ 
+ 			if (syb_info->dflt)
+ 				break;
+ 			++syb_info;
+ 		}
+ 
++		/* A default of NULL is no default: a NULL stays NULL. */
++		if (len < 0) {
++			syb_info->dflt = false;
++			continue;
++		}
++		/* The size is set only with the value it describes: a default whose
++		 * value could not be kept must not be substituted from a stale or
++		 * missing buffer. */
++		if (!TDS_RESIZE(syb_info->dflt_value, len))
++			return TDS_FAIL;
++		memcpy(syb_info->dflt_value, src, len);
+ 		syb_info->dflt_size = len;
+-		if (TDS_RESIZE(syb_info->dflt_value, len))
+-			memcpy(syb_info->dflt_value, src, len);
+ 	}
++	return TDS_SUCCESS;
+ }
+ 
+ static TDSRET
+@@ -1073,7 +1252,9 @@
+ 				continue;
+ 			if (!row_match) {
+ 				tds_extra_assert(res_info->num_cols == num_defs);
+-				tds5_read_bulk_defaults(res_info, bcpinfo);
++				/* Read on to the end of the reply either way. */
++				if (TDS_FAILED(tds5_read_bulk_defaults(res_info, bcpinfo)))
++					ret = TDS_FAIL;
+ 				continue;
+ 			}
+ 			for (icol = 0; icol < BULKCOL_COUNT; ++icol) {
+@@ -1145,14 +1326,17 @@
+ 	BCPCOLDATA *coldata;
+ 
+ 	ret = get_col_data(bulk, bcpcol, offset);
++	/* errors must be reported, defaults are used only for NULL values */
++	TDS_PROPAGATE(ret);
+ 	coldata = bcpcol->bcp_column_data;
+ 	if (coldata->is_null && bulk->sybase_colinfo != NULL && !is_blob_type(bcpcol->column_type)) {
+ 		const TDS5COLINFO *syb_info = &bulk->sybase_colinfo[colnum];
+ 
+-		if (!syb_info->dflt) {
++		/* With KEEP_NULLS no default was read: the column is as if it had none.
++		 * A NULL is left as it is: for a NOT NULL column the caller reports it
++		 * (null_error), so that a failure without a report is never one. */
++		if (!syb_info->dflt || tds5_keep_nulls(bulk)) {
+ 			/* leave to NULL */
+-			if (!bcpcol->column_nullable)
+-				return TDS_FAIL;
+ 		} else {
+ 			if (!TDS_RESIZE(coldata->data, syb_info->dflt_size))
+ 				return TDS_FAIL;
+@@ -1186,7 +1370,6 @@
+ {
+ 	TDSCOLUMN *bcpcol;
+ 	int i;
+-	int fixed_col_len_tot     = 0;
+ 	int variable_col_len_tot  = 0;
+ 	int column_bcp_data_size  = 0;
+ 	int bcp_record_size       = 0;
+@@ -1203,52 +1386,41 @@
+ 		return rc;
+ 	}
+ 
+-	/* 
+-	 * Work out the number of "variable" columns.  These are either nullable or of 
+-	 * varying length type e.g. varchar.   
++	/*
++	 * Size the row buffer for the largest row tds5_send_record can write, in
++	 * either format, whichever columns the server makes fixed or variable:
++	 *   [4 DOL bytes] 2 (count, row number) | fixed data | 2 (row length) |
++	 *   variable data | offset table
++	 * The APL offset table holds one byte per variable column plus one, a count
++	 * byte, and one adjustment byte per 256 bytes of the whole row up to its
++	 * end (fixed data included); the DOL one two bytes per variable column.
+ 	 */
+ 	var_cols = 0;
+ 
+ 	if (IS_TDS50(tds->conn)) {
++		int row_end;
++
+ 		for (i = 0; i < bcpinfo->bindinfo->num_cols; i++) {
+-	
+ 			bcpcol = bcpinfo->bindinfo->columns[i];
+ 
+-			/*
+-			 * work out storage required for this datatype
+-			 * blobs always require 16, numerics vary, the
+-			 * rest can be taken from the server
+-			 */
+-
++			/* the most this column's value can take in the row */
+ 			if (is_blob_type(bcpcol->on_server.column_type))
+-				column_bcp_data_size  = 16;
++				column_bcp_data_size = 16;
+ 			else if (is_numeric_type(bcpcol->on_server.column_type))
+-				column_bcp_data_size  = tds_numeric_bytes_per_prec[bcpcol->column_prec];
++				column_bcp_data_size = tds_numeric_bytes_per_prec[MAXPRECISION];
+ 			else
+-				column_bcp_data_size  = bcpcol->column_size;
++				column_bcp_data_size = MAX(bcpcol->column_size, bcpcol->on_server.column_size);
++			if (column_bcp_data_size < 1)
++				column_bcp_data_size = 1;	/* an empty char is sent as a space */
+ 
+-			/*
+-			 * now add that size into either fixed or variable
+-			 * column totals...
+-			 */
+-
+-			if (is_nullable_type(bcpcol->on_server.column_type) || bcpcol->column_nullable) {
+-				var_cols++;
+-				variable_col_len_tot += column_bcp_data_size;
+-			} else {
+-				fixed_col_len_tot += column_bcp_data_size;
+-			}
++			variable_col_len_tot += column_bcp_data_size;	/* fixed or variable: all count */
++			var_cols++;
+ 		}
+ 
+-		/* this formula taken from sybase manual... */
++		row_end = (bcpinfo->datarows_locking ? 4 : 0) + 2 + variable_col_len_tot + 2;
++		bcp_record_size = row_end +
++			(bcpinfo->datarows_locking ? 2 * var_cols : 1 + (row_end >> 8) + var_cols + 1);
+ 
+-		bcp_record_size =  	4 +
+-							fixed_col_len_tot +
+-							variable_col_len_tot +
+-							( (int)(variable_col_len_tot / 256 ) + 1 ) +
+-							(var_cols + 1) +
+-							2;
+-
+ 		tdsdump_log(TDS_DBG_FUNC, "current_record_size = %d\n", bcpinfo->bindinfo->row_size);
+ 		tdsdump_log(TDS_DBG_FUNC, "bcp_record_size     = %d\n", bcp_record_size);
+ 
+diff --git a/src/tds/mem.c b/src/tds/mem.c
+--- a/src/tds/mem.c
++++ b/src/tds/mem.c
+@@ -16,6 +16,12 @@
+  * License along with this library; if not, write to the
+  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+  * Boston, MA 02111-1307, USA.
++ */
++
++/*
++ * Modified by the drizzle-sybase project, last on 2026-11-11.
++ * The changes, and why, are listed in patches/freetds-1.5.17-sybase-bulk.patch
++ * of drizzle-sybase; this file is otherwise FreeTDS 1.5.17's.
+  */
+ 
+ #include <config.h>
+@@ -775,7 +781,7 @@
+ 	REQ(i,CSR_PREV) REQ(i,CSR_FIRST) REQ(i,CSR_LAST) REQ(i,CSR_ABS) REQ(i,CSR_REL) \
+ 	REQ(i,CSR_MULTI) REQ(i,CON_INBAND) REQ(i,PROTO_TEXT) REQ(i,PROTO_BULK) \
+ 	REQ(i,DATA_SENSITIVITY) REQ(i,DATA_BOUNDARY) REQ(i,PROTO_DYNPROC) REQ(i,DATA_FLTN) \
+-	REQ(i,DATA_BITN) REQ(i,DATA_INT8) REQ(i,WIDETABLE) \
++	REQ(i,DATA_BITN) REQ(i,DATA_INT8) REQ(i,DOL_BULK) REQ(i,WIDETABLE) \
+ 	REQ(i,DATA_UINT2) REQ(i,DATA_UINT4) REQ(i,DATA_UINT8) REQ(i,DATA_UINTN) REQ(i,LARGEIDENT) \
+ 	REQ(i,SRVPKTSIZE) REQ(i,DATA_DATE) REQ(i,DATA_TIME) REQ(i,DATA_BIGTIME) REQ(i,DATA_BIGDATETIME)
+ #define REQ(i,n) |(((TDS_REQ_ ## n / 8) == i)?(1<<(TDS_REQ_ ## n & 7)):0)

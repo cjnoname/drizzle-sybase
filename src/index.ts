@@ -113,16 +113,33 @@ export {
 
 // Database instance
 export { createSybaseDrizzle } from "./db.js";
-export type { SybaseDrizzle, SybaseDrizzleTx, SybaseDrizzleConfig } from "./db.js";
+export type {
+  SybaseDrizzle,
+  SybaseDrizzleConfig,
+  SybaseDrizzleConnection,
+  SybaseDrizzleTx,
+  SybaseExecuteResult
+} from "./db.js";
+
+// Bulk copy
+export type {
+  SybaseBulkInsertOptions,
+  SybaseBulkInsertResult,
+  SybaseBulkRow,
+  SybaseBulkRows,
+  SybaseBulkValue
+} from "./bulk.js";
 
 // Errors
 export {
   SybaseError,
+  SybaseBulkCopyError,
   SybaseConnectionError,
   SybaseQueryError,
   SybaseTimeoutError,
   SybasePoolError
 } from "./errors.js";
+export type { SybaseBulkBatch, SybaseBulkRejectedRow } from "./errors.js";
 
 // Connection + Pool
 export { SybaseConnection } from "./connection.js";
@@ -138,6 +155,7 @@ export { SybasePool } from "./pool.js";
 export type { SybasePoolConfig, SybasePoolMetrics } from "./pool.js";
 export type {
   SybaseColumnarResult,
+  SybaseColumnarResultSet,
   SybaseColumnValues,
   SybaseFileResult,
   SybaseResultColumn
