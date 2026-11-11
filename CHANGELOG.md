@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v4.0.0...v5.0.0) (2026-11-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* behaviour that differs from 4.0.0:
+    - A string holding a NUL character is refused in SQL (it was silently
+      stripped).
+    - insert() without .values() throws.
+    - withConnection() throws when the session's state cannot be checked after
+      the callback (the connection was lost, or its reset failed), even if the
+      callback succeeded.
+    - executeAtomic() refuses a batch containing COMMIT or ROLLBACK.
+    - Introspection writes `{ owner: "dbo" }` for dbo tables, and no longer
+      filters out tables named sys* or indexes named t*: generated schemas change.
+    - A hard timeout's SybaseTimeoutError has timeoutMs set to the hard timeout
+      itself and connectionDead true.
+    - A call that sets its own timeoutSeconds does not inherit the configured
+      hardTimeoutMs.
+
+### Features
+
+* In-process bulk copy, per-call timeouts and multiple result sets ([5993df5](https://github.com/cjnoname/drizzle-sybase/commit/5993df5ad660c24b845c3cf2884ff61f1a9bc8d4))
+
+
+### Bug Fixes
+
+* Copy the Linux test binary as root, and drop a redundant seconds check ([5dadca4](https://github.com/cjnoname/drizzle-sybase/commit/5dadca49c19d1559c19099f7d85f3ce0a0015f3f))
+
 ## [4.0.0](https://github.com/cjnoname/drizzle-sybase/compare/v3.2.0...v4.0.0) (2026-10-28)
 
 
