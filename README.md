@@ -259,9 +259,15 @@ try {
     err.rowsInDoubt; // see below; 0 in every other case
     (err.row, err.column); // the input row (1-based) and column a refused value was in
     err.cause; // SybaseQueryError (e.g. Msg 2601 duplicate key), SybaseTimeoutError, ...
+    err.kind; // "refused" | "source" | "server" | "connection" | "timeout"
+    err.retryable; // true for a lost connection, a timeout or a deadlock; never for refused rows
   }
 }
 ```
+
+Decide whether to try again on `retryable` (or `kind`), not on
+`connectionDead`: a failed copy always closes its connection — that is what
+rolls back its open batch — so `connectionDead` is true for a refused row too.
 
 A failed copy is abandoned by closing its connection — that is what makes the
 server roll back the batch it never saw the end of — so the pool never hands
@@ -328,7 +334,8 @@ before it is sent, with the query builders' rules — except that money takes no
 - A TSV row longer than 4 MiB fails the copy (no table's row comes near it).
 - On an iso_1 server text is sent as Latin-1; a character Latin-1 cannot hold
   (e.g. `中`) refuses its row, naming the row, column and character — it is
-  never stored as `?`.
+  not stored as `?` unless asked: `unmappable: "replace"` writes `?` for each
+  such character instead (the text is then not copied exactly).
 - Text holding a NUL character refuses its row, as SQL text with one is
   refused (db-lib would store a lone NUL as a blank).
 - A number, date or bit given as a string of more than 127 characters refuses

@@ -3599,6 +3599,7 @@ typedef struct BulkState {
   int timeout_overridden;
   char *table;
   int identity_insert;  // 1 while `set identity_insert <table> on` is in effect
+  int replace_unmappable;  // a character iso_1 cannot hold becomes '?' (else refuses its row)
   unsigned char *text;  // scratch for a text value in the server's encoding
   size_t text_cap;
   BulkField *fields;        // the row being sent, one per bound column
@@ -4195,7 +4196,9 @@ static long bulk_encode_text(BulkState *st, const BulkField *f, int latin1, char
       return -1;
     }
     if (latin1) {
-      if (cp > 0xFF) {
+      if (cp > 0xFF && st->replace_unmappable) {
+        cp = '?';
+      } else if (cp > 0xFF) {
         snprintf(why, why_size,
                  "has U+%04X at character %ld, which the server's character set (iso_1) "
                  "cannot hold",
@@ -4239,12 +4242,16 @@ static int bulk_set_value(SybaseConnection *conn, BulkState *st, const BulkColum
     // sized by the field. What is left cannot fit if even its shortest encoding
     // is too long — a byte per UTF-16 unit, or, from UTF-8 into Latin-1, a byte
     // per two (every character Latin-1 holds is at most two bytes of UTF-8).
+    // A character replaced by '?' is one byte from up to two units, or up to
+    // four bytes of UTF-8.
     BulkField trimmed = *f;
     while (trimmed.length > 0 &&
            (f->units ? f->units[trimmed.length - 1] : f->bytes[trimmed.length - 1]) == ' ') {
       trimmed.length--;
     }
-    size_t per_byte = !f->units && conn->latin1 ? 2 : 1;
+    size_t per_byte = conn->latin1 && st->replace_unmappable ? (f->units ? 2 : 4)
+                      : !f->units && conn->latin1          ? 2
+                                                            : 1;
     if (trimmed.length > (size_t)col->max_length * per_byte) {
       snprintf(why, why_size,
                "is at least %zu bytes in the server's character set; the column holds %d",
@@ -4419,6 +4426,7 @@ typedef struct {
   int num_names;
   int keep_identity;
   int ignore_defaults;
+  int replace_unmappable;
   int allow_constraint_bypass;
   int timeout_seconds;
   BulkState *state;  // being built; handed to the connection on success
@@ -4831,6 +4839,7 @@ static void bulk_begin(BulkWork *w) {
     return;
   }
   w->state = st;
+  st->replace_unmappable = w->replace_unmappable;
   if (w->timeout_seconds > 0 && w->timeout_seconds != conn->timeout_seconds) {
     if (set_query_timeout(conn, w->timeout_seconds) != 0) {
       bulk_fail(w, "Could not set the copy's timeout");
@@ -5561,7 +5570,8 @@ static int is_table_name(const char *name) {
 }
 
 // napi_value bulkBegin(conn, { table, columns?, keepIdentity?, ignoreDefaults?,
-//                              allowConstraintBypass?, timeoutSeconds?, hardTimeoutMs })
+//                              replaceUnmappable?, allowConstraintBypass?, timeoutSeconds?,
+//                              hardTimeoutMs })
 //
 // Opens a copy into `table` (see the section comment). Resolves to the bound
 // columns, `{ columns: [{ name, type, nullable, length, precision, scale }] }`,
@@ -5659,6 +5669,7 @@ static napi_value fn_bulk_begin(napi_env env, napi_callback_info info) {
   // A hard timeout is required: a copy never runs without its watchdog.
   if (option_bool(env, args[1], "keepIdentity", &w->keep_identity) != 0 ||
       option_bool(env, args[1], "ignoreDefaults", &w->ignore_defaults) != 0 ||
+      option_bool(env, args[1], "replaceUnmappable", &w->replace_unmappable) != 0 ||
       option_bool(env, args[1], "allowConstraintBypass", &w->allow_constraint_bypass) != 0 ||
       config_int(env, args[1], "timeoutSeconds", 1, MAX_TIMEOUT_SECONDS, 0, &w->timeout_seconds) != 0 ||
       config_int(env, args[1], "hardTimeoutMs", 1, INT32_MAX, 1, &w->hard_timeout_ms) != 0) {

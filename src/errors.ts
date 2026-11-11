@@ -228,7 +228,34 @@ export interface SybaseBulkRejectedRow {
  * `SybaseQueryError` for a server error such as a duplicate key, a `TypeError`
  * for a value that cannot be converted.
  */
+/**
+ * What a bulk copy failed on:
+ * - `refused`: the rows — a value that does not convert, a NULL for a NOT NULL
+ *   column, more refused rows than `maxErrors`, a count other than
+ *   `expectedRows`. Sending them again fails again.
+ * - `source`: the caller's rows could not be read (the source threw, or is not
+ *   rows at all).
+ * - `server`: the server refused the copy or a batch (a duplicate key, a
+ *   permission, a table with triggers, a transaction open, ...).
+ * - `connection`: the connection was lost, or the answer to a commit.
+ * - `timeout`: a timeout of the call passed.
+ */
+export type SybaseBulkFailureKind = "refused" | "source" | "server" | "connection" | "timeout";
+
 export class SybaseBulkCopyError extends SybaseError {
+  /** What the copy failed on; see {@link SybaseBulkFailureKind}. */
+  readonly kind: SybaseBulkFailureKind;
+
+  /**
+   * Whether the same copy may succeed if tried again: a lost connection, a
+   * timeout, or a deadlock the server chose this copy to end. Never for rows
+   * that were refused. (`connectionDead` says nothing of this: a failed copy is
+   * always abandoned by closing its connection, which is what rolls back its
+   * open batch.) What to send again is the caller's to work out:
+   * `rowsCommitted` are in the table, and `rowsInDoubt` may be.
+   */
+  readonly retryable: boolean;
+
   /** Rows committed by earlier batches — certainly in the table. */
   readonly rowsCommitted: number;
 
@@ -271,11 +298,18 @@ export class SybaseBulkCopyError extends SybaseError {
       row?: number;
       column?: string;
       connectionDead: boolean;
+      kind: SybaseBulkFailureKind;
       cause?: unknown;
     }
   ) {
     super(message, details.connectionDead);
     this.name = "SybaseBulkCopyError";
+    this.kind = details.kind;
+    this.retryable =
+      details.kind === "connection" ||
+      details.kind === "timeout" ||
+      (details.kind === "server" &&
+        (details.cause as { msgNo?: unknown } | undefined)?.msgNo === 1205);
     this.rowsCommitted = details.rowsCommitted;
     this.rowsInDoubt = details.rowsInDoubt;
     this.batches = details.batches;

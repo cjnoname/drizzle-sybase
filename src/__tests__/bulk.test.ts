@@ -226,6 +226,7 @@ describe("bulkInsert: value rows", () => {
       rows: [[1, "a"]],
       keepIdentity: true,
       ignoreDefaults: true,
+      unmappable: "replace",
       allowConstraintBypass: true,
       timeoutSeconds: 7
     });
@@ -234,6 +235,7 @@ describe("bulkInsert: value rows", () => {
       columns: ["k", "v"],
       keepIdentity: true,
       ignoreDefaults: true,
+      replaceUnmappable: true,
       allowConstraintBypass: true,
       timeoutSeconds: 7
     });
@@ -470,6 +472,27 @@ describe("bulkInsert: value rows", () => {
       { row: 1, column: "k", message: expect.stringMatching(/8388608 characters long/) }
     ]);
     expect(stub.sent.map(c => c.rows)).toEqual([[["2", "2"]]]);
+  });
+
+  // A character is a byte or more in the server's character set — one, `?`,
+  // when replaced, though a surrogate pair is two UTF-16 units: counted as
+  // characters, not units, before anything is refused as too long.
+  it("measures a string by its characters, so a replaced pair fits a one-byte column", async () => {
+    stub.columns = [column("v", "char", { length: 1 })];
+    await (await connected()).bulkInsert({ table: "t", rows: [["😀"]], unmappable: "replace" });
+    expect(stub.sent[0]!.rows).toEqual([["😀"]]);
+    for (const [value, message] of [
+      ["😀😀", /value is at least 2 bytes/],
+      ["ab", /value is at least 2 bytes/],
+      ["😀".repeat(5), /value is at least 5 bytes/]
+    ] as const) {
+      const err = (await (
+        await connected()
+      )
+        .bulkInsert({ table: "t", rows: [[value]], unmappable: "replace" })
+        .catch((e: unknown) => e)) as SybaseBulkCopyError;
+      expect(err.message).toMatch(message);
+    }
   });
 
   it("counts rows the native side rejects", async () => {
@@ -1219,8 +1242,79 @@ describe("bulkInsert: failures", () => {
     expect(err.batches).toEqual([{ rows: 2 }]);
     expect(err.cause).toBeInstanceOf(SybaseQueryError);
     expect(err.msgNo).toBe(2601);
+    // Closed to roll the batch back — which says nothing of whether to retry.
     expect(err.connectionDead).toBe(true);
+    expect([err.kind, err.retryable]).toEqual(["server", false]);
     expect(conn.isConnected).toBe(false);
+  });
+
+  // What the copy failed on, and so whether sending it again can help.
+  it("says what a copy failed on, and whether trying it again can help", async () => {
+    stub.columns = [column("k", "int")];
+    const failWith = async (
+      options: Partial<Parameters<SybaseConnection["bulkInsert"]>[0]>,
+      onSend?: typeof stub.onSend
+    ) => {
+      stub.onSend = onSend;
+      const err = (await (
+        await connected()
+      )
+        .bulkInsert({ table: "t", rows: [[1]], ...options })
+        .catch((e: unknown) => e)) as SybaseBulkCopyError;
+      expect(err).toBeInstanceOf(SybaseBulkCopyError);
+      return [err.kind, err.retryable];
+    };
+    // Rows refused, by the JS side or the native side: never worth sending again.
+    expect(await failWith({ rows: [[1.5]] })).toEqual(["refused", false]);
+    expect(
+      await failWith({}, () => {
+        throw nativeError("Row 1: a NULL for a column that allows none", {
+          row: 1,
+          valueRefused: true
+        });
+      })
+    ).toEqual(["refused", false]);
+    expect(await failWith({ expectedRows: 2 })).toEqual(["refused", false]);
+    // Stopped on a row, but not by its values (it could not be sent): not refused.
+    expect(
+      await failWith({}, () => {
+        throw nativeError("Row 1 could not be sent: bcp_sendrow() failed", {
+          row: 1,
+          outcome: "none"
+        });
+      })
+    ).toEqual(["server", false]);
+    // The caller's source.
+    expect(
+      await failWith({
+        rows: (function* () {
+          yield [1];
+          throw new Error("disk gone");
+        })(),
+        batchSize: 1
+      })
+    ).toEqual(["source", false]);
+    // A deadlock victim may succeed when tried again; another server error not.
+    const serverError = (message: string) => () => {
+      throw nativeError(message, { outcome: "failed" });
+    };
+    expect(
+      await failWith({}, serverError("Msg 1205, Level 13, State 2: deadlock: chosen as the victim"))
+    ).toEqual(["server", true]);
+    expect(
+      await failWith({}, serverError("Msg 229, Level 14, State 1: permission denied"))
+    ).toEqual(["server", false]);
+    // A lost connection, or a passed timeout.
+    expect(
+      await failWith({}, () => {
+        throw nativeError("Write to the server failed", { connectionLost: true });
+      })
+    ).toEqual(["connection", true]);
+    expect(
+      await failWith({}, () => {
+        throw nativeError("hard timeout", { hardTimeout: true });
+      })
+    ).toEqual(["timeout", true]);
   });
 
   it("reports the rows whose commit was cut off as in doubt", async () => {
@@ -1577,6 +1671,9 @@ describe("bulkInsert on the pool and db", () => {
     for (const table of ["dbo.#t", "tempdb..#t", "db.dbo.#t"]) {
       await expect(db.bulkInsert({ table, rows: [] })).rejects.toThrow(TypeError);
     }
+    await expect(
+      db.bulkInsert({ table: "t", rows: [], unmappable: "drop" as never })
+    ).rejects.toThrow(/unmappable must be "refuse" or "replace"/);
     expect(db.pool.metrics.totalConnectionsCreated).toBe(0);
     await db.close();
   });

@@ -131,6 +131,8 @@ export interface NativeBulkBeginOptions {
   keepIdentity?: boolean;
   /** Keep NULLs (and columns left out) NULL instead of using column defaults. */
   ignoreDefaults?: boolean;
+  /** On an iso_1 server, write a character it cannot hold as `?` instead of refusing its row. */
+  replaceUnmappable?: boolean;
   /** Copy even into a table with triggers, CHECK/foreign key constraints or rules (not applied). */
   allowConstraintBypass?: boolean;
   /** Cooperative timeout of the copy, in seconds; default: the connection's. */

@@ -139,7 +139,7 @@ export {
   SybaseTimeoutError,
   SybasePoolError
 } from "./errors.js";
-export type { SybaseBulkBatch, SybaseBulkRejectedRow } from "./errors.js";
+export type { SybaseBulkBatch, SybaseBulkFailureKind, SybaseBulkRejectedRow } from "./errors.js";
 
 // Connection + Pool
 export { SybaseConnection } from "./connection.js";

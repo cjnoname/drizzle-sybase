@@ -390,6 +390,52 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
     expect(rows).toEqual([{ v: "café", raw: Buffer.from([0x63, 0x61, 0x66, 0xe9]) }]);
   }, 60_000);
 
+  // Asked for: what iso_1 cannot hold becomes '?' — one per character, a pair
+  // of surrogates included — and the rest is copied as before.
+  it("writes '?' for what iso_1 cannot hold with unmappable: 'replace'", async ctx => {
+    if (charset !== "iso_1") {
+      ctx.skip();
+      return;
+    }
+    await recreate(PROBE, PROBE_COLUMNS);
+    const result = await db.bulkInsert({
+      table: PROBE,
+      columns: ["k", "m", "c", "b", "v"],
+      rows: [[1, "1", "x", 0, "中é😀"]],
+      unmappable: "replace"
+    });
+    expect(result.rowsCopied).toBe(1);
+    await db.bulkInsert({
+      table: PROBE,
+      columns: ["k", "m", "c", "b", "v"],
+      rows: "2\t1\tx\t0\t€a\n",
+      unmappable: "replace"
+    });
+    const { rows } = await db.executeRaw(
+      `select v, convert(varbinary(10), v) as raw from ${PROBE} order by k`
+    );
+    expect(rows).toEqual([
+      { v: "?é?", raw: Buffer.from([0x3f, 0xe9, 0x3f]) },
+      { v: "?a", raw: Buffer.from([0x3f, 0x61]) }
+    ]);
+    // Measured once replaced: a character outside iso_1 fits a one-byte column,
+    // from value rows (a surrogate pair) and from TSV (four bytes of UTF-8);
+    // two characters still do not.
+    await recreate(PROBE, "(k int not null, v varchar(1) null)");
+    await db.bulkInsert({ table: PROBE, rows: [[1, "😀"]], unmappable: "replace" });
+    await db.bulkInsert({ table: PROBE, rows: "2\t中\n3\t😀\n", unmappable: "replace" });
+    for (const rows of [[[4, "😀😀"]], "4\t中x\n"]) {
+      await expect(
+        db.bulkInsert({ table: PROBE, rows: rows as never, unmappable: "replace" })
+      ).rejects.toThrow(/the column holds 1/);
+    }
+    expect((await db.executeRaw(`select k, v from ${PROBE} order by k`)).rows).toEqual([
+      { k: 1, v: "?" },
+      { k: 2, v: "?" },
+      { k: 3, v: "?" }
+    ]);
+  }, 60_000);
+
   // -------------------------------------------------------------------------
   // Atomicity and truthful counts
   // -------------------------------------------------------------------------

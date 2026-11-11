@@ -10,8 +10,13 @@
  */
 import { checkInteger, MAX_INT32 } from "./checks.js";
 import { formatSybaseDateTime } from "./datetime.js";
-import { messageOf, SybaseBulkCopyError } from "./errors.js";
-import type { SybaseBulkBatch, SybaseBulkRejectedRow } from "./errors.js";
+import {
+  messageOf,
+  SybaseBulkCopyError,
+  SybaseConnectionError,
+  SybaseTimeoutError
+} from "./errors.js";
+import type { SybaseBulkBatch, SybaseBulkFailureKind, SybaseBulkRejectedRow } from "./errors.js";
 import type {
   NativeBulkBeginOptions,
   NativeBulkBeginResult,
@@ -123,6 +128,15 @@ export interface SybaseBulkInsertOptions {
    * `null`, `undefined`) in a column that has a DEFAULT stores the default.
    */
   ignoreDefaults?: boolean;
+  /**
+   * What to do with a character the server's character set cannot hold — on
+   * an iso_1 server, any past U+00FF (`中`, `€`): `"refuse"` (the default)
+   * refuses its row, naming the row, column and character; `"replace"` writes
+   * `?` in its place, as other clients converting to iso_1 do. Text is then not
+   * copied exactly: choose it only where that is acceptable. (A utf8 server
+   * holds every character; a lone surrogate or a NUL is refused either way.)
+   */
+  unmappable?: "refuse" | "replace";
   /**
    * Copy into a table that has an insert trigger, CHECK or foreign key
    * constraints, or rules. ASE's bulk copy applies none of them (nor does the
@@ -239,6 +253,13 @@ export const validateBulkInsertOptions = (options: SybaseBulkInsertOptions): voi
     if (options[flag] !== undefined && typeof options[flag] !== "boolean") {
       throw new TypeError(`bulkInsert: ${flag} must be a boolean`);
     }
+  }
+  if (
+    options.unmappable !== undefined &&
+    options.unmappable !== "refuse" &&
+    options.unmappable !== "replace"
+  ) {
+    throw new TypeError('bulkInsert: unmappable must be "refuse" or "replace"');
   }
 };
 
@@ -357,6 +378,37 @@ const TOKEN_TYPES = new Set([
   "datetime",
   "smalldatetime"
 ]);
+
+/**
+ * What a failure that does not say so itself was on: its cause's kind. Rows
+ * are refused only when a value was (the native side's refusals arrive as
+ * TypeError, as the JS side's): a failure on a row is not always about it — a
+ * row that could not be bound or sent (out of memory, a broken connection)
+ * names the row it stopped on, and is not a bad row.
+ */
+const kindOf = (cause: unknown): SybaseBulkFailureKind =>
+  cause instanceof SybaseTimeoutError
+    ? "timeout"
+    : cause instanceof SybaseConnectionError
+      ? "connection"
+      : cause instanceof TypeError
+        ? "refused"
+        : "server";
+
+/** Characters (code points) in the first `end` UTF-16 units of `text`: a surrogate pair is one. */
+const countCharacters = (text: string, end: number): number => {
+  let count = end;
+  for (let i = 1; i < end; i++) {
+    const unit = text.charCodeAt(i);
+    if (unit >= 0xdc00 && unit <= 0xdfff) {
+      const before = text.charCodeAt(i - 1);
+      if (before >= 0xd800 && before <= 0xdbff) {
+        count--;
+      }
+    }
+  }
+  return count;
+};
 
 /** How the values of a column are given to the native layer, by its type. */
 const encoderFor = (column: NativeBulkColumn, timeZone: string): Encoder => {
@@ -493,17 +545,23 @@ const encoderFor = (column: NativeBulkColumn, timeZone: string): Encoder => {
           return null;
         }
         if (typeof value === "string") {
-          // Every UTF-16 unit takes a byte or more in the server's character
-          // set, so a value with more (trailing blanks aside, which ASE drops)
-          // cannot fit: refused here, before it is copied to the native side.
+          // Every character takes a byte or more in the server's character
+          // set — one, `?`, when replaced (`unmappable: "replace"`), though
+          // two UTF-16 units — so a value with more characters (trailing
+          // blanks aside, which ASE drops) cannot fit: refused here, before it
+          // is copied to the native side. (Counted only past the column's
+          // length in units: a scan, nothing allocated.)
           let end = value.length;
           while (end > column.length && value.charCodeAt(end - 1) === 0x20) {
             end--;
           }
           if (end > column.length) {
-            throw new BulkValueError(
-              `is at least ${end} bytes in the server's character set; the column holds ${column.length}`
-            );
+            const characters = countCharacters(value, end);
+            if (characters > column.length) {
+              throw new BulkValueError(
+                `is at least ${characters} bytes in the server's character set; the column holds ${column.length}`
+              );
+            }
           }
           return end === value.length ? value : value.slice(0, end);
         }
@@ -1150,6 +1208,8 @@ export const copyRows = async (
       row?: number;
       column?: string;
       abandon: boolean;
+      /** Default: from the cause, and whether a row was refused. */
+      kind?: SybaseBulkFailureKind;
     }
   ): never => {
     closeReader();
@@ -1182,6 +1242,7 @@ export const copyRows = async (
       // As it is, not only as this failure left it: a commit before it may have
       // discarded the connection already.
       connectionDead: abandoned,
+      kind: details.kind ?? kindOf(details.cause),
       cause: details.cause
     });
   };
@@ -1209,6 +1270,7 @@ export const copyRows = async (
         columns: options.columns,
         keepIdentity: options.keepIdentity,
         ignoreDefaults: options.ignoreDefaults,
+        replaceUnmappable: options.unmappable === "replace",
         allowConstraintBypass: options.allowConstraintBypass,
         timeoutSeconds: options.timeoutSeconds
       })
@@ -1233,7 +1295,8 @@ export const copyRows = async (
   } catch (err) {
     return fail(`reading the rows failed: ${messageOf(err)}`, {
       cause: err,
-      abandon: true
+      abandon: true,
+      kind: "source"
     });
   }
   closeReader = () => reader.close();
@@ -1277,7 +1340,8 @@ export const copyRows = async (
     }
     return fail(`reading the rows failed: ${messageOf(err)}`, {
       cause: err,
-      abandon: true
+      abandon: true,
+      kind: "source"
     });
   };
 
@@ -1342,7 +1406,8 @@ export const copyRows = async (
         // cannot be read off it.
         return fail("the server's answer to the commit could not be read", {
           rowsInDoubt: openRows,
-          abandon: true
+          abandon: true,
+          kind: "connection"
         });
       }
       const confirmed = result.committed;
@@ -1379,10 +1444,16 @@ export const copyRows = async (
       return;
     }
     if (total > expected) {
-      fail(`expectedRows is ${expected}, but the input has more rows`, { abandon: true });
+      fail(`expectedRows is ${expected}, but the input has more rows`, {
+        abandon: true,
+        kind: "refused"
+      });
     }
     if (last && total !== expected) {
-      fail(`expectedRows is ${expected}, but ${total} rows would be copied`, { abandon: true });
+      fail(`expectedRows is ${expected}, but ${total} rows would be copied`, {
+        abandon: true,
+        kind: "refused"
+      });
     }
   };
 
@@ -1408,7 +1479,10 @@ export const copyRows = async (
     // Nothing to send: end the copy, so the connection can be used again.
     await send(EMPTY, 0, 1, COMMIT_DONE);
     if (expected !== undefined && expected !== 0) {
-      fail(`expectedRows is ${expected}, but the input has no rows`, { abandon: false });
+      fail(`expectedRows is ${expected}, but the input has no rows`, {
+        abandon: false,
+        kind: "refused"
+      });
     }
     return {
       rowsCopied: 0,

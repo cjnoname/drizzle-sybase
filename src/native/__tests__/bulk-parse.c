@@ -339,6 +339,14 @@ static void check_text(void) {
   expect_text(&st, &f, 0, "c\xC3\xA9" "a", 4, NULL);
   f.units = han, f.length = 2;
   expect_text(&st, &f, 1, NULL, 0, "U+4E2D at character 2");
+  st.replace_unmappable = 1;  // what iso_1 cannot hold becomes '?'
+  expect_text(&st, &f, 1, "a?", 2, NULL);
+  f.units = emoji, f.length = 2;
+  expect_text(&st, &f, 1, "?", 1, NULL);
+  f.units = lone, f.length = 2;
+  expect_text(&st, &f, 1, NULL, 0, "unpaired surrogate at character 2");
+  st.replace_unmappable = 0;
+  f.units = han, f.length = 2;
   expect_text(&st, &f, 0, "a\xE4\xB8\xAD", 4, NULL);
   f.units = emoji, f.length = 2;
   expect_text(&st, &f, 1, NULL, 0, "U+1F600 at character 1");
