@@ -242,14 +242,24 @@ export interface SybaseBulkRejectedRow {
  */
 export type SybaseBulkFailureKind = "refused" | "source" | "server" | "connection" | "timeout";
 
+/**
+ * Server errors a bulk copy can meet waiting for locks, which another session
+ * holding them can end: a deadlock it was chosen to break (1205), the server's
+ * locks all in use (1204), a lock wait that timed out (12205). The batch they
+ * fail is rolled back.
+ */
+const TRANSIENT_SERVER_ERRORS: ReadonlySet<unknown> = new Set([1204, 1205, 12205]);
+
 export class SybaseBulkCopyError extends SybaseError {
   /** What the copy failed on; see {@link SybaseBulkFailureKind}. */
   readonly kind: SybaseBulkFailureKind;
 
   /**
    * Whether the same copy may succeed if tried again: a lost connection, a
-   * timeout, or a deadlock the server chose this copy to end. Never for rows
-   * that were refused. (`connectionDead` says nothing of this: a failed copy is
+   * timeout, or a wait for locks that failed — a deadlock (Msg 1205), the
+   * server out of locks (1204), a lock wait timed out (12205). Never for rows
+   * that were refused. (Out of locks again and again, the copy's own batches
+   * may be what takes them: a smaller `batchSize` takes fewer.) (`connectionDead` says nothing of this: a failed copy is
    * always abandoned by closing its connection, which is what rolls back its
    * open batch.) What to send again is the caller's to work out:
    * `rowsCommitted` are in the table, and `rowsInDoubt` may be.
@@ -309,7 +319,7 @@ export class SybaseBulkCopyError extends SybaseError {
       details.kind === "connection" ||
       details.kind === "timeout" ||
       (details.kind === "server" &&
-        (details.cause as { msgNo?: unknown } | undefined)?.msgNo === 1205);
+        TRANSIENT_SERVER_ERRORS.has((details.cause as { msgNo?: unknown } | undefined)?.msgNo));
     this.rowsCommitted = details.rowsCommitted;
     this.rowsInDoubt = details.rowsInDoubt;
     this.batches = details.batches;

@@ -1298,9 +1298,14 @@ describe("bulkInsert: failures", () => {
     const serverError = (message: string) => () => {
       throw nativeError(message, { outcome: "failed" });
     };
-    expect(
-      await failWith({}, serverError("Msg 1205, Level 13, State 2: deadlock: chosen as the victim"))
-    ).toEqual(["server", true]);
+    // So may a copy that ran out of locks, or of time waiting for one.
+    for (const message of [
+      "Msg 1205, Level 13, State 2: deadlock: chosen as the victim",
+      "Msg 1204, Level 17, State 2: SQL Server has run out of LOCKS",
+      "Msg 12205, Level 17, State 2: Could not acquire a lock within the specified wait period"
+    ]) {
+      expect(await failWith({}, serverError(message))).toEqual(["server", true]);
+    }
     expect(
       await failWith({}, serverError("Msg 229, Level 14, State 1: permission denied"))
     ).toEqual(["server", false]);

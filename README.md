@@ -260,7 +260,7 @@ try {
     (err.row, err.column); // the input row (1-based) and column a refused value was in
     err.cause; // SybaseQueryError (e.g. Msg 2601 duplicate key), SybaseTimeoutError, ...
     err.kind; // "refused" | "source" | "server" | "connection" | "timeout"
-    err.retryable; // true for a lost connection, a timeout or a deadlock; never for refused rows
+    err.retryable; // true for a lost connection, a timeout, a deadlock or a failed lock wait; never for refused rows
   }
 }
 ```
