@@ -3965,8 +3965,9 @@ static int parse_bulk_wall_clock(const char *s, int64_t *days, int64_t *ms) {
       return -1;
     }
   }
+  // (second was checked as it was read.)
   if (month < 1 || month > 12 || day < 1 || day > days_in_month(year, month) || hour < 0 ||
-      hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+      hour > 23 || minute < 0 || minute > 59 || second > 59) {
     return -1;
   }
   *days = days_from_civil(year, month, day) - days_from_civil(1900, 1, 1);

@@ -157,12 +157,13 @@ jobs:
 
       # The suite against this binary, as uploaded: the tests that need a server
       # skip (no credentials here); the rest — the addon's own checks among them
-      # — run on the platform the binary is for.
+      # — run on the platform the binary is for. Copied in the container: the
+      # build there (as root) left a root-owned file at that path.
       - name: Test this binary (linux)
         if: startsWith(matrix.platform, 'linux-')
         run: |
-          cp sybase_native.${{ matrix.platform }}.node src/native/
           docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace node:24-bookworm bash -c "
+            cp sybase_native.${{ matrix.platform }}.node src/native/ &&
             npm install -g pnpm@\$(node -p \"require('./package.json').packageManager.split('@')[1]\") &&
             pnpm i --frozen-lockfile && pnpm test
           "
