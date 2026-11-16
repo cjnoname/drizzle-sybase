@@ -1132,32 +1132,48 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
       warnOnTimeZoneMismatch: false
     } as Parameters<typeof createSybaseDrizzle>[0]);
     const table = "dsb_bcp_reopen";
+    const binding = getNative();
+    const send = binding.bulkSend;
     try {
       await temp.executeRaw(`if object_id('${table}') is not null drop table ${table}`);
       await temp.executeRaw(
-        `create table ${table} (k int not null, pad varchar(1000) not null) lock datarows`
+        `create table ${table} (k int not null, pad varchar(10) not null) lock datarows`
       );
+      // Small rows: what is tested does not depend on how fast the link is.
+      // They make chunks of CHUNK_ROWS (10,000), so a batch of three: a chunk
+      // short of a batch's end is sent once the next one has been read, so the
+      // first is on the server while the third is being read, and the batch
+      // commits only after that.
+      let firstSent!: () => void;
+      const sentOnce = new Promise<void>(resolve => (firstSent = resolve));
+      binding.bulkSend = async (h, chunk) => {
+        const result = await send.call(binding, h, chunk);
+        firstSent();
+        return result;
+      };
       let dropped: Promise<unknown> | undefined;
-      const pad = "x".repeat(1000);
       async function* rows() {
-        for (let i = 0; i < 8_000; i++) {
-          yield [i, pad];
+        for (let i = 0; i < 25_000; i++) {
+          yield [i, "x"];
         }
-        // The copy is open (a first chunk was sent): the drop waits for its locks.
+        // The copy is open and its first chunk is on the server: the drop
+        // waits for its locks until the batch commits.
+        await sentOnce;
         dropped = temp.executeRaw(`drop table ${table}`);
         await new Promise(resolve => setTimeout(resolve, 1_500));
-        for (let i = 8_000; i < 25_000; i++) {
-          yield [i, pad];
+        for (let i = 25_000; i < 40_000; i++) {
+          yield [i, "x"];
         }
       }
       const err = (await temp
-        .bulkInsert({ table, rows: rows(), batchSize: 20_000, maxErrors: 3_000 })
+        .bulkInsert({ table, rows: rows(), batchSize: 30_000, maxErrors: 3_000 })
         .catch((e: unknown) => e)) as SybaseBulkCopyError;
       await dropped;
       expect(err).toBeInstanceOf(SybaseBulkCopyError);
       expect(err.message).toMatch(/could not be opened again after its last committed batch/);
-      expect(err).toMatchObject({ rowsCommitted: 20_000, rowsInDoubt: 0, rejectedCount: 0 });
+      expect(err).toMatchObject({ rowsCommitted: 30_000, rowsInDoubt: 0, rejectedCount: 0 });
     } finally {
+      binding.bulkSend = send;
       await temp.executeRaw(`if object_id('${table}') is not null drop table ${table}`);
       await temp.close();
     }
@@ -1491,6 +1507,8 @@ const startProxy = async (target: { host: string; port: number }, cut: CutAt) =>
     sockets.add(client).add(upstream);
     let buffered = Buffer.alloc(0);
     let batches = 0;
+    /** The commit was forwarded: what the server sends next is its answer, which is lost. */
+    let dropAnswer = false;
     const kill = () => {
       client.destroy();
       upstream.destroy();
@@ -1516,17 +1534,24 @@ const startProxy = async (target: { host: string; port: number }, cut: CutAt) =>
             return;
           }
           if (typeof cut === "object" && "afterCommit" in cut && batches === cut.afterCommit) {
-            // Let the server read it all, then drop the connection before its answer.
-            upstream.write(packet, () => setTimeout(kill, 50));
+            // Let the server read it all and answer — it has committed by
+            // then — and drop the connection instead of passing the answer on.
+            upstream.write(packet);
+            dropAnswer = true;
             client.pause();
-            upstream.pause();
             return;
           }
         }
         upstream.write(packet);
       }
     });
-    upstream.on("data", (data: Buffer) => client.write(data));
+    upstream.on("data", (data: Buffer) => {
+      if (dropAnswer) {
+        kill();
+        return;
+      }
+      client.write(data);
+    });
     client.on("error", () => upstream.destroy());
     upstream.on("error", () => client.destroy());
     client.on("close", () => upstream.destroy());
