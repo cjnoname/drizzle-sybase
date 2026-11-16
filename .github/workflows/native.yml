@@ -1,7 +1,7 @@
 name: Native
 
 # Build the native addon for every platform the package ships and load each
-# binary under Node.js 24 on its own platform — Linux in AWS Lambda's Node.js 24
+# binary under Node.js 26 on its own platform — Linux in AWS Lambda's Node.js 26
 # image. On Linux, also run the test suite (all but the tests that need a
 # server) against that very binary. Then pack the package with all five, as
 # published, and install and load it as an application would.
@@ -45,11 +45,11 @@ jobs:
     name: Build ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           architecture: ${{ matrix.node-arch }}
 
       # Linux builds in Debian bookworm (glibc 2.36), not on the runner (Ubuntu
@@ -61,7 +61,7 @@ jobs:
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
-            node:24-bookworm \
+            node:26-bookworm \
             bash -c "
               apt-get update && apt-get install -y build-essential python3 curl &&
               npm install -g node-gyp@\$(node -p \"require('./package.json').devDependencies['node-gyp']\") &&
@@ -137,11 +137,11 @@ jobs:
           npx node-gyp build
 
       # --- Load it where it must run ---
-      - name: Load test (linux, in AWS Lambda's Node.js 24)
+      - name: Load test (linux, in AWS Lambda's Node.js 26)
         if: startsWith(matrix.platform, 'linux-')
         run: |
           docker run --rm --pull always --platform ${{ matrix.docker }} --entrypoint node \
-            -v ${{ github.workspace }}:/w -w /w public.ecr.aws/lambda/nodejs:24 \
+            -v ${{ github.workspace }}:/w -w /w public.ecr.aws/lambda/nodejs:26 \
             scripts/smoke-native.ts build/Release/sybase_native.node
 
       - name: Load test (macos, windows)
@@ -162,7 +162,7 @@ jobs:
       - name: Test this binary (linux)
         if: startsWith(matrix.platform, 'linux-')
         run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace node:24-bookworm bash -c "
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace node:26-bookworm bash -c "
             cp sybase_native.${{ matrix.platform }}.node src/native/ &&
             npm install -g pnpm@\$(node -p \"require('./package.json').packageManager.split('@')[1]\") &&
             pnpm i --frozen-lockfile && pnpm test
@@ -177,15 +177,15 @@ jobs:
   # The package as it would be published, with all five binaries and the
   # FreeTDS source: what it holds is the same on every platform, so it is packed
   # and checked once, then installed into an empty project and loaded in
-  # Lambda's Node.js 24 image (linux-x64).
+  # Lambda's Node.js 26 image (linux-x64).
   package:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
       - name: Install dependencies
         shell: bash
         run: |
