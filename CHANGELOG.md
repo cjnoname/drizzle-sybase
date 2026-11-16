@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.1.2](https://github.com/cjnoname/drizzle-sybase/compare/v5.1.1...v5.1.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* Close the verification gaps left after [#18](https://github.com/cjnoname/drizzle-sybase/issues/18) and [#20](https://github.com/cjnoname/drizzle-sybase/issues/20) ([d98ae1f](https://github.com/cjnoname/drizzle-sybase/commit/d98ae1fe9263cfeb9c4515f9fcc2eed9e617a9e0))
+* Flag a NULL variable column before a non-NULL one in a data-only-locked bulk copy ([08e380f](https://github.com/cjnoname/drizzle-sybase/commit/08e380f5d5f8ff1e360948cb659922e5c8863584))
+* Flag a NULL variable column before a non-NULL one in a data-only-locked bulk copy ([0aa85da](https://github.com/cjnoname/drizzle-sybase/commit/0aa85daf1521c7132d6b567d67f7262c0d51fb2a))
+* Refuse a data-only-locked bulk row whose variable column starts past byte 8191 ([f8e13c0](https://github.com/cjnoname/drizzle-sybase/commit/f8e13c0dbffc41e4f6c4db5d384062e234aa1f3b))
+* Refuse a data-only-locked bulk row whose variable column starts past byte 8191 ([d562c2b](https://github.com/cjnoname/drizzle-sybase/commit/d562c2bdafbe6661582f1a20065ced984727d1f6))
+* Say that a data-only-locked row past byte 8191 needs the unsupported wide row format ([6bf0587](https://github.com/cjnoname/drizzle-sybase/commit/6bf05879c5ac592a35f18dbef9a2fe6b18df0a3a))
+
 ## [5.1.1](https://github.com/cjnoname/drizzle-sybase/compare/v5.1.0...v5.1.1) (2026-11-11)
 
 
