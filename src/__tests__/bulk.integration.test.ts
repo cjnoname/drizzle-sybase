@@ -597,6 +597,32 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
     60_000
   );
 
+  // A NULL variable-length column with a non-NULL one after it has no data of
+  // its own. ASE 16.1 refuses such a data-only-locked row (Msg 4853) unless its
+  // offset-table entry carries the flag ASE's own bcp sets. A nullable char is
+  // a variable-length column too.
+  it.each(["datarows", "datapages", "allpages"])(
+    "keeps NULL variable columns before a non-NULL one in a %s-locked table",
+    async lock => {
+      await recreate(
+        KEYS,
+        `(k int not null, a varchar(2) null, b varchar(3) null, c char(2) null) lock ${lock}`
+      );
+      const rows = [
+        [1, null, null, "X4"],
+        [2, null, "AB", "X4"],
+        [3, "E", null, "X4"],
+        [4, "E", "AB", null],
+        [5, null, null, null],
+        [6, "E", "AB", "X4"]
+      ];
+      expect((await db.bulkInsert({ table: KEYS, rows })).rowsCopied).toBe(6);
+      const back = (await db.executeRaw(`select k, a, b, c from ${KEYS} order by k`)).rows;
+      expect(back).toEqual(rows.map(([k, a, b, c]) => ({ k, a, b, c })));
+    },
+    60_000
+  );
+
   it("loads #temp tables, whichever temporary database the session has", async () => {
     const seen = new Set<string>();
     for (let attempt = 0; attempt < 6; attempt++) {

@@ -72,6 +72,12 @@ is master's final form of each hunk, with these fixes master does not have yet
     batch: every row sent next then failed without an error, as if refused on
     its own. It now reports SYBEBULKINSERT, still returning the batch's count
     (the batch is committed).
+  - In the data-only-locked row format, a NULL variable-length column with a
+    non-NULL one after it was sent with the same offset as that next column,
+    which ASE 16.1 refuses as a badly formatted row (Msg 4853) and closes the
+    connection. ASE 16's own bcp (Open Client 20.0) flags that offset-table
+    entry with 0x2000, and so does this patch (checked against ASE 16.1 SP00
+    PL02, by capturing what bcp sends; not checked against ASE 15.7).
 
 diff --git a/include/freetds/tds.h b/include/freetds/tds.h
 --- a/include/freetds/tds.h
@@ -380,7 +386,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  		TDS_UCHAR *poff = rowbuffer + row_pos;
  		unsigned int pfx_top = offsets[ncols] >> 8;
  
-@@ -764,6 +915,17 @@
+@@ -764,6 +915,23 @@
  		for (i=0; i <= ncols; i++)
  			*poff++ = offsets[ncols-i] & 0xFF;
  		row_pos = (unsigned int)(poff - rowbuffer);
@@ -389,16 +395,22 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
 +
 +		for (col = ncols; col-- > 0;) {
 +			/* The DOL BULK format has a much simpler row table -- it's just a 2-byte length for every
-+			 * non-fixed column (does not have the extra "offset after the end" that the basic format has) */
-+			rowbuffer[row_pos++] = offsets[col] % 256u;
-+			rowbuffer[row_pos++] = offsets[col] / 256u;
++			 * non-fixed column (does not have the extra "offset after the end" that the basic format has).
++			 * A NULL column followed by a non-NULL one has no data of its own: ASE 16's bcp flags its
++			 * entry with 0x2000, and ASE 16.1 refuses the row without the flag (Msg 4853). */
++			unsigned int entry = offsets[col];
 +
-+			tdsdump_log(TDS_DBG_FUNC, "[DOL BULK offset table] col=%u offset=%u\n", col, offsets[col]);
++			if (offsets[col + 1] == offsets[col])
++				entry |= 0x2000u;
++			rowbuffer[row_pos++] = entry % 256u;
++			rowbuffer[row_pos++] = entry / 256u;
++
++			tdsdump_log(TDS_DBG_FUNC, "[DOL BULK offset table] col=%u offset=%u entry=0x%04x\n", col, offsets[col], entry);
 +		}
  	}
  
  	tdsdump_log(TDS_DBG_FUNC, "%4d %8d %8d\n", i, ncols, row_pos);
-@@ -991,13 +1153,20 @@
+@@ -991,13 +1159,20 @@
  	return -1;
  }
  
@@ -420,7 +432,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  	for (i = 0; i < res_info->num_cols; ++i, ++syb_info) {
  		TDSCOLUMN *col = res_info->columns[i];
  		TDS_UCHAR *src = col->column_data;
-@@ -1010,17 +1179,27 @@
+@@ -1010,17 +1185,27 @@
  		for (;;) {
  			/* avoid overflows */
  			if (syb_info >= syb_info_end)
@@ -451,7 +463,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  }
  
  static TDSRET
-@@ -1073,7 +1252,9 @@
+@@ -1073,7 +1258,9 @@
  				continue;
  			if (!row_match) {
  				tds_extra_assert(res_info->num_cols == num_defs);
@@ -462,7 +474,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  				continue;
  			}
  			for (icol = 0; icol < BULKCOL_COUNT; ++icol) {
-@@ -1145,14 +1326,17 @@
+@@ -1145,14 +1332,17 @@
  	BCPCOLDATA *coldata;
  
  	ret = get_col_data(bulk, bcpcol, offset);
@@ -483,7 +495,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  		} else {
  			if (!TDS_RESIZE(coldata->data, syb_info->dflt_size))
  				return TDS_FAIL;
-@@ -1186,7 +1370,6 @@
+@@ -1186,7 +1376,6 @@
  {
  	TDSCOLUMN *bcpcol;
  	int i;
@@ -491,7 +503,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  	int variable_col_len_tot  = 0;
  	int column_bcp_data_size  = 0;
  	int bcp_record_size       = 0;
-@@ -1203,52 +1386,41 @@
+@@ -1203,52 +1392,41 @@
  		return rc;
  	}
  
