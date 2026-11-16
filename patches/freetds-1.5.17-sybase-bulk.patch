@@ -82,8 +82,9 @@ is master's final form of each hunk, with these fixes master does not have yet
   - An offset-table entry of that format holds its offset in 13 bits, below
     the 0x2000 flag: a variable-length column starting past byte 8191 (rows
     that long fit only 16K pages) was sent with a wrong offset. Such a row is
-    now refused, reported as SYBEBCOR, as Open Client's bcp refuses it; the
-    wide-row format of ASE 15.7 ('allow wide dol rows') is not implemented.
+    now refused, reported as SYBEBCOR. Open Client 15.7's bcp sends it in a
+    wide row format, to a database with 'allow wide dol rows'; that format is
+    not implemented here.
 
 diff --git a/include/freetds/tds.h b/include/freetds/tds.h
 --- a/include/freetds/tds.h
@@ -426,8 +427,8 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
 +		unsigned int col;
 +
 +		/* An entry holds its offset in 13 bits (0x2000 is a flag): a column that starts past
-+		 * byte 8191 needs ASE 15.7's wide row format, which is not implemented. Like Open
-+		 * Client's bcp, refuse the row rather than send it with a wrong offset. */
++		 * byte 8191 needs ASE 15.7's wide row format, which is not implemented. Refuse the
++		 * row rather than send it with a wrong offset. */
 +		if (ncols && offsets[ncols - 1] > 0x1FFFu)
 +			return -2;
 +

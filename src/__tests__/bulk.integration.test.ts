@@ -634,32 +634,51 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
 
   // An offset-table entry of the data-only-locked format holds 13 bits: a row
   // in which a variable-length column would start past byte 8191 cannot be
-  // sent in it, and is refused on its own (an insert of it fails too).
+  // sent in it, and is refused on its own. Variable-length data starts at byte
+  // 12 here (4 blank bytes, the 2-byte header, k, the 2-byte row length).
   it("refuses a data-only-locked row whose variable column would start past byte 8191", async () => {
     await recreate(
       KEYS,
       "(k int not null, a varchar(4000) null, b varchar(4000) null, c varchar(300) null, " +
         "d varchar(10) null) lock datarows"
     );
-    const rows = [
-      [1, "a", "b", "c", "d"],
-      [2, "a".repeat(4000), "b".repeat(4000), "c".repeat(300), "d"],
-      [3, "a", null, null, "d"]
+    const wide = (k: number, c: number, d: string | null) => [
+      k,
+      "a".repeat(4000),
+      "b".repeat(4000),
+      "c".repeat(c),
+      d
     ];
+    // d would start at byte 8192.
+    const rows = [[1, "a", "b", "c", "d"], wide(2, 180, "d"), [3, "a", null, null, "d"]];
     const result = await db.bulkInsert({ table: KEYS, rows, maxErrors: 1 });
     expect(result.rowsCopied).toBe(2);
     expect(result.rejected).toEqual([
       {
         row: 2,
         message:
-          "the row is too long for a data-only-locked table: a variable-length column " +
-          "would start past byte 8191"
+          "a variable-length column would start past byte 8191, which needs ASE's wide " +
+          "data-only-locked row format: not supported"
       }
     ]);
     expect((await db.executeRaw(`select k from ${KEYS} order by k`)).rows).toEqual([
       { k: 1 },
       { k: 3 }
     ]);
+    // d starting at byte 8191, or past it only as a trailing NULL (not sent):
+    // the row is sent. Only a 16K page holds it; a smaller one refuses it.
+    const { rows: page } = await db.executeRaw<{ size: number }>("select @@maxpagesize as size");
+    for (const row of [wide(4, 179, "d"), wide(5, 180, null)]) {
+      const outcome = await db.bulkInsert({ table: KEYS, rows: [row] }).then(
+        r => r.rowsCopied,
+        (e: unknown) => (e as Error).message
+      );
+      if (Number(page[0]!.size) >= 16_384) {
+        expect(outcome).toBe(1);
+      } else {
+        expect(outcome).toMatch(/Msg 4837, .*row of length/);
+      }
+    }
   }, 60_000);
 
   it("loads #temp tables, whichever temporary database the session has", async () => {
@@ -1152,15 +1171,30 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
         return result;
       };
       let dropped: Promise<unknown> | undefined;
+      // The copy's lock on the table is blocking another session: the drop waits.
+      const dropWaits = async () => {
+        for (let i = 0; i < 200; i++) {
+          const { rows } = await db.executeRaw<{ n: number }>(
+            "select count(*) as n from master..syslocks where dbid = db_id('tempdb') " +
+              `and id = object_id('tempdb..${table}') and type & 256 = 256`
+          );
+          if (Number(rows[0]!.n) > 0) {
+            return;
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        throw new Error("the drop never waited for the copy's lock");
+      };
       async function* rows() {
         for (let i = 0; i < 25_000; i++) {
           yield [i, "x"];
         }
         // The copy is open and its first chunk is on the server: the drop
-        // waits for its locks until the batch commits.
+        // waits for its locks until the batch commits. The batch is read on
+        // (and so committed) only once the drop is seen waiting.
         await sentOnce;
         dropped = temp.executeRaw(`drop table ${table}`);
-        await new Promise(resolve => setTimeout(resolve, 1_500));
+        await dropWaits();
         for (let i = 25_000; i < 40_000; i++) {
           yield [i, "x"];
         }
@@ -1498,10 +1532,14 @@ type CutAt =
   /** Cut instead of forwarding the last packet of the `n`th batch: nothing of it is committed. */
   | { beforeCommit: number }
   /** Cut at the first bulk packet: rows are still being sent. */
-  | "duringRows";
+  | "duringRows"
+  /** Never cut: only record what the client sends. */
+  | "never";
 
 const startProxy = async (target: { host: string; port: number }, cut: CutAt) => {
   const sockets = new Set<Socket>();
+  /** The payload of every bulk packet the client sent, in order. */
+  const bulkPayloads: Buffer[] = [];
   const server: Server = createServer(client => {
     const upstream = connectTcp(target.port, target.host);
     sockets.add(client).add(upstream);
@@ -1523,6 +1561,9 @@ const startProxy = async (target: { host: string; port: number }, cut: CutAt) =>
         const packet = buffered.subarray(0, length);
         buffered = buffered.subarray(length);
         const bulk = packet[0] === TDS_BULK;
+        if (bulk) {
+          bulkPayloads.push(Buffer.from(packet.subarray(8)));
+        }
         if (bulk && cut === "duringRows") {
           kill();
           return;
@@ -1561,6 +1602,7 @@ const startProxy = async (target: { host: string; port: number }, cut: CutAt) =>
   const { port } = server.address() as { port: number };
   return {
     port,
+    bulk: bulkPayloads,
     close: () => {
       sockets.forEach(socket => socket.destroy());
       return new Promise<void>(resolve => server.close(() => resolve()));
@@ -1665,3 +1707,59 @@ describe.skipIf(!hasConfig)(
     }, 60_000);
   }
 );
+
+describe.skipIf(!hasConfig)("bulk copy rows on the wire (real ASE, through a proxy)", () => {
+  // Each row as sent into this datarows table: its 2-byte length, then 4 blank
+  // bytes, the count of variable-length columns, the row number, k, the row
+  // length, the data of b and c, and the offset table — c's entry, then b's.
+  // The entries are what ASE 16's own bcp (Open Client 20.0) sends for these
+  // rows, as captured in #18: a NULL b followed by a non-NULL c has its entry
+  // flagged with 0x2000, without which ASE 16.1 refuses the row (Msg 4853).
+  // ASE 15.7 takes it either way, so only the bytes show that the flag is sent.
+  it("flags the offset of a NULL variable column followed by a non-NULL one, as ASE's bcp does", async () => {
+    const table = "tempdb..dsb_bcp_wire";
+    const db = createSybaseDrizzle({
+      ...config,
+      max: 1,
+      warnOnTimeZoneMismatch: false
+    } as Parameters<typeof createSybaseDrizzle>[0]);
+    const proxy = await startProxy(config, "never");
+    const viaProxy = createSybaseDrizzle({
+      ...config,
+      host: "127.0.0.1",
+      port: proxy.port,
+      max: 1,
+      warnOnTimeZoneMismatch: false
+    } as Parameters<typeof createSybaseDrizzle>[0]);
+    try {
+      await db.executeRaw(`if object_id('${table}') is not null drop table ${table}`);
+      await db.executeRaw(
+        `create table ${table} (k int not null, b varchar(2) null, c char(2) null) lock datarows`
+      );
+      const result = await viaProxy.bulkInsert({
+        table,
+        rows: [
+          [1, "E", "X4"],
+          [2, null, "X4"]
+        ]
+      });
+      expect(result.rowsCopied).toBe(2);
+      const sent = Buffer.concat(proxy.bulk).toString("hex");
+      expect(sent).toContain(
+        ["1300", "00000000", "0200", "01000000", "1300", "45", "5834", "0d00", "0c00"].join("")
+      );
+      expect(sent).toContain(
+        ["1200", "00000000", "0200", "02000000", "1200", "5834", "0c00", "0c20"].join("")
+      );
+      expect((await db.executeRaw(`select k, b, c from ${table} order by k`)).rows).toEqual([
+        { k: 1, b: "E", c: "X4" },
+        { k: 2, b: null, c: "X4" }
+      ]);
+    } finally {
+      await viaProxy.close();
+      await proxy.close();
+      await db.executeRaw(`if object_id('${table}') is not null drop table ${table}`);
+      await db.close();
+    }
+  }, 60_000);
+});
