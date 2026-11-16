@@ -599,29 +599,68 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
 
   // A NULL variable-length column with a non-NULL one after it has no data of
   // its own. ASE 16.1 refuses such a data-only-locked row (Msg 4853) unless its
-  // offset-table entry carries the flag ASE's own bcp sets. A nullable char is
-  // a variable-length column too.
+  // offset-table entry carries the flag ASE's own bcp sets. A nullable char,
+  // int, numeric or datetime is a variable-length column too.
   it.each(["datarows", "datapages", "allpages"])(
     "keeps NULL variable columns before a non-NULL one in a %s-locked table",
     async lock => {
       await recreate(
         KEYS,
-        `(k int not null, a varchar(2) null, b varchar(3) null, c char(2) null) lock ${lock}`
+        "(k int not null, a varchar(2) null, i int null, n numeric(5,1) null, " +
+          `d datetime null, vb varbinary(4) null, b varchar(3) null, c char(2) null) lock ${lock}`
       );
+      const d = "2020-01-02 03:04:05";
+      const vb = Buffer.from([1, 2]);
       const rows = [
-        [1, null, null, "X4"],
-        [2, null, "AB", "X4"],
-        [3, "E", null, "X4"],
-        [4, "E", "AB", null],
-        [5, null, null, null],
-        [6, "E", "AB", "X4"]
+        [1, null, null, null, null, null, null, "X4"],
+        [2, null, null, null, null, null, "AB", "X4"],
+        [3, "E", null, null, null, null, null, "X4"],
+        [4, "E", null, null, null, null, "AB", null],
+        [5, null, null, null, null, null, null, null],
+        [6, "E", 7, "1.5", d, vb, "AB", "X4"],
+        [7, null, 7, null, d, null, null, "X4"],
+        [8, null, null, "1.5", null, vb, null, null]
       ];
-      expect((await db.bulkInsert({ table: KEYS, rows })).rowsCopied).toBe(6);
-      const back = (await db.executeRaw(`select k, a, b, c from ${KEYS} order by k`)).rows;
-      expect(back).toEqual(rows.map(([k, a, b, c]) => ({ k, a, b, c })));
+      expect((await db.bulkInsert({ table: KEYS, rows })).rowsCopied).toBe(8);
+      const back = (
+        await db.executeRaw(
+          `select k, a, i, n, convert(char(19), d, 140) as d, vb, b, c from ${KEYS} order by k`
+        )
+      ).rows;
+      expect(back).toEqual(rows.map(([k, a, i, n, d, vb, b, c]) => ({ k, a, i, n, d, vb, b, c })));
     },
     60_000
   );
+
+  // An offset-table entry of the data-only-locked format holds 13 bits: a row
+  // in which a variable-length column would start past byte 8191 cannot be
+  // sent in it, and is refused on its own (an insert of it fails too).
+  it("refuses a data-only-locked row whose variable column would start past byte 8191", async () => {
+    await recreate(
+      KEYS,
+      "(k int not null, a varchar(4000) null, b varchar(4000) null, c varchar(300) null, " +
+        "d varchar(10) null) lock datarows"
+    );
+    const rows = [
+      [1, "a", "b", "c", "d"],
+      [2, "a".repeat(4000), "b".repeat(4000), "c".repeat(300), "d"],
+      [3, "a", null, null, "d"]
+    ];
+    const result = await db.bulkInsert({ table: KEYS, rows, maxErrors: 1 });
+    expect(result.rowsCopied).toBe(2);
+    expect(result.rejected).toEqual([
+      {
+        row: 2,
+        message:
+          "the row is too long for a data-only-locked table: a variable-length column " +
+          "would start past byte 8191"
+      }
+    ]);
+    expect((await db.executeRaw(`select k from ${KEYS} order by k`)).rows).toEqual([
+      { k: 1 },
+      { k: 3 }
+    ]);
+  }, 60_000);
 
   it("loads #temp tables, whichever temporary database the session has", async () => {
     const seen = new Set<string>();

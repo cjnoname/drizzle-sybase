@@ -5073,19 +5073,26 @@ static int bulk_send_row(BulkWork *w, BulkState *st, const BulkField *fields,
     w->rows_sent++;
     return 0;
   }
-  // Only a NULL the column refuses (db-lib reports SYBEBCNN for it) is about
-  // this row. Anything else — the copy could not be opened, the connection
-  // broke, or a failure db-lib did not report (out of memory) — stops the copy:
-  // a row that may be valid is never skipped as a bad one.
+  // Only a NULL the column refuses (db-lib reports SYBEBCNN for it), or a row the
+  // data-only-locked format cannot lay out (SYBEBCOR), is about this row.
+  // Anything else — the copy could not be opened, the connection broke, or a
+  // failure db-lib did not report (out of memory) — stops the copy: a row that
+  // may be valid is never skipped as a bad one.
   if (DBDEAD(conn->dbproc) || conn_is_dead(conn) || !conn->has_error ||
-      conn->last_dberr != SYBEBCNN) {
+      (conn->last_dberr != SYBEBCNN && conn->last_dberr != SYBEBCOR)) {
     snprintf(w->error, sizeof(w->error), "Row %lld could not be sent: %.4000s", (long long)row,
              conn->has_error ? conn->last_error : "bcp_sendrow() failed");
     w->error_row = row;
     return -1;
   }
   st->started = 1;  // the copy is open: only this row was refused
-  bulk_null_reason(st, is_null, why, sizeof(why));
+  if (conn->last_dberr == SYBEBCOR) {
+    snprintf(why, sizeof(why),
+             "the row is too long for a data-only-locked table: a variable-length column "
+             "would start past byte 8191");
+  } else {
+    bulk_null_reason(st, is_null, why, sizeof(why));
+  }
   bulk_reject(w, row, NULL, why);
   return bulk_too_many_rejects(w, row, NULL, why);
 }
