@@ -341,9 +341,11 @@ before it is sent, with the query builders' rules — except that money takes no
 - A number, date or bit given as a string of more than 127 characters refuses
   its row: no value of those types is written that long.
 - In a datarows or datapages table, a row in which a variable-length column
-  would start past byte 8191 refuses its row, as an `insert` of it would fail:
-  the row format cannot hold the offset (ASE 15.7's wide rows, `allow wide dol
-  rows` on 16K-page servers, are not sent).
+  would start past byte 8191 refuses its row. Only a 16K-page server stores
+  such rows, in a database with `allow wide dol rows` (on by default in
+  temporary databases), in a wide row format the bulk copy does not implement.
+  Load them into an allpages table instead (e.g. a staging table, then
+  `insert ... select`).
 - An empty string is stored as ASE stores `''` from SQL: one blank. NULL stays
   NULL — except that, as with the bcp utility, a NULL (an empty TSV field,
   `null`, `undefined`) or a column left out of `columns` gets the column's

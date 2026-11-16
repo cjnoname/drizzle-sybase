@@ -5088,8 +5088,8 @@ static int bulk_send_row(BulkWork *w, BulkState *st, const BulkField *fields,
   st->started = 1;  // the copy is open: only this row was refused
   if (conn->last_dberr == SYBEBCOR) {
     snprintf(why, sizeof(why),
-             "the row is too long for a data-only-locked table: a variable-length column "
-             "would start past byte 8191");
+             "a variable-length column would start past byte 8191, which needs ASE's wide "
+             "data-only-locked row format: not supported");
   } else {
     bulk_null_reason(st, is_null, why, sizeof(why));
   }

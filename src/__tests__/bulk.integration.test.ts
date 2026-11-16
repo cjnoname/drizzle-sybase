@@ -634,32 +634,51 @@ describe.skipIf(!hasConfig)("bulk copy (real ASE)", () => {
 
   // An offset-table entry of the data-only-locked format holds 13 bits: a row
   // in which a variable-length column would start past byte 8191 cannot be
-  // sent in it, and is refused on its own (an insert of it fails too).
+  // sent in it, and is refused on its own. Variable-length data starts at byte
+  // 12 here (4 blank bytes, the 2-byte header, k, the 2-byte row length).
   it("refuses a data-only-locked row whose variable column would start past byte 8191", async () => {
     await recreate(
       KEYS,
       "(k int not null, a varchar(4000) null, b varchar(4000) null, c varchar(300) null, " +
         "d varchar(10) null) lock datarows"
     );
-    const rows = [
-      [1, "a", "b", "c", "d"],
-      [2, "a".repeat(4000), "b".repeat(4000), "c".repeat(300), "d"],
-      [3, "a", null, null, "d"]
+    const wide = (k: number, c: number, d: string | null) => [
+      k,
+      "a".repeat(4000),
+      "b".repeat(4000),
+      "c".repeat(c),
+      d
     ];
+    // d would start at byte 8192.
+    const rows = [[1, "a", "b", "c", "d"], wide(2, 180, "d"), [3, "a", null, null, "d"]];
     const result = await db.bulkInsert({ table: KEYS, rows, maxErrors: 1 });
     expect(result.rowsCopied).toBe(2);
     expect(result.rejected).toEqual([
       {
         row: 2,
         message:
-          "the row is too long for a data-only-locked table: a variable-length column " +
-          "would start past byte 8191"
+          "a variable-length column would start past byte 8191, which needs ASE's wide " +
+          "data-only-locked row format: not supported"
       }
     ]);
     expect((await db.executeRaw(`select k from ${KEYS} order by k`)).rows).toEqual([
       { k: 1 },
       { k: 3 }
     ]);
+    // d starting at byte 8191, or past it only as a trailing NULL (not sent):
+    // the row is sent. Only a 16K page holds it; a smaller one refuses it.
+    const { rows: page } = await db.executeRaw<{ size: number }>("select @@maxpagesize as size");
+    for (const row of [wide(4, 179, "d"), wide(5, 180, null)]) {
+      const outcome = await db.bulkInsert({ table: KEYS, rows: [row] }).then(
+        r => r.rowsCopied,
+        (e: unknown) => (e as Error).message
+      );
+      if (Number(page[0]!.size) >= 16_384) {
+        expect(outcome).toBe(1);
+      } else {
+        expect(outcome).toMatch(/Msg 4837, .*row of length/);
+      }
+    }
   }, 60_000);
 
   it("loads #temp tables, whichever temporary database the session has", async () => {
