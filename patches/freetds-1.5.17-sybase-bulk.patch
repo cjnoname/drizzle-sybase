@@ -77,7 +77,13 @@ is master's final form of each hunk, with these fixes master does not have yet
     which ASE 16.1 refuses as a badly formatted row (Msg 4853) and closes the
     connection. ASE 16's own bcp (Open Client 20.0) flags that offset-table
     entry with 0x2000, and so does this patch (checked against ASE 16.1 SP00
-    PL02, by capturing what bcp sends; not checked against ASE 15.7).
+    PL02, by capturing what bcp sends, and against ASE 15.7 SP140, which
+    loads such rows with the flag or without it).
+  - An offset-table entry of that format holds its offset in 13 bits, below
+    the 0x2000 flag: a variable-length column starting past byte 8191 (rows
+    that long fit only 16K pages) was sent with a wrong offset. Such a row is
+    now refused, reported as SYBEBCOR, as Open Client's bcp refuses it; the
+    wide-row format of ASE 15.7 ('allow wide dol rows') is not implemented.
 
 diff --git a/include/freetds/tds.h b/include/freetds/tds.h
 --- a/include/freetds/tds.h
@@ -95,7 +101,15 @@ diff --git a/include/freetds/tds.h b/include/freetds/tds.h
  #ifndef _tdsguard_hfOrWb5znoUCWdBPoNQvqN_
  #define _tdsguard_hfOrWb5znoUCWdBPoNQvqN_
  
-@@ -1700,6 +1706,7 @@
+@@ -274,6 +280,7 @@
+ 		TDSEOOB  = 20022, 
+ 		TDSECLOS = 20056,
+ 		TDSEUSCT = 20058, 
++		TDSEBCOR = 20074,	/* Attempt to bulk copy an oversized row to the server. */
+ 		TDSEUTDS = 20146, 
+ 		TDSEEUNR = 20185, 
+ 		TDSECAP  = 20203, 
+@@ -1700,6 +1707,7 @@
  	TDS_INT direction;
  	bool identity_insert_on;
  	bool xfer_init;
@@ -340,7 +354,15 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  
  	if ((row_pos = tds5_bcp_add_fixed_columns(bcpinfo, get_col_data, null_error, offset, record, row_pos)) < 0)
  		return TDS_FAIL;
-@@ -436,7 +575,7 @@
+@@ -430,13 +569,15 @@
+ 	/* potential variable columns to write */
+ 
+ 	row_pos = tds5_bcp_add_variable_columns(bcpinfo, get_col_data, null_error, offset, record, row_pos, &var_cols_written);
++	if (row_pos == -2)
++		tdserror(tds_get_ctx(tds), tds, TDSEBCOR, 0);
+ 	if (row_pos < 0)
+ 		return TDS_FAIL;
+ 
  
  	if (var_cols_written) {
  		TDS_PUT_UA2LE(&record[row_sz_pos], row_pos);
@@ -349,7 +371,17 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  	}
  
  	tdsdump_log(TDS_DBG_INFO1, "old_record_size = %d new size = %d \n", old_record_size, row_pos);
-@@ -704,7 +843,15 @@
+@@ -625,7 +766,8 @@
+  * \param start Where to begin copying data into the rowbuffer. 
+  * \param pncols Address of output variable holding the count of columns added to the rowbuffer.  
+  * 
+- * \return length of (potentially modified) rowbuffer, or -1.
++ * \return length of (potentially modified) rowbuffer, -2 if the row cannot be laid out in the
++ *  data-only-locked format, or -1.
+  */
+ static int
+ tds5_bcp_add_variable_columns(TDSBCPINFO *bcpinfo, tds_bcp_get_col_data get_col_data, tds_bcp_null_error null_error,
+@@ -704,7 +846,15 @@
  				rowbuffer[row_pos] = ' ';
  			} else {
  				cpbytes = bcpcol->bcp_column_data->datalen > bcpcol->column_size ?
@@ -366,7 +398,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  				memcpy(&rowbuffer[row_pos], bcpcol->bcp_column_data->data, cpbytes);
  				tds5_swap_data(bcpcol, &rowbuffer[row_pos]);
  			}
-@@ -713,6 +860,10 @@
+@@ -713,6 +863,10 @@
  		}
  
  		row_pos += cpbytes;
@@ -377,7 +409,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  		offsets[++ncols] = row_pos;
  		tdsdump_dump_buf(TDS_DBG_NETWORK, "BCP row buffer so far", rowbuffer,  row_pos);
  	}
-@@ -740,7 +891,7 @@
+@@ -740,7 +894,7 @@
  	while (ncols && offsets[ncols] == offsets[ncols-1])
  		ncols--;	/* trailing NULL columns are not sent and are not included in the offset table */
  
@@ -386,12 +418,18 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  		TDS_UCHAR *poff = rowbuffer + row_pos;
  		unsigned int pfx_top = offsets[ncols] >> 8;
  
-@@ -764,6 +915,23 @@
+@@ -764,6 +918,29 @@
  		for (i=0; i <= ncols; i++)
  			*poff++ = offsets[ncols-i] & 0xFF;
  		row_pos = (unsigned int)(poff - rowbuffer);
 +	} else {		/* Datarows-locking */
 +		unsigned int col;
++
++		/* An entry holds its offset in 13 bits (0x2000 is a flag): a column that starts past
++		 * byte 8191 needs ASE 15.7's wide row format, which is not implemented. Like Open
++		 * Client's bcp, refuse the row rather than send it with a wrong offset. */
++		if (ncols && offsets[ncols - 1] > 0x1FFFu)
++			return -2;
 +
 +		for (col = ncols; col-- > 0;) {
 +			/* The DOL BULK format has a much simpler row table -- it's just a 2-byte length for every
@@ -410,7 +448,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  	}
  
  	tdsdump_log(TDS_DBG_FUNC, "%4d %8d %8d\n", i, ncols, row_pos);
-@@ -991,13 +1159,20 @@
+@@ -991,13 +1168,20 @@
  	return -1;
  }
  
@@ -432,7 +470,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  	for (i = 0; i < res_info->num_cols; ++i, ++syb_info) {
  		TDSCOLUMN *col = res_info->columns[i];
  		TDS_UCHAR *src = col->column_data;
-@@ -1010,17 +1185,27 @@
+@@ -1010,17 +1194,27 @@
  		for (;;) {
  			/* avoid overflows */
  			if (syb_info >= syb_info_end)
@@ -463,7 +501,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  }
  
  static TDSRET
-@@ -1073,7 +1258,9 @@
+@@ -1073,7 +1267,9 @@
  				continue;
  			if (!row_match) {
  				tds_extra_assert(res_info->num_cols == num_defs);
@@ -474,7 +512,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  				continue;
  			}
  			for (icol = 0; icol < BULKCOL_COUNT; ++icol) {
-@@ -1145,14 +1332,17 @@
+@@ -1145,14 +1341,17 @@
  	BCPCOLDATA *coldata;
  
  	ret = get_col_data(bulk, bcpcol, offset);
@@ -495,7 +533,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  		} else {
  			if (!TDS_RESIZE(coldata->data, syb_info->dflt_size))
  				return TDS_FAIL;
-@@ -1186,7 +1376,6 @@
+@@ -1186,7 +1385,6 @@
  {
  	TDSCOLUMN *bcpcol;
  	int i;
@@ -503,7 +541,7 @@ diff --git a/src/tds/bulk.c b/src/tds/bulk.c
  	int variable_col_len_tot  = 0;
  	int column_bcp_data_size  = 0;
  	int bcp_record_size       = 0;
-@@ -1203,52 +1392,41 @@
+@@ -1203,52 +1401,41 @@
  		return rc;
  	}
  

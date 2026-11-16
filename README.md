@@ -340,6 +340,10 @@ before it is sent, with the query builders' rules — except that money takes no
   refused (db-lib would store a lone NUL as a blank).
 - A number, date or bit given as a string of more than 127 characters refuses
   its row: no value of those types is written that long.
+- In a datarows or datapages table, a row in which a variable-length column
+  would start past byte 8191 refuses its row, as an `insert` of it would fail:
+  the row format cannot hold the offset (ASE 15.7's wide rows, `allow wide dol
+  rows` on 16K-page servers, are not sent).
 - An empty string is stored as ASE stores `''` from SQL: one blank. NULL stays
   NULL — except that, as with the bcp utility, a NULL (an empty TSV field,
   `null`, `undefined`) or a column left out of `columns` gets the column's
